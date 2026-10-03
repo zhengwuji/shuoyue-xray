@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.5"
+VERSION="v1.3.6"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -642,7 +642,7 @@ EOF
   # NetworkManager / systemd-networkd 系统上 networking.service 根本不存在 => 独立单元
   rm -f /etc/systemd/system/networking.service.d/override.conf 2>/dev/null
   rmdir /etc/systemd/system/networking.service.d 2>/dev/null
-  cat <<'EOF' >/etc/systemd/system/degwd-shaping.service
+  write_atomic /etc/systemd/system/degwd-shaping.service 644 <<'EOF'
 [Unit]
 Description=de_GWD CAKE shaping (tc/ifb)
 After=network-online.target
@@ -747,7 +747,7 @@ EOF
 
   # 不覆盖发行版 /etc/systemd/system/nftables.service, 使用自建单元名
   # <<EOF(不加引号) 以便按 $BASE 展开; 单元文件内无其它 shell 变量
-  cat <<EOF >/etc/systemd/system/degwd-nftables.service
+  write_atomic /etc/systemd/system/degwd-nftables.service 644 <<EOF
 [Unit]
 Description=de_GWD nftables + CAKE shaping
 Wants=network-pre.target
@@ -800,8 +800,15 @@ install_xray() {
   mkdir -p "$XRAYDIR"
   # dat 资产放官方位置,服务里用环境变量指向
   mkdir -p /usr/local/share/xray
+  # Nice=-8 必须写在 [Service] 段内。
+  # 原实现是「先写完整个单元, 再 cat >> 追加 Nice=-8」, 追加位置在 [Install] 之后,
+  # 而 systemd 只认键所属的最近一个节头 -> [Install] 里的 Nice= 无意义, 被静默忽略
+  # (仅日志一行 "Unknown key name 'Nice' ... ignoring"), 服务端 Xray 实际从未拿到
+  # 调度优先级。这里改成在 [Service] 段落内按条件插入。
+  local _nice=""
+  [[ $VIRT_TYPE != "container" ]] && _nice="Nice=-8"
   # 自有 systemd 单元(带 hardening,继承原版)
-  cat <<EOF >/etc/systemd/system/xray.service
+  write_atomic /etc/systemd/system/xray.service 644 <<EOF
 [Unit]
 Description=de_GWD Xray Service
 After=network.target nss-lookup.target
@@ -815,13 +822,11 @@ Environment=XRAY_LOCATION_ASSET=/usr/local/share/xray
 LimitNOFILE=10000000
 LimitNPROC=10000000
 LimitCORE=10000000
+$_nice
 NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
-EOF
-  [[ $VIRT_TYPE != "container" ]] && cat <<EOF >>/etc/systemd/system/xray.service
-Nice=-8
 EOF
   if [[ $XTLSUSER != "root" ]]; then
     chown -R $XTLSUSER:$XTLSUSER "$XRAYDIR" 2>/dev/null
@@ -1248,7 +1253,7 @@ install_doh() {
   rm -rf /tmp/dnsproxy.tar.gz /tmp/dnsproxy-ex
 
   # <<EOF(不加引号) 以便按 $BASE 展开; 单元文件内无其它 shell 变量
-  cat <<EOF >/etc/systemd/system/doh-server.service
+  write_atomic /etc/systemd/system/doh-server.service 644 <<EOF
 [Unit]
 Description=de_GWD DoH Server (dnsproxy)
 After=network.target unbound.service
@@ -1319,7 +1324,7 @@ EOF
   else
     warn "未生成 /var/lib/unbound/root.key, DNSSEC 验证将不可用"
   fi
-  cat <<'EOF' >/etc/systemd/system/unbound.service
+  write_atomic /etc/systemd/system/unbound.service 644 <<'EOF'
 [Unit]
 Description=de_GWD unbound DNS
 After=network.target
@@ -1759,7 +1764,7 @@ install_singbox() {
   [[ -z $bin ]] && die "sing-box 解包失败"
   mv -f "$bin" "$BASE/singbox/sing-box" && chmod 755 "$BASE/singbox/sing-box"
   rm -rf /tmp/singbox.tar.gz /tmp/sb-ex
-  cat <<EOF >/etc/systemd/system/sing-box.service
+  write_atomic /etc/systemd/system/sing-box.service 644 <<EOF
 [Unit]
 Description=de_GWD sing-box server (Hysteria2/TUIC/AnyTLS)
 After=network.target
@@ -2730,7 +2735,7 @@ fetch_panel_py() {
 }
 
 panel_unit_conf() {
-  cat <<EOF > /etc/systemd/system/degwd-panel.service
+  write_atomic /etc/systemd/system/degwd-panel.service 644 <<EOF
 [Unit]
 Description=Shuoyue de_GWD Web Panel
 After=network.target

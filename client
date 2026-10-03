@@ -8,7 +8,7 @@
 #  基于原版 jacyl4/de_GWD (EPL-2.0) 的功能规格重写,全部组件改用官方上游。
 #  LAN 设备将网关与 DNS 指向本机即可生效。仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.5"
+VERSION="v1.3.6"
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
 # 交互式脚本: 不启用 -e(需保留人工交互分支), 但未定义变量与管道错误必须暴露
@@ -590,7 +590,7 @@ dns:
   edns_client_subnet: true
 $extra
 EOF
-  cat <<EOF >/etc/systemd/system/adguardhome.service
+  write_atomic /etc/systemd/system/adguardhome.service 644 <<EOF
 [Unit]
 Description=AdGuard Home
 After=network.target
@@ -1024,7 +1024,7 @@ install_singbox() {
   [[ -z $bin ]] && { rm -rf /tmp/singbox.tar.gz /tmp/sb-ex; return 1; }
   mv -f "$bin" "$BASE/singbox/sing-box" && chmod 755 "$BASE/singbox/sing-box"
   rm -rf /tmp/singbox.tar.gz /tmp/sb-ex
-  cat <<EOF >/etc/systemd/system/sb-bridge.service
+  write_atomic /etc/systemd/system/sb-bridge.service 644 <<EOF
 [Unit]
 Description=de_GWD sing-box bridge (hy2/tuic/anytls outbound)
 After=network.target
