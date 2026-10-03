@@ -185,7 +185,11 @@ dl_checked server "$BASE/server" 30
 chmod +x "$BASE/server"
 echo -e "${GREEN}OK${cRES} ($(du -sk "$BASE/server" | awk '{print$1}') KB)"
 dl "$RAW/version" "$BASE/version" 2>/dev/null
-dl "$RAW/panel.py" "$BASE/panel.py" 2>/dev/null && chmod 755 "$BASE/panel.py"
+# panel.py 也在 SHA256SUMS 清单里, 同样走强校验(原来是裸 dl, 唯一漏检的产物)
+echo -n "下载 Web 面板... "
+dl_checked panel.py "$BASE/panel.py" 10
+chmod 755 "$BASE/panel.py"
+echo -e "${GREEN}OK${cRES} ($(du -sk "$BASE/panel.py" | awk '{print$1}') KB)"
 
 pick_bindir || die "/usr/bin 不可写,无法创建命令"
 ln -sf "$BASE/server" "$BINDIR/shuoyue"
