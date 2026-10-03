@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.0"
+VERSION="v1.3.1"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -56,7 +56,7 @@ write_atomic() {   # $1=dest $2=mode
   chmod "$2" "$t" && mv -f "$t" "$1"
 }
 
-ask()  { local v; read -rp "$1" v; echo "$v"; }
+ask()  { local v; read -r -p "$1" v; echo "$v"; }
 ask_secret() { local v; read -rsp "$1" v; echo; echo "$v"; }
 
 # 非交互模式: --cli / Web 面板调用时置 1。任何会 ask 的函数都必须先看它,
@@ -246,18 +246,45 @@ conf_init() {
   echo '{}' > "$CONF"; chmod 600 "$CONF"
 }
 conf_get() { [[ -f $CONF ]] && jq -r "$1 // empty" "$CONF" 2>/dev/null; }
+
+# 带 flock + 原子替换的配置写入; 值一律经文件交给 jq, 不出现在 argv。
+# 原实现把值拼进 jq 命令行(--argjson v "..."), 私钥/uuid/订阅 token/SS2022 密钥
+# 都能被同机任意用户用 `ps aux` 读到; 且固定临时名 ${CONF}.tmp 在 cron 与菜单
+# 并发时会互相截断。这里与 client 的 conf_write 保持一致。
+conf_write() {   # $1=jq 表达式, 其余为传给 jq 的参数
+  local expr="$1"; shift
+  local t; t=$(mktemp "${CONF}.XXXXXX") || return 1
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -x 9 || exit 1
+      jq "$@" "$expr" "$CONF" > "$t" || exit 1
+      chmod 600 "$t" && mv -f "$t" "$CONF"
+    ) 9>"${CONF}.lock"
+  else
+    (
+      jq "$@" "$expr" "$CONF" > "$t" || exit 1
+      chmod 600 "$t" && mv -f "$t" "$CONF"
+    )
+  fi
+  local rc=$?
+  rm -f "$t"
+  return $rc
+}
 # 字符串写入: conf_set .domain "a.com"
-conf_set() {
-  # 值先经 jq -Rs 压成单行 JSON 字符串, 规避多行 argv 在部分平台的问题
-  jq --argjson v "$(printf '%s' "$2" | jq -Rs .)" "$1 = \$v" "$CONF" > "${CONF}.tmp" \
-    && mv -f "${CONF}.tmp" "$CONF" && chmod 600 "$CONF"
+conf_set() {   # $1=路径 $2=字符串值
+  local valf; valf=$(mktemp "$BASE/.val.XXXXXX") || return 1
+  printf '%s' "$2" > "$valf"; chmod 600 "$valf"
+  conf_write "$1 = \$v" --rawfile v "$valf"
+  local rc=$?; rm -f "$valf"; return $rc
 }
 # 原始 JSON 写入: conf_raw '.relay' '[{...}]'
-conf_raw() {
-  # 值先压缩校验为单行 JSON
-  local compact; compact=$(printf '%s' "$2" | jq -c . 2>/dev/null) || return 1
-  jq "$1 = $compact" "$CONF" > "${CONF}.tmp" \
-    && mv -f "${CONF}.tmp" "$CONF" && chmod 600 "$CONF"
+conf_raw() {   # $1=路径 $2=单个 JSON 值
+  local compact cf
+  compact=$(printf '%s' "$2" | jq -c . 2>/dev/null) || return 1
+  cf=$(mktemp "$BASE/.raw.XXXXXX") || return 1
+  printf '%s' "$compact" > "$cf"; chmod 600 "$cf"
+  conf_write "$1 = \$c[0]" --slurpfile c "$cf"
+  local rc=$?; rm -f "$cf"; return $rc
 }
 
 # ------------------------------------------------ GitHub release downloader ---
@@ -360,9 +387,18 @@ EOF
 
 pkg_dep() {
   local need="" p
-  for p in sudo wget curl git jq bc qrencode socat cron ca-certificates \
-           gnupg unzip dnsutils net-tools nftables chrony ethtool screen \
-           resolvconf unbound; do
+  # 只装真正用到的包。已删除:
+  #   socat/screen  —— 全文无任何调用(实测计数为 1, 即只出现在本列表)
+  #   resolvconf    —— 会接管 /etc/resolv.conf, 与本脚本手写的
+  #                    nameserver 127.0.0.1(unbound) 冲突
+  #   dnsutils      —— 无 dig/host/nslookup 调用(用 unbound-host 代替)
+  #   net-tools     —— 无 ifconfig/netstat/route 调用(全用 iproute2 的 ip)
+  #   git/bc/sudo/unzip —— 全文无调用
+  # 补: unbound-anchor / unbound-host 在 Debian 是**独立的二进制包**,
+  #     unbound 包自 bookworm 起已不再 Depends 它俩 → 不装则 DNSSEC
+  #     信任锚生成与校验(server 里的 unbound-anchor / unbound-host 调用)静默失败
+  for p in wget curl jq qrencode cron ca-certificates \
+           gnupg nftables chrony ethtool unbound unbound-anchor unbound-host; do
     dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
   done
   # mimalloc 包名随 Debian 版本变化: bookworm=libmimalloc2.0, trixie+=libmimalloc3
@@ -629,21 +665,28 @@ nftables_conf() {
   [[ $VIRT_TYPE == "container" ]] && return 0
   mkdir -p "$BASE/nftables"
   # flowtable 设备集启动时动态生成
-  cat <<'EOF' >"$BASE/nftables/flowtable_eth.sh"
+  # 注意: 此处用 <<EOF(不加引号) 以便展开 $BASE; 生成脚本内的 shell 变量
+  # 必须转义(\$interface_FT), 否则会在写文件时被外层展开成空串
+  # 空集合陷阱: 原写法用 `xargs -n1 | tr '\n' ','` 拼接, 但 xargs -n1 在
+  # 空输入时会输出一个空行, tr 把它变成 ",", 于是变量非空 -> 兜底不触发
+  # -> ${interface_FT%,} 变成空串 -> 产出 `define flowtable_eth = {  };`
+  # (空设备集合是非法规则, 整张 nft 表加载失败)。
+  # 改为 client 侧已验证的写法: tr 后用 sed 's/,$//' 把纯 "," 还原成空串。
+  cat <<EOF >"$BASE/nftables/flowtable_eth.sh"
 #!/bin/bash
-interface_FT=$(find /sys/class/net ! -type d 2>/dev/null | xargs --max-args=1 realpath 2>/dev/null \
-  | grep 'device' | awk -F'/' '{print$NF}' | xargs -n1 2>/dev/null | grep -v '^lo$' | grep -v '^ifb4' | tr '\n' ',')
-[[ -z $interface_FT ]] && interface_FT="lo,"
-echo "define flowtable_eth = { ${interface_FT%,} };" > /opt/de_GWD/nftables/flowtable.eth
+interface_FT=\$(find /sys/class/net ! -type d 2>/dev/null | xargs --max-args=1 realpath 2>/dev/null \\
+  | grep 'device' | awk -F'/' '{print\$NF}' | grep -v '^lo\$' | grep -v '^ifb4' | sort -u | tr '\\n' ',' | sed 's/,\$//; s/,/, /g')
+[[ -z \$interface_FT ]] && interface_FT="lo"
+echo "define flowtable_eth = { \$interface_FT };" > $BASE/nftables/flowtable.eth
 EOF
   chmod +x "$BASE/nftables/flowtable_eth.sh"
 
-  cat <<'EOF' >"$BASE/nftables/default.nft"
-include "/opt/de_GWD/nftables/flowtable.eth"
+  cat <<EOF >"$BASE/nftables/default.nft"
+include "$BASE/nftables/flowtable.eth"
 
 table inet degwd_bypassflow {
     flowtable Acceleration {
-        hook ingress priority -300; devices = $flowtable_eth;
+        hook ingress priority -300; devices = \$flowtable_eth;
     }
     chain bypasschain {
         type filter hook forward priority -300; policy accept;
@@ -703,7 +746,8 @@ table inet degwd_router {
 EOF
 
   # 不覆盖发行版 /etc/systemd/system/nftables.service, 使用自建单元名
-  cat <<'EOF' >/etc/systemd/system/degwd-nftables.service
+  # <<EOF(不加引号) 以便按 $BASE 展开; 单元文件内无其它 shell 变量
+  cat <<EOF >/etc/systemd/system/degwd-nftables.service
 [Unit]
 Description=de_GWD nftables + CAKE shaping
 Wants=network-pre.target
@@ -717,8 +761,8 @@ RemainAfterExit=yes
 StandardInput=null
 ProtectSystem=full
 ProtectHome=true
-ExecStart=/opt/de_GWD/nftables/flowtable_eth.sh
-ExecStart=/usr/sbin/nft -f /opt/de_GWD/nftables/default.nft
+ExecStart=$BASE/nftables/flowtable_eth.sh
+ExecStart=/usr/sbin/nft -f $BASE/nftables/default.nft
 # CAKE 整形已由独立的 degwd-shaping.service 负责(After=network-online.target),
 # 此处不再重复 ExecStart=/etc/rc_online.local
 # 原为 nft flush ruleset: 会清空整机所有 nft 表(Docker/firewalld 全丢)
@@ -1203,14 +1247,15 @@ install_doh() {
   mv -f "$bin" "$BASE/dnsproxy" && chmod 755 "$BASE/dnsproxy"
   rm -rf /tmp/dnsproxy.tar.gz /tmp/dnsproxy-ex
 
-  cat <<'EOF' >/etc/systemd/system/doh-server.service
+  # <<EOF(不加引号) 以便按 $BASE 展开; 单元文件内无其它 shell 变量
+  cat <<EOF >/etc/systemd/system/doh-server.service
 [Unit]
 Description=de_GWD DoH Server (dnsproxy)
 After=network.target unbound.service
 Wants=unbound.service
 
 [Service]
-ExecStart=/opt/de_GWD/dnsproxy --listen=127.0.0.1 --https-port=9853 --tls-crt=/var/www/ssl/de_GWD.cer --tls-key=/var/www/ssl/de_GWD.key --upstream=udp://127.0.0.1:53 --upstream=tcp://127.0.0.1:53 --cache --cache-size=8192 --cache-min-ttl=60
+ExecStart=$BASE/dnsproxy --listen=127.0.0.1 --https-port=9853 --tls-crt=/var/www/ssl/de_GWD.cer --tls-key=/var/www/ssl/de_GWD.key --upstream=udp://127.0.0.1:53 --upstream=tcp://127.0.0.1:53 --cache --cache-size=8192 --cache-min-ttl=60
 Restart=always
 RestartSec=2
 LimitNOFILE=1000000
@@ -2479,7 +2524,7 @@ uninstallGWD() {
   systemctl daemon-reload
   (crontab -l 2>/dev/null | grep -vE 'de_GWD|acme\.sh') | crontab - 2>/dev/null
   rm -rf /root/.acme.sh
-  rm -rf /opt/de_GWD "$SSLDIR" "$WEBDIR"
+  rm -rf "$BASE" "$SSLDIR" "$WEBDIR"
   rm -f /etc/wireguard/wgcf.conf /usr/local/bin/xray /usr/local/bin/shuoyue /etc/rc_online.local
   rm -rf /usr/local/share/xray
   # 移除本方案写入的 drop-in 配置(不动用户原有的 sysctl/limits 配置)

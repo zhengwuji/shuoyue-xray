@@ -87,10 +87,42 @@ dl() {
 }
 
 # 下载并做完整性 + 内容校验
+# 校验顺序: sha256 清单(强) → 体积下限 + 特征串(弱兜底)。
+# 原实现只有 `grep -q '朔月\|Shuoyue\|xray'`, 任何含 "xray" 的页面(CDN 错误页、
+# 被替换的中间人响应)都能通过; 清单由仓库内 SHA256SUMS 提供, 取不到时才降级。
+SUMS=""
+fetch_sums() {
+  [[ -n $SUMS ]] && return 0
+  local t; t=$(mktemp) || return 1
+  if dl "$RAW/SHA256SUMS" "$t" && [[ -s $t ]]; then SUMS=$t; return 0; fi
+  rm -f "$t"; return 1
+}
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print$1}'
+  elif command -v busybox >/dev/null 2>&1; then busybox sha256sum "$1" | awk '{print$1}'
+  else openssl dgst -sha256 "$1" | awk '{print$NF}'; fi
+}
 dl_checked() {
   local name="$1" dest="$2" min="$3"
   dl "$RAW/$name" "$dest" || die "$name 下载失败(检查网络或稍后重试)"
   [[ $(du -sk "$dest" 2>/dev/null | awk '{print$1}') -ge "$min" ]] || die "$name 下载不完整"
+
+  local want got
+  if fetch_sums; then
+    # 清单行格式: "<sha256>  <文件名>"; 只认精确文件名匹配(避免 index 式模糊命中)
+    want=$(awk -v n="$name" '$2==n {print $1; exit}' "$SUMS")
+    if [[ -n $want ]]; then
+      got=$(sha256_of "$dest")
+      if [[ "$got" != "$want" ]]; then
+        die "$name sha256 校验失败(期望 ${want:0:16}..., 实际 ${got:0:16}...), 已中止"
+      fi
+      ok "$name sha256 校验通过 (${got:0:16}...)"
+      return 0
+    fi
+    warn "$name 不在 SHA256SUMS 清单中, 退回特征串校验"
+  else
+    warn "SHA256SUMS 获取失败, 退回特征串校验(弱校验)"
+  fi
   grep -q '朔月\|Shuoyue\|de_GWD' "$dest" || die "$name 下载内容校验失败,已中止"
 }
 

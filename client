@@ -8,7 +8,7 @@
 #  基于原版 jacyl4/de_GWD (EPL-2.0) 的功能规格重写,全部组件改用官方上游。
 #  LAN 设备将网关与 DNS 指向本机即可生效。仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.0"
+VERSION="v1.3.1"
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
 # 交互式脚本: 不启用 -e(需保留人工交互分支), 但未定义变量与管道错误必须暴露
@@ -62,6 +62,24 @@ write_atomic() {
   local t; t=$(mktemp "$1.XXXXXX") || return 1
   cat > "$t" || { rm -f "$t"; return 1; }
   chmod "$2" "$t" && mv -f "$t" "$1"
+}
+
+# 拆分 host:port, 支持 [ipv6]:port 与裸 IPv6; 结果写入全局 SP_HOST/SP_PORT
+# 原写法 `host=${x%%:*}; port=${x##*:}` 有两个坑:
+#   1. [2001:db8::1]:443 会被切成 host="[" port="db8::1]:443"
+#   2. 没有冒号时 port 会等于整个 host(而非空), 后续 --argjson port 直接报错
+split_hostport() {
+  local hp="$1"
+  SP_HOST=""; SP_PORT=""
+  if [[ $hp == \[*\]* ]]; then
+    SP_HOST=${hp%%\]*}; SP_HOST=${SP_HOST#[}
+    [[ $hp == *\]:* ]] && SP_PORT=${hp##*\]:}
+  elif [[ $hp == *:*:* ]]; then
+    SP_HOST=$hp                      # 裸 IPv6(多冒号且无方括号): 无端口
+  else
+    SP_HOST=${hp%%:*}; SP_PORT=${hp##*:}
+    [[ $SP_PORT == "$SP_HOST" ]] && SP_PORT=""
+  fi
 }
 
 detect_nic() {
@@ -189,8 +207,13 @@ EOF
 
 pkg_dep() {
   local need="" p
-  for p in jq qrencode curl wget dnsutils nftables chrony ethtool bc \
-           ca-certificates gnupg unzip wireguard-tools util-linux; do
+  # 只装真正用到的包。已删除(全文无调用, 计数为 1 即只出现在本列表):
+  #   socat/screen/bc/unzip/gnupg/wget —— 无任何调用
+  #   resolvconf —— 会接管 /etc/resolv.conf, 与 resolv_setup() 手写的内容冲突
+  # 保留: util-linux(flock), wireguard-tools(wg/wg-quick), dnsutils(dig),
+  #       gnupg(installkernel 校验 Zabbly key 指纹), ca-certificates(HTTPS 信任链)
+  for p in jq qrencode curl dnsutils nftables chrony ethtool \
+           ca-certificates gnupg wireguard-tools util-linux; do
     dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
   done
   dpkg -s smartdns >/dev/null 2>&1 || need="$need smartdns"
@@ -479,7 +502,7 @@ EOF
   ncnt=$(echo "$nodes" | jq 'length' 2>/dev/null || echo 0)
   while [[ $i -lt $ncnt ]]; do
     addr=$(echo "$nodes" | jq -r ".[$i].address")
-    d=${addr%%:*}
+    split_hostport "$addr"; d=$SP_HOST
     ip=$(echo "$nodes" | jq -r ".[$i].ip // empty")
     [[ -n $ip ]] && echo "address /$d/$ip" >>"$SDNSDIR/smartdns.conf"
     i=$((i+1))
@@ -936,7 +959,7 @@ refresh_v2node() {
   nodes=$(conf_get '.nodes')
   ncnt=$(echo "$nodes" | jq 'length' 2>/dev/null || echo 0)
   while [[ $i -lt $ncnt ]]; do
-    addr=$(echo "$nodes" | jq -r ".[$i].address"); d=${addr%%:*}
+    addr=$(echo "$nodes" | jq -r ".[$i].address"); split_hostport "$addr"; d=$SP_HOST
     ip=$(echo "$nodes" | jq -r ".[$i].ip // empty")
     [[ -z $ip ]] && ip=$(dig +short +time=3 +tries=1 @"$DNS_ALI" "$d" A 2>/dev/null | grep -E '^[0-9.]+$' | head -n1)
     [[ -n $ip ]] && { echo "$ip" >> "$BASE/nftables/IP_V2NODE"; conf_raw ".nodes[$i].ip" "\"$ip\""; }
@@ -1022,7 +1045,7 @@ EOF
 sb_client_gen() {   # 为当前活动节点生成 client.json
   local i; i=$(conf_get '.nodeActive'); [[ -z $i ]] && return 1
   local addr host port proto uuid password sni insecure
-  addr=$(conf_get ".nodes[$i].address"); host=${addr%%:*}; port=${addr##*:}
+  addr=$(conf_get ".nodes[$i].address"); split_hostport "$addr"; host=$SP_HOST; port=$SP_PORT
   proto=$(conf_get ".nodes[$i].proto")
   uuid=$(conf_get ".nodes[$i].uuid"); password=$(conf_get ".nodes[$i].password")
   sni=$(conf_get ".nodes[$i].tls"); [[ -z $sni ]] && sni=$host
@@ -1099,7 +1122,7 @@ node_outbound() {   # $1 = node index, $2 = tag
   local addr host port proto uuid password path sni pbk sid flow method ins insecure scy
   local enc mode nhost fp alpn
   addr=$(conf_get ".nodes[$i].address")
-  host=${addr%%:*}; port=${addr##*:}
+  split_hostport "$addr"; host=$SP_HOST; port=$SP_PORT
   proto=$(conf_get ".nodes[$i].proto"); proto=${proto:-vmess}
   uuid=$(conf_get ".nodes[$i].uuid"); password=$(conf_get ".nodes[$i].password")
   path=$(conf_get ".nodes[$i].path"); sni=$(conf_get ".nodes[$i].tls"); [[ -z $sni ]] && sni=$host
@@ -1510,7 +1533,7 @@ installGWD() {
   conf_set '.net.gateway' "$gw"
 
   # 节点(追加, 不覆盖已有节点)
-  local addr uuid path tls
+  local addr uuid path host
   while :; do
     addr=$(ask "服务端地址 (domain:port): ")
     [[ "$addr" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] && break
@@ -1518,11 +1541,13 @@ installGWD() {
   done
   uuid=$(ask "UUID: "); [[ -z $uuid ]] && die "UUID 不能为空"
   path=$(ask "WS path (回车=tcp 直连): ")
-  tls=${addr%%:*}
-  local dip; dip=$(dig +short +time=3 +tries=1 @"$DNS_ALI" "${addr%%:*}" A 2>/dev/null | grep -E '^[0-9.]+$' | head -n1)
+  # host 同时用作 SNI(裸 IP 节点没有域名时 tls 字段留空更准确)
+  split_hostport "$addr"; host=$SP_HOST
+  local dip; dip=$(dig +short +time=3 +tries=1 @"$DNS_ALI" "$host" A 2>/dev/null | grep -E '^[0-9.]+$' | head -n1)
   # 用 jq -n 组装(手拼 JSON 遇引号/反斜杠会产出非法配置); 追加而非整体替换
-  local newnode nf
-  newnode=$(jq -cn --arg n "$(echo "$tls" | cut -d. -f1)" --arg a "$addr" --arg t "$tls" \
+  local newnode nf sni
+  sni="$host"; [[ "$host" =~ ^[0-9.]+$ ]] && sni=""
+  newnode=$(jq -cn --arg n "$(echo "$host" | cut -d. -f1)" --arg a "$addr" --arg t "$sni" \
                  --arg u "$uuid" --arg p "$path" --arg i "${dip:-}" \
     '{proto:"vmess", name:$n, address:$a, tls:$t, uuid:$u, path:$p, ip:$i}') || die "节点组装失败"
   nf=$(mktemp "$BASE/.node.XXXXXX") || die "无法创建临时文件"
@@ -1702,7 +1727,7 @@ parse_share_link() {
     vless)
       auth=${body%%\?*}
       uuid=${auth%%@*}; hostport=${auth#*@}
-      host=${hostport%%:*}; port=${hostport##*:}
+      split_hostport "$hostport"; host=$SP_HOST; port=$SP_PORT
       q="?${body#*\?}"; [[ "$q" == "?$body" ]] && q=""
       sni=$(qget sni "$q"); pbk=$(qget pbk "$q"); sid=$(qget sid "$q")
       path=$(qget path "$q"); flow=$(qget flow "$q")
@@ -1734,7 +1759,7 @@ parse_share_link() {
     trojan)
       auth=${body%%\?*}
       password=${auth%%@*}; hostport=${auth#*@}
-      host=${hostport%%:*}; port=${hostport##*:}
+      split_hostport "$hostport"; host=$SP_HOST; port=$SP_PORT
       q="?${body#*\?}"; [[ "$q" == "?$body" ]] && q=""
       sni=$(qget sni "$q"); path=$(qget path "$q")
       local ttyp tproto
@@ -1756,7 +1781,7 @@ parse_share_link() {
         hostport=${methodpass#*@}; methodpass=${methodpass%%@*}
       fi
       [[ -z $methodpass ]] && return 1
-      host=${hostport%%:*}; port=${hostport##*:}
+      split_hostport "$hostport"; host=$SP_HOST; port=$SP_PORT
       # 只按第一个 ':' 切分: SS2022 密钥(可能含 / + =)不会被切坏
       method=${methodpass%%:*}; password=${methodpass#*:}
       [[ -z $password || $password == "$methodpass" ]] && return 1
@@ -1773,7 +1798,7 @@ parse_share_link() {
       else
         sinfo=""; hostport=$auth
       fi
-      host=${hostport%%:*}; port=${hostport##*:}
+      split_hostport "$hostport"; host=$SP_HOST; port=$SP_PORT
       [[ -z $port || $port == "$host" ]] && port="1080"
       uuid=""; password=""
       if [[ -n $sinfo ]]; then
@@ -1798,7 +1823,7 @@ parse_share_link() {
         uinfo=""; hostport=$auth
       fi
       uuid=${uinfo%%:*}; password=${uinfo#*:}
-      host=${hostport%%:*}; port=${hostport##*:}
+      split_hostport "$hostport"; host=$SP_HOST; port=$SP_PORT
       q="?${nbody#*\?}"; [[ "$q" == "?$nbody" ]] && q=""
       sni=$(qget sni "$q"); [[ -z $sni || $sni == "null" ]] && sni=$host
       insecure=$(norm_insecure "$(qget insecure "$q")")
@@ -1809,7 +1834,7 @@ parse_share_link() {
     hy2|hysteria2)
       auth=${body%%\?*}
       password=${auth%%@*}; hostport=${auth#*@}
-      host=${hostport%%:*}; port=${hostport##*:}
+      split_hostport "$hostport"; host=$SP_HOST; port=$SP_PORT
       q="?${body#*\?}"; [[ "$q" == "?$body" ]] && q=""
       sni=$(qget sni "$q"); insecure=$(norm_insecure "$(qget insecure "$q")")
       jq -cn --arg n "$name" --arg a "$host:$port" --arg pw "$password" --arg s "$sni" --argjson i "$insecure" \
@@ -1819,7 +1844,7 @@ parse_share_link() {
       auth=${body%%\?*}
       local userpass; userpass=${auth%%@*}; hostport=${auth#*@}
       uuid=${userpass%%:*}; password=${userpass#*:}
-      host=${hostport%%:*}; port=${hostport##*:}
+      split_hostport "$hostport"; host=$SP_HOST; port=$SP_PORT
       q="?${body#*\?}"; [[ "$q" == "?$body" ]] && q=""
       sni=$(qget sni "$q"); insecure=$(norm_insecure "$(qget allow_insecure "$q")")
       jq -cn --arg n "$name" --arg a "$host:$port" --arg u "$uuid" --arg pw "$password" \
@@ -1829,7 +1854,7 @@ parse_share_link() {
     anytls)
       auth=${body%%\?*}
       password=${auth%%@*}; hostport=${auth#*@}
-      host=${hostport%%:*}; port=${hostport##*:}
+      split_hostport "$hostport"; host=$SP_HOST; port=$SP_PORT
       q="?${body#*\?}"; [[ "$q" == "?$body" ]] && q=""
       sni=$(qget sni "$q"); insecure=$(norm_insecure "$(qget insecure "$q")")
       jq -cn --arg n "$name" --arg a "$host:$port" --arg pw "$password" --arg s "$sni" --argjson i "$insecure" \
@@ -1889,13 +1914,20 @@ nodes_switch() {
   nodes_list
   local i; i=$(ask "切换到节点序号(1-based): ")
   [[ ! "$i" =~ ^[0-9]+$ || $i -lt 1 ]] && return
-  local n; n=$(conf_get '.nodes' | jq 'length')
-  [[ $i -gt $n ]] && die "序号不存在"
-  local idx=$((i-1))
+  nodes_switch_idx "$i"
+}
+# $1 = 1-based 序号; 菜单与 --node-switch 共用, 非交互
+nodes_switch_idx() {
+  local i="$1" n idx
+  conf_init
+  n=$(conf_get '.nodes' | jq 'length' 2>/dev/null || echo 0)
+  [[ ! "$i" =~ ^[0-9]+$ || $i -lt 1 ]] && { err "节点序号必须为正整数: ${i:-空}"; return 1; }
+  [[ $i -gt $n ]] && { err "节点序号不存在(共 $n 个)"; return 1; }
+  idx=$((i-1))
   conf_set '.nodeActive' "$idx"
   apply_node_bridge
   refresh_v2node
-  xray_gen_config
+  xray_gen_config || { err "Xray 配置生成失败"; return 1; }
   svc_restart xray && ok "已切换到节点 $i ($(conf_get ".nodes[$idx].name"))"
 }
 nodes_ping() {
@@ -1903,15 +1935,15 @@ nodes_ping() {
   local i; i=$(ask "测延迟节点序号(1-based): ")
   [[ ! "$i" =~ ^[0-9]+$ || $i -lt 1 ]] && return
   local idx=$((i-1))
-  local addr tls proto
-  addr=$(conf_get ".nodes[$idx].address"); tls=${addr%%:*}
-  local port; port=${addr##*:}
+  local addr host proto
+  addr=$(conf_get ".nodes[$idx].address"); split_hostport "$addr"; host=$SP_HOST
+  local port; port=$SP_PORT
   proto=$(conf_get ".nodes[$idx].proto")
   if [[ $proto == "hy2" || $proto == "tuic" ]]; then
     warn "$proto 为纯 UDP 协议, TCP 握手测试仅供参考"
   fi
   local ms rc
-  ms=$(curl -o /dev/null -m 5 -kIs -w '%{time_connect}' "https://$tls:$port" 2>/dev/null); rc=$?
+  ms=$(curl -o /dev/null -m 5 -kIs -w '%{time_connect}' "https://$host:$port" 2>/dev/null); rc=$?
   ms=$(printf '%s' "$ms" | awk '{printf "%.0f", $1*1000}')
   # 原版不判返回码: curl 失败时 time_connect 输出 0, 会谎报 0ms
   if [[ $rc -ne 0 || -z $ms ]]; then
@@ -1926,7 +1958,7 @@ nodes_speed() {
   [[ ! "$i" =~ ^[0-9]+$ || $i -lt 1 ]] && return
   local idx=$((i-1))
   local addr host port spd rc
-  addr=$(conf_get ".nodes[$idx].address"); host=${addr%%:*}; port=${addr##*:}
+  addr=$(conf_get ".nodes[$idx].address"); split_hostport "$addr"; host=$SP_HOST; port=$SP_PORT
   local url="https://$host:$port/spt"; [[ $port == "443" ]] && url="https://$host/spt"
   echo "  下载测速中(限时 20s)..."
   # 原版用 wget + tail -n2 解析, 无超时且输出格式随版本变化
@@ -1991,9 +2023,11 @@ split_sm() {
     ni=$(ask "  $cat (当前=${cur:-未设置}): ")
     [[ -z $ni ]] && continue
     if [[ "$ni" == "x" ]]; then
-      conf_raw ".split.sm" "$(conf_get '.split.sm' | jq 'del(.'$cat')')"
+      # 用 --arg 传键名, 不再用 shell 插值拼 jq 过滤器
+      # (原 '. + {'"$cat"':$v}' 在键名含特殊字符时会拼出非法过滤器)
+      conf_raw ".split.sm" "$(conf_get '.split.sm' | jq --arg c "$cat" 'del(.[$c])')"
     elif [[ "$ni" =~ ^[0-9]+$ ]]; then
-      conf_raw ".split.sm" "$(conf_get '.split.sm' | jq --argjson v "$ni" '. + {'\"$cat\"':$v}')"
+      conf_raw ".split.sm" "$(conf_get '.split.sm' | jq --arg c "$cat" --argjson v "$ni" '. + {($c): $v}')"
     else
       warn "  $cat: 请输入 0(直连) / 节点序号 / x(清除) / 回车(不变), 已跳过"
     fi
@@ -2202,7 +2236,9 @@ MTU = 1400
 [Peer]
 PublicKey = $(conf_get '.wg.serverPub')
 EndPoint = $wan:$wgport
-AllowedIPs = 0.0.0.0/0, ::/0
+# 网关是 IPv4-only(sysctl 里 disable_ipv6=1), 写 ::/0 会让 wg-quick 尝试加
+# IPv6 路由并在部分内核上直接报错, 故只保留 IPv4 全路由
+AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 15
 EOF
       chmod 600 "/etc/wireguard/client$i.conf"
@@ -2346,8 +2382,9 @@ printRelay() {
     local port uuid
     port=$(echo "$relays" | jq -r ".[$r].port"); uuid=$(echo "$relays" | jq -r ".[$r].uuid")
     local vmj b64
-    vmj=$(jq -cn --arg add "$wan" --arg port "$port" --arg id "$uuid" \
-      '{v:"2",ps:"relay'"$port"'",add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"tcp",type:"none",tls:""}')
+    # ps 也用 --arg 传入: 原写法 ps:"relay'"$port"'" 是把 shell 值拼进 jq 过滤器
+    vmj=$(jq -cn --arg add "$wan" --arg port "$port" --arg id "$uuid" --arg ps "relay$port" \
+      '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"tcp",type:"none",tls:""}')
     b64=$(echo -n "$vmj" | base64 -w0)
     echo -e "${WHITE}中转线 $port : vmess://$b64${cRES}"
     r=$((r+1))
@@ -2374,21 +2411,44 @@ health_check() {   # $1="full" 才跑外网探测(主菜单每轮调用会拖慢
 
 # ================================================================ 内核 =========
 installkernel() {
-  local codename; codename=$(. /etc/os-release; echo "$VERSION_CODENAME")
+  local codename; codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
+  [[ -z $codename ]] && { err "无法识别发行版 codename"; return 1; }
   mkdir -p /etc/apt/keyrings
-  curl -fsSL https://zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
-  cat <<EOF >/etc/apt/sources.list.d/zabbly-kernels-stable.sources
+  # 源 URI 原写 zabbly.com/kernel/stable(实测 404/502), 官方仓库在 pkgs.zabbly.com
+  curl -fsSL --max-time 30 https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc \
+    || { err "Zabbly GPG key 下载失败"; return 1; }
+  # 校验指纹: 只信任 Zabbly Kernel Builds 官方 key, 防止上游被投毒
+  local ZABBLY_FPR="4EFC590696CB15B87C73A3AD82CC8797C838DCFD" fpr=""
+  fpr=$(gpg --show-keys --with-fingerprint --with-colons /etc/apt/keyrings/zabbly.asc 2>/dev/null \
+        | awk -F: '/^fpr:/{print $10; exit}')
+  if [[ -z $fpr ]]; then
+    # 老版本 gpg 无 --show-keys: 导到临时 keyring 再取指纹, 不污染用户 keyring
+    local kd; kd=$(mktemp -d)
+    GNUPGHOME="$kd" gpg --import /etc/apt/keyrings/zabbly.asc >/dev/null 2>&1
+    fpr=$(GNUPGHOME="$kd" gpg --with-colons --fingerprint 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}')
+    rm -rf "$kd"
+  fi
+  if [[ "$fpr" != "$ZABBLY_FPR" ]]; then
+    rm -f /etc/apt/keyrings/zabbly.asc
+    err "Zabbly GPG key 指纹不匹配(期望 $ZABBLY_FPR, 实际 ${fpr:-无法读取}), 已中止安装"
+    return 1
+  fi
+  ok "Zabbly GPG key 指纹校验通过: ${fpr:0:16}..."
+  write_atomic /etc/apt/sources.list.d/zabbly-kernels-stable.sources 644 <<EOF
 Enabled: yes
 Types: deb
-URIs: https://zabbly.com/kernel/stable
+URIs: https://pkgs.zabbly.com/kernel/stable
 Suites: $codename
 Components: main
 Signed-By: /etc/apt/keyrings/zabbly.asc
 EOF
-  apt-get update -qq && apt-get install -y -qq linux-zabbly
+  apt-get update -qq
+  apt-get install -y -qq linux-zabbly \
+    || { err "Zabbly 内核不支持该发行版/套件($codename), 仅支持 Debian 12/13 与 Ubuntu 22.04/24.04"; return 1; }
   ok "内核已安装, 重启生效"
   read -rsp "现在重启? [y/N]: " -n1 r; echo
   [[ "$r" =~ ^[Yy] ]] && reboot
+  return 0
 }
 
 # ================================================================ 自动更新 =====
@@ -2402,7 +2462,9 @@ SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 VERSION_FILE="$BASE/.version"
 lv=$(cat "$VERSION_FILE" 2>/dev/null)
 [[ -z $lv ]] && lv=$(bash "$SELF" --version 2>/dev/null | awk '{print $NF}')
-REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
+# 仓库地址由外层注入(占位符 __REMOTE_BASE__ 在写入后替换),
+# 避免这里再抄一份 URL 导致改地址时漏改
+REMOTE_BASE="__REMOTE_BASE__"
 rv=$(curl -fsSL --max-time 15 "$REMOTE_BASE/version" 2>/dev/null | head -n1)
 [[ -z $rv || -z $lv ]] && exit 0
 [[ "$lv" == "$rv" ]] && exit 0
@@ -2425,6 +2487,8 @@ install -m 755 "$new" "$SELF" || exit 1
 echo "$rv" > "$VERSION_FILE"
 exec bash "$SELF" --update
 EOF
+  # 注入仓库地址(heredoc 用 <<'EOF' 保持字面, 占位符在此替换)
+  sed -i "s|__REMOTE_BASE__|$REMOTE_BASE|" "$BASE/autoUpdate"
   if command -v crontab >/dev/null 2>&1; then
     (crontab -l 2>/dev/null | grep -F -v -- "$BASE/autoUpdate"; echo "0 5 * * * $BASE/autoUpdate") | crontab -
   else
@@ -2444,7 +2508,7 @@ autoupdate_off() {
 gen_node_link() {   # $1 = idx
   local i="$1" addr host port proto uuid password path sni pbk sid flow method insecure name
   local enc mode nhost fp
-  addr=$(conf_get ".nodes[$i].address"); host=${addr%%:*}; port=${addr##*:}
+  addr=$(conf_get ".nodes[$i].address"); split_hostport "$addr"; host=$SP_HOST; port=$SP_PORT
   proto=$(conf_get ".nodes[$i].proto"); proto=${proto:-vmess}
   uuid=$(conf_get ".nodes[$i].uuid"); password=$(conf_get ".nodes[$i].password")
   path=$(conf_get ".nodes[$i].path"); sni=$(conf_get ".nodes[$i].tls"); [[ -z $sni ]] && sni=$host
@@ -2722,6 +2786,20 @@ case "${1:-}" in
   --lists)     download_lists && refresh_nft_sets; exit 0 ;;
   --ddns)      ddns_update_cf; exit 0 ;;
   --status)    conf_init; health_check full; exit 0 ;;
+  --node-switch)
+    # 非交互切换活动节点: --node-switch N (1-based)
+    [[ -z ${2:-} ]] && { err "用法: bash client --node-switch <序号>"; exit 2; }
+    nodes_switch_idx "$2" || exit 1
+    exit 0 ;;
+  --regen)
+    # 仅重新生成配置与规则并重启服务(不下载、不装包)
+    conf_init
+    xray_gen_config || { err "Xray 配置生成失败"; exit 1; }
+    apply_node_bridge
+    svc_restart xray || { err "Xray 重启失败"; exit 1; }
+    nftables_apply || { err "nftables 重建失败"; exit 1; }
+    ok "配置与规则已重建"
+    exit 0 ;;
   --uninstall) uninstallGWD; exit 0 ;;
   --version)   echo "$VERSION"; exit 0 ;;
   --help|-h)
@@ -2729,14 +2807,16 @@ case "${1:-}" in
 朔月 Shuoyue $VERSION — 旁路网关客户端
 
 用法: bash client [子命令]
-  --install     安装并初始化 de_GWD
-  --update      更新 Xray/规则/配置并重启服务
-  --lists       仅更新分流规则列表(供 cron 调用)
-  --ddns        更新 Cloudflare DDNS 记录(供 cron 调用)
-  --status      打印服务状态与完整连通性检测
-  --uninstall   卸载 de_GWD(恢复 DNS, 删除 nft 表与自建单元)
-  --version     显示版本
-  --help        显示本帮助
+  --install          安装并初始化 de_GWD
+  --update           更新 Xray/规则/配置并重启服务
+  --lists            仅更新分流规则列表(供 cron 调用)
+  --ddns             更新 Cloudflare DDNS 记录(供 cron 调用)
+  --status           打印服务状态与完整连通性检测
+  --node-switch N    切换到第 N 个节点(1-based, 非交互)
+  --regen            仅重建配置与 nftables 规则并重启服务
+  --uninstall        卸载 de_GWD(恢复 DNS, 删除 nft 表与自建单元)
+  --version          显示版本
+  --help             显示本帮助
 
 无参数 = 打开交互式管理菜单。
 日志: $LOG_FILE

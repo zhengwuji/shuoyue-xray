@@ -32,6 +32,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/
 # 之后随时输入 shuoyue 打开菜单
 ```
 
+> **下载完整性**:`install.sh` 会先取仓库根目录的 `SHA256SUMS` 校验 `server` /
+> `client` / `client-openwrt` / `panel.py` 的哈希,不匹配立即中止;取不到清单时
+> 退回体积下限 + 特征串的弱校验(会打印警告)。清单由仓库根目录的
+> `gen_sums.sh` 生成 —— 改动上述任一文件后必须重新生成,否则安装会被
+> 自己的校验挡下。
+
 方式二(手动上传):
 
 ```bash

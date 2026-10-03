@@ -1,7 +1,17 @@
+# 全部文本文件按内容自动识别; 但下面这些必须是 LF —— 它们是 Linux 上直接
+# 执行的脚本/配置, CRLF 会让 bash 报 `\r: command not found` 并让 nft/unit 解析失败。
+# 显式列出(而非只靠 text=auto)是因为 Windows 克隆时 core.autocrlf=true 会把
+# 未标记的文件在检出时转成 CRLF。
 * text=auto
 date eol=lf
 install.sh eol=lf
 server eol=lf
 client eol=lf
+client-openwrt eol=lf
+panel.py eol=lf
+version eol=lf
+SHA256SUMS eol=lf
 LICENSE.md eol=lf
 README.md eol=lf
+REVIEW-优化建议.md eol=lf
+*.sh eol=lf
