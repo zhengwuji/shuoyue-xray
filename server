@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.1"
+VERSION="v1.3.2"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -1855,12 +1855,20 @@ singbox_gen_config() {
 # 链接发射器: GEN_LINKS_TAGGED 非空时输出 "id|显示名|链接", 否则只输出链接
 # 节点名统一加 conf .prefix 前缀(面板可改), 便于客户端里区分
 emit_link() {
-  local id="$1" link="$2" pfx; pfx=$(conf_get '.prefix')
+  local id="$1" link="$2" pfx tag; pfx=$(conf_get '.prefix'); tag=$(proto_name "$id")
   if [[ -n $pfx ]]; then
-    link="${link%%#*}#${pfx}${link#*#}"
+    if [[ $link == *'#'* ]]; then
+      link="${link%%#*}#${pfx}${link#*#}"
+    else
+      # 没有 '#' 片段时直接追加。原写法 `${link%%#*}#${pfx}${link#*#}` 在无 '#'
+      # 时 %%#* 与 #*# 都返回整串 → 整条链接被复制一遍:
+      #   vmess://eyJ...  →  vmess://eyJ...#朔月vmess://eyJ...
+      # vmess 的节点名在 base64 内的 ps 字段, 链接本身不带 '#', 必然命中。
+      link="${link}#${pfx}${tag}"
+    fi
   fi
   if [[ -n ${GEN_LINKS_TAGGED:-} ]]; then
-    printf '%s|%s|%s\n' "$id" "$(proto_name "$id")" "$link"
+    printf '%s|%s|%s\n' "$id" "$tag" "$link"
   else
     printf '%s\n' "$link"
   fi
