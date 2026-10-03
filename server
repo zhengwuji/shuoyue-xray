@@ -1184,13 +1184,15 @@ EOF
 # WSENC_END
 EOF
     fi
-    # Web 面板反代(如果装了面板): 随机路径段, 反代到 127.0.0.1:3000
-    local ppanel; ppanel=$(conf_get '.panel.path')
+    # Web 面板反代(如果装了面板): 随机路径段, 反代到 127.0.0.1:<pport>
+    local ppanel pport
+    ppanel=$(conf_get '.panel.path')
+    pport=$(panel_port)
     if [[ -n $ppanel ]] && systemctl is-enabled degwd-panel >/dev/null 2>&1; then
       cat <<EOF
 # PANEL_START
     location /$ppanel/ {
-        proxy_pass http://127.0.0.1:3000/$ppanel/;
+        proxy_pass http://127.0.0.1:$pport/$ppanel/;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -2062,16 +2064,17 @@ installGWD() {
   svc_restart degwd-shaping 2>/dev/null
   svc_restart degwd-nftables && ok "nftables 防火墙 + CAKE 流量整形" || warn "nftables 未启动"
 
-  # 防火墙放行面板端口 (若开启了 ufw)
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow 3000/tcp >/dev/null 2>&1 && ok "ufw 已放行 3000/tcp"
-  fi
-
   ok "安装基础代理内核 (Xray)..."
   install_xray
 
   ok "部署并启动 Web 控制面板..."
   install_panel
+
+  local pport; pport=$(panel_port)
+  # 防火墙放行面板端口 (若开启了 ufw)
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow ${pport}/tcp >/dev/null 2>&1 && ok "ufw 已放行 ${pport}/tcp"
+  fi
 
   enable_autoupdate_ask
 
@@ -2080,7 +2083,7 @@ installGWD() {
   laddr=$(local_ip)
   path=$(conf_get '.panel.path')
   tok=$(conf_get '.panel.token')
-  panel_url="http://${wan:-$laddr}:${PANEL_PORT}/${path}/?t=${tok}"
+  panel_url="http://${wan:-$laddr}:${pport}/${path}/?t=${tok}"
 
   echo
   echo -e "${GREEN}===================================================================${cRES}"
@@ -2091,7 +2094,7 @@ installGWD() {
   echo
   echo -e "  ${CYAN}▶ 面板访问地址:${cRES}  ${YELLOW}${panel_url}${cRES}"
   if [[ -n $wan && -n $laddr && $wan != "$laddr" ]]; then
-    echo -e "  ${CYAN}▶ 内网备用地址:${cRES}  http://${laddr}:${PANEL_PORT}/${path}/?t=${tok}"
+    echo -e "  ${CYAN}▶ 内网备用地址:${cRES}  http://${laddr}:${pport}/${path}/?t=${tok}"
   fi
   echo
   echo -e "${WHITE}  使用说明:${cRES}"
@@ -2560,14 +2563,31 @@ resetPassword() {
 
 changePort() {
   conf_init
-  domain_proto_on || die "当前仅启用免域名协议(Reality/SS/hy2/tuic/anytls 端口各自固定),无 nginx 端口可改"
-  echo "当前端口: $(conf_get '.port')"
-  local np; np=$(ask "新端口 (443 或 1024-65535): ")
-  service_port_valid "$np" || die "端口无效: 需 443 或 1024-65535, 且不能占用内核内部端口"
-  conf_set '.port' "$np"
-  regen_all
-  nginx -t >/dev/null 2>&1 && systemctl restart nginx && ok "端口已更改为 $np(订阅/链接已同步)" || warn "nginx 配置异常,请运行 nginx -t 检查"
-  printNode
+  echo
+  echo -e "${CYAN}=== 更改端口管理 ===${cRES}"
+  echo "  [1] 更改业务节点服务端口 (Nginx TLS 端口, 当前: $(conf_get '.port // 443'))"
+  echo "  [2] 更改 Web 控制面板端口 (网页 GUI 端口, 当前: $(panel_port))"
+  echo "  [q] 返回"
+  echo
+  read -rp "请选择 [1/2, q 返回]: " opt
+  case $opt in
+    1)
+      domain_proto_on || die "当前仅启用免域名协议(Reality/SS/hy2/tuic/anytls 端口各自固定), 无 nginx 端口可改"
+      echo "当前端口: $(conf_get '.port')"
+      local np; np=$(ask "新端口 (443 或 1024-65535): ")
+      service_port_valid "$np" || die "端口无效: 需 443 或 1024-65535, 且不能占用内核内部端口"
+      conf_set '.port' "$np"
+      regen_all
+      nginx -t >/dev/null 2>&1 && systemctl restart nginx && ok "业务端口已更改为 $np(订阅/链接已同步)" || warn "nginx 配置异常,请运行 nginx -t 检查"
+      printNode
+      ;;
+    2)
+      change_panel_port
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 uninstallGWD() {
@@ -2638,7 +2658,7 @@ config_menu() {
     4) changePath ;;
     5) changeWGCF ;;
     6) changeTCPPF ;;
-    7) install_panel ;;
+    7) panel_menu ;;
   esac
 }
 
@@ -2649,6 +2669,7 @@ status_panel() {
   [[ -f $SSLDIR/de_GWD.cer ]] && echo -e "  证书到期: $(openssl x509 -enddate -noout -in $SSLDIR/de_GWD.cer 2>/dev/null | cut -d= -f2)"
   svc_ok wg-quick@wgcf && echo -e "${PURPLE}  [Enabled] Cloudflare WARP${cRES}"
   svc_ok haproxy && echo -e "${PURPLE}  [Enabled] HAProxy TCP Port Forward${cRES}"
+  svc_ok degwd-panel && echo -e "${PURPLE}  [Enabled] Web 控制面板 (端口: $(panel_port))${cRES}"
 }
 
 start_menu() {
@@ -2663,12 +2684,12 @@ start_menu() {
     echo "  2. 升级 (Update: 组件最新版 + 系统全面升级)"
     echo "  3. 卸载 (Uninstall, 完整移除)"
     echo "  4. 更改配置 (域名/协议开关/Reality/WS path/WARP/转发/面板)"
-    echo "  5. 更改端口 (Port, 仅 nginx 类协议)"
+    echo "  5. 更改端口 (Port: 业务节点服务端口与 Web GUI 端口)"
     echo "  6. 重置 UUID/密码 (所有协议同步, 订阅自动更新)"
     echo "  7. 节点信息/订阅 (Info + v2rayN 导入示例)"
     echo "  8. Cloudflare 测速"
     [[ $VIRT_TYPE != "container" ]] && echo "  9. 升级内核 (Kernel, Zabbly)"
-    echo "  P. 查看 / 重启 Web 面板 (获取面板登录 URL / 状态)"
+    echo "  P. Web 控制面板管理 (查看完整地址 / 修改端口 / 重启)"
     echo "  C. 终端命令行交互安装 (旧版 CLI 字符界面勾选)"
     echo "  0. 自动更新开关 (AutoUpdate)"
     echo " CTRL+C 退出"
@@ -2684,7 +2705,7 @@ start_menu() {
       7) printNode ;;
       8) CFspeedTest ;;
       9) installkernel ;;
-      [Pp]) install_panel ;;
+      [Pp]) panel_menu ;;
       [Cc]) cli_install_legacy ;;
       0) autoUpdateGWD ;;
       *) warn "输入有误" ;;
@@ -2772,12 +2793,54 @@ apply_protos() {
 }
 
 # =============================================================== Web 面板 ====
-# 单文件 Python3 标准库面板(panel.py), 默认监听 0.0.0.0:3000 (支持 DEGWD_PANEL_BIND 覆盖)
-# 由 nginx 反代到 https://<域名>/<随机路径>/ (若配置了域名) 或直接访问 http://<IP>:3000/<随机路径>/
+# 单文件 Python3 标准库面板(panel.py), 监听 0.0.0.0 (支持 DEGWD_PANEL_BIND 覆盖)
+# 默认端口随机生成并落盘于 conf .panel.port, 可通过菜单自由修改与查询
 PANEL_DIR="$BASE/panel"
 PANEL_PY="$PANEL_DIR/panel.py"
 PANEL_BIND="${DEGWD_PANEL_BIND:-0.0.0.0}"
-PANEL_PORT="3000"
+
+# 产生 10000 - 60000 间随机未占用的端口(规避保留端口与正在监听的端口)
+panel_rand_port() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PYEOF'
+import random, socket
+reserved = {53, 80, 443, 1080, 3000, 8388, 8442, 8443, 8444, 8445, 8446, 8447, 8448, 8449, 8450, 8451, 8452, 9853, 9890, 9891, 9892, 9893, 9894, 9895, 9896, 51820}
+found = None
+for _ in range(100):
+    p = random.randint(10000, 60000)
+    if p in reserved:
+        continue
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", p))
+            found = p
+            break
+    except Exception:
+        continue
+print(found or random.randint(20000, 50000))
+PYEOF
+  else
+    shuf -i 10000-60000 -n 1 2>/dev/null || awk 'BEGIN{srand(); print int(rand()*(60000-10000)+10000)}'
+  fi
+}
+
+# 获取当前面板端口; 若未设置则自动随机分配并落盘
+panel_port() {
+  local p
+  p=$(conf_get '.panel.port')
+  if [[ -n $p && $p =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then
+    echo "$p"
+    return 0
+  fi
+  if [[ -n ${DEGWD_PANEL_PORT:-} && $DEGWD_PANEL_PORT =~ ^[0-9]+$ ]] && (( DEGWD_PANEL_PORT >= 1 && DEGWD_PANEL_PORT <= 65535 )); then
+    echo "$DEGWD_PANEL_PORT"
+    return 0
+  fi
+  p=$(panel_rand_port)
+  conf_set '.panel.port' "$p" 2>/dev/null || true
+  echo "$p"
+}
 
 # 从仓库拉 panel.py(多源回退 + 内容校验)
 fetch_panel_py() {
@@ -2799,6 +2862,7 @@ fetch_panel_py() {
 }
 
 panel_unit_conf() {
+  local pport; pport=$(panel_port)
   write_atomic /etc/systemd/system/degwd-panel.service 644 <<EOF
 [Unit]
 Description=Shuoyue de_GWD Web Panel
@@ -2810,7 +2874,7 @@ User=root
 WorkingDirectory=$PANEL_DIR
 Environment=DEGWD_BASE=$BASE
 Environment=DEGWD_PANEL_BIND=$PANEL_BIND
-Environment=DEGWD_PANEL_PORT=$PANEL_PORT
+Environment=DEGWD_PANEL_PORT=$pport
 ExecStart=$(command -v python3) $PANEL_PY
 Restart=on-failure
 RestartSec=3
@@ -2828,7 +2892,7 @@ EOF
 }
 
 # 把面板挂到 nginx: 直接重建 default.conf —— nginx_web_conf 会按
-# conf .panel.path 自动插入 # PANEL_START 段(反代到 127.0.0.1:3000)
+# conf .panel.path 自动插入 # PANEL_START 段(反代到 127.0.0.1:<pport>)
 nginx_panel_conf() {
   local path; path=$(conf_get '.panel.path')
   [[ -z $path ]] && return 0
@@ -2849,10 +2913,11 @@ nginx_panel_conf() {
 
 # 探测面板是否真的起来了(最多等 10 秒), 返回 0 表示 HTTP 有响应
 panel_health_check() {
+  local pport; pport=$(panel_port)
   local i
   for i in $(seq 1 20); do
     if curl -fsS --max-time 2 -o /dev/null \
-         "http://127.0.0.1:$PANEL_PORT/$1/?t=$2" 2>/dev/null; then
+         "http://127.0.0.1:$pport/$1/?t=$2" 2>/dev/null; then
       return 0
     fi
     sleep 0.5
@@ -2873,12 +2938,12 @@ install_panel() {
   chmod 755 "$PANEL_PY"
   ok "OK"
 
-  # 首次运行会生成并落盘 .panel.token / .panel.path
-  local tok path
-  tok=$(conf_get '.panel.token'); path=$(conf_get '.panel.path')
-  if [[ -z $tok || -z $path ]]; then
+  # 首次运行会生成并落盘 .panel.token / .panel.path / .panel.port
+  local tok path pport
+  tok=$(conf_get '.panel.token'); path=$(conf_get '.panel.path'); pport=$(conf_get '.panel.port')
+  if [[ -z $tok || -z $path || -z $pport ]]; then
     python3 - <<PYEOF
-import json, os, secrets
+import json, os, secrets, random, socket
 conf = "$CONF"
 d = {}
 if os.path.exists(conf):
@@ -2887,22 +2952,41 @@ if os.path.exists(conf):
 p = d.get("panel") if isinstance(d.get("panel"), dict) else {}
 if not p.get("token"): p["token"] = secrets.token_urlsafe(24)
 if not p.get("path"):  p["path"] = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(10))
+if not p.get("port"):
+    reserved = {53, 80, 443, 1080, 3000, 8388, 8442, 8443, 8444, 8445, 8446, 8447, 8448, 8449, 8450, 8451, 8452, 9853, 9890, 9891, 9892, 9893, 9894, 9895, 9896, 51820}
+    env_p = os.environ.get("DEGWD_PANEL_PORT")
+    if env_p and env_p.isdigit():
+        p["port"] = int(env_p)
+    else:
+        found = None
+        for _ in range(100):
+            cand = random.randint(10000, 60000)
+            if cand in reserved: continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(("0.0.0.0", cand))
+                    found = cand
+                    break
+            except Exception:
+                continue
+        p["port"] = found or random.randint(20000, 50000)
 d["panel"] = p
 tmp = conf + ".tmp"
 with open(tmp, "w", encoding="utf-8") as fh: json.dump(d, fh, ensure_ascii=False)
 os.chmod(tmp, 0o600); os.replace(tmp, conf)
 PYEOF
-    tok=$(conf_get '.panel.token'); path=$(conf_get '.panel.path')
+    tok=$(conf_get '.panel.token'); path=$(conf_get '.panel.path'); pport=$(conf_get '.panel.port')
   fi
-  [[ -n $tok && -n $path ]] || die "面板凭据生成失败"
+  [[ -n $tok && -n $path && -n $pport ]] || die "面板凭据生成失败"
 
   panel_unit_conf
   systemctl enable degwd-panel >/dev/null 2>&1
-  svc_restart degwd-panel && ok "degwd-panel 已启动" || { err "面板启动失败"; journalctl -u degwd-panel -n 20 --no-pager; return 1; }
+  svc_restart degwd-panel && ok "degwd-panel 已启动 (端口 $pport)" || { err "面板启动失败"; journalctl -u degwd-panel -n 20 --no-pager; return 1; }
 
   # 真正验证面板能响应(而不是只看 systemd 状态), 否则"装完不生效"很难排查
   if panel_health_check "$path" "$tok"; then
-    ok "面板本机自检通过 (127.0.0.1:$PANEL_PORT)"
+    ok "面板本机自检通过 (127.0.0.1:$pport)"
   else
     err "面板无响应, 请检查: journalctl -u degwd-panel -n 50 --no-pager"
     return 1
@@ -2913,19 +2997,20 @@ PYEOF
     if nginx_panel_conf; then
       ok "面板已挂到 nginx (https://$(conf_get '.domain')/$path/)"
     else
-      warn "写入面板反代失败, 面板仍可通过端口 $PANEL_PORT 访问"
+      warn "写入面板反代失败, 面板仍可通过端口 $pport 访问"
     fi
   fi
 
-  local host wan; host=$(conf_get '.domain'); wan=$(wan_ip)
+  local host wan; host=$(conf_get '.domain'); wan=$(wan_ip 2>/dev/null || true)
   echo
   ok "Web 面板服务已就绪"
   if [[ -n $host && -f /etc/nginx/conf.d/default.conf ]]; then
     echo -e "  域名地址: ${GREEN}https://$host/$path/?t=$tok${cRES}"
   fi
-  echo -e "  直连地址: ${GREEN}http://${wan:-127.0.0.1}:$PANEL_PORT/$path/?t=$tok${cRES}"
-  echo "  重新查看: shuoyue --cli status | jq -r '.panel_path'"
-  echo "  凭据存储: $CONF 的 .panel.token / .panel.path (chmod 600)"
+  echo -e "  直连地址: ${GREEN}http://${wan:-127.0.0.1}:$pport/$path/?t=$tok${cRES}"
+  echo "  监听端口: $pport"
+  echo "  重新查看: shuoyue (菜单 P) 或 shuoyue --panel-info"
+  echo "  凭据存储: $CONF 的 .panel.token / .panel.path / .panel.port (chmod 600)"
 }
 
 uninstall_panel() {
@@ -2938,6 +3023,191 @@ uninstall_panel() {
     sed -i '/^# PANEL_START$/,/^# PANEL_END$/d' /etc/nginx/conf.d/default.conf
   fi
   ok "Web 面板已移除"
+}
+
+# 查看 Web 面板完整访问地址与状态
+show_panel_info() {
+  conf_init
+  local tok path pport wan laddr host active_str
+  tok=$(conf_get '.panel.token')
+  path=$(conf_get '.panel.path')
+  pport=$(panel_port)
+  wan=$(wan_ip 2>/dev/null || true)
+  laddr=$(local_ip 2>/dev/null || true)
+  host=$(conf_get '.domain')
+
+  if [[ -z $tok || -z $path ]]; then
+    warn "尚未部署 Web 控制面板，请先执行安装！"
+    return 1
+  fi
+
+  if svc_ok degwd-panel; then
+    active_str="${GREEN}运行中 (active)${cRES}"
+  else
+    active_str="${RED}未运行 (inactive)${cRES}"
+  fi
+
+  echo
+  echo -e "${CYAN}=====================================================${cRES}"
+  echo -e "${WHITE}   朔月 Shuoyue — Web 控制面板完整地址与状态${cRES}"
+  echo -e "${CYAN}=====================================================${cRES}"
+  echo -e "  服务状态: $active_str"
+  echo -e "  监听端口: ${YELLOW}$pport${cRES}"
+  echo -e "  安全路径: /${path}/"
+  echo -e "  安全凭据: ${tok:0:6}...${tok: -6}"
+  echo
+  echo -e "${WHITE}▶ 完整访问地址 (在浏览器中打开):${cRES}"
+  echo -e "  ${CYAN}公网直连:${cRES}  ${GREEN}http://${wan:-$laddr}:${pport}/${path}/?t=${tok}${cRES}"
+  if [[ -n $wan && -n $laddr && $wan != "$laddr" ]]; then
+    echo -e "  ${CYAN}内网直连:${cRES}  http://${laddr}:${pport}/${path}/?t=${tok}"
+  fi
+  if [[ -n $host && -f /etc/nginx/conf.d/default.conf ]]; then
+    echo -e "  ${CYAN}域名反代:${cRES}  ${GREEN}https://${host}/${path}/?t=${tok}${cRES}"
+  fi
+  echo -e "${CYAN}=====================================================${cRES}"
+  echo
+}
+
+# 修改 Web 控制面板端口
+change_panel_port() {
+  conf_init
+  local cur_port np
+  cur_port=$(panel_port)
+  echo
+  echo -e "${CYAN}=== 修改 Web 控制面板端口 ===${cRES}"
+  echo -e "当前面板端口: ${YELLOW}$cur_port${cRES}"
+  if [[ -n "${1:-}" ]]; then
+    np="$1"
+  else
+    np=$(ask "请输入新的面板端口 (1024-65535, 直接回车则随机生成): ")
+  fi
+  if [[ -z $np ]]; then
+    np=$(panel_rand_port)
+    ok "已随机生成端口: $np"
+  fi
+
+  [[ "$np" =~ ^[0-9]+$ ]] || { warn "端口必须是纯数字"; return 1; }
+  (( np >= 1024 && np <= 65535 )) || { warn "端口范围必须在 1024 - 65535 之间"; return 1; }
+  [[ $RESERVED_PORTS == *" $np "* ]] && { warn "端口 $np 是系统/代理协议保留端口，请换一个"; return 1; }
+
+  local existing_port rport
+  existing_port=$(conf_get '.port')
+  if [[ -n $existing_port && "$existing_port" == "$np" ]]; then
+    warn "端口 $np 已被当前业务服务 (Nginx) 占用，请换一个"; return 1
+  fi
+  rport=$(conf_get '.reality.port')
+  if [[ -n $rport && "$rport" == "$np" ]]; then
+    warn "端口 $np 已被 Reality 服务占用，请换一个"; return 1
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    if ss -tln | grep -qE ":$np\s"; then
+      local pids
+      pids=$(lsof -ti :$np 2>/dev/null || true)
+      if [[ -n $pids ]] && ! systemctl status degwd-panel 2>/dev/null | grep -q "$pids"; then
+        warn "端口 $np 已被其他系统进程占用，请换一个"; return 1
+      fi
+    fi
+  fi
+
+  ok "更新面板端口为 $np..."
+  conf_set '.panel.port' "$np"
+
+  panel_unit_conf
+  svc_restart degwd-panel && ok "degwd-panel 已重启生效" || warn "degwd-panel 重启异常"
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "$np/tcp" >/dev/null 2>&1 && ok "ufw 已放行 $np/tcp"
+    if [[ "$cur_port" != "$np" && "$cur_port" != "3000" ]]; then
+      ufw delete allow "$cur_port/tcp" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if domain_proto_on && [[ -f /etc/nginx/conf.d/default.conf ]]; then
+    nginx_panel_conf && ok "Nginx 反向代理配置已同步更新" || warn "Nginx 反代配置更新失败"
+  fi
+
+  local path tok
+  path=$(conf_get '.panel.path')
+  tok=$(conf_get '.panel.token')
+  if panel_health_check "$path" "$tok"; then
+    ok "面板健康检查通过 (127.0.0.1:$np)"
+  else
+    warn "面板在新端口未及时响应，请检查: journalctl -u degwd-panel -n 30 --no-pager"
+  fi
+
+  show_panel_info
+}
+
+# 重置面板安全 Token 与随机路径
+reset_panel_secrets() {
+  read -rsp "确认重新生成面板 Token 与访问路径? 旧地址将无法访问 [y/N]: " -n1 c; echo
+  [[ "$c" =~ ^[Yy] ]] || { ok "已取消"; return 0; }
+  python3 - <<PYEOF
+import json, os, secrets
+conf = "$CONF"
+d = {}
+if os.path.exists(conf):
+    try: d = json.load(open(conf, encoding="utf-8"))
+    except Exception: d = {}
+p = d.get("panel") if isinstance(d.get("panel"), dict) else {}
+p["token"] = secrets.token_urlsafe(24)
+p["path"] = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(10))
+d["panel"] = p
+tmp = conf + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh: json.dump(d, fh, ensure_ascii=False)
+os.chmod(tmp, 0o600); os.replace(tmp, conf)
+PYEOF
+  svc_restart degwd-panel
+  if domain_proto_on && [[ -f /etc/nginx/conf.d/default.conf ]]; then
+    nginx_panel_conf
+  fi
+  ok "面板凭据已重新生成！"
+  show_panel_info
+}
+
+# Web 面板控制台
+panel_menu() {
+  conf_init
+  local tok; tok=$(conf_get '.panel.token')
+  if [[ -z $tok ]]; then
+    echo
+    echo -e "${YELLOW}尚未安装 Web 面板。${cRES}"
+    read -rsp "是否立即安装 Web 控制面板? [Y/n]: " a; echo
+    [[ "$a" =~ ^[Nn] ]] && return 0
+    install_panel
+    return $?
+  fi
+
+  while :; do
+    show_panel_info
+    echo "--- Web 面板管理选项 ---"
+    echo "  [1] 修改 Web GUI 监听端口"
+    echo "  [2] 重启 Web 面板服务"
+    echo "  [3] 重新生成安全 Token 与访问路径 (旧链接立即失效)"
+    echo "  [4] 重新部署 / 修复 Web 面板组件"
+    echo "  [q] 返回主菜单"
+    echo
+    read -rp "请选择 [1-4, q 退出]: " opt
+    case $opt in
+      1) change_panel_port ;;
+      2)
+        svc_restart degwd-panel && ok "degwd-panel 已重启" || err "重启失败"
+        ;;
+      3)
+        reset_panel_secrets
+        ;;
+      4)
+        install_panel
+        ;;
+      [Qq]|"")
+        break
+        ;;
+      *)
+        warn "无效输入"
+        ;;
+    esac
+  done
 }
 
 # =============================================================== CLI (面板) ====
@@ -2973,6 +3243,7 @@ cli_status() {
     --arg subtoken "$token" \
     --arg suburl "$suburl" \
     --arg panel_path "$(conf_get '.panel.path // ""')" \
+    --argjson panel_port "$(panel_port)" \
     --argjson protos "$protos" \
     --argjson installed "$(any_proto && echo true || echo false)" \
     --argjson xray "$(svc_ok xray && echo true || echo false)" \
@@ -2985,7 +3256,7 @@ cli_status() {
     --argjson links "$links" \
     --argjson cfg "$(cli_cfg_json)" \
     '{version:$version, installed:$installed, domain:$domain, port:$port, uuid:$uuid,
-      path:$path, subtoken:$subtoken, suburl:$suburl, panel_path:$panel_path,
+      path:$path, subtoken:$subtoken, suburl:$suburl, panel_path:$panel_path, panel_port:$panel_port,
       protos:$protos, protolist:$protolist, links:$links, cfg:$cfg, warp:$warp,
       sub_on:$sub_on, svc:{xray:$xray, nginx:$nginx, singbox:$singbox},
       reality_ready:$reality_ready}'
@@ -3208,11 +3479,14 @@ cli_dispatch() {
 
 # -------------------------------------------------------------------- 入口 ---
 case "${1:-}" in
-  --update)       updateGWD; exit 0 ;;
-  --install)      installGWD; exit 0 ;;
-  --install-cli)  cli_install_legacy; exit 0 ;;
-  --version)      echo "$VERSION"; exit 0 ;;
-  --cli)          shift; NONINTERACTIVE=1; cli_dispatch "$@"; exit $? ;;
+  --update)        updateGWD; exit 0 ;;
+  --install)       installGWD; exit 0 ;;
+  --install-cli)   cli_install_legacy; exit 0 ;;
+  --version)       echo "$VERSION"; exit 0 ;;
+  --panel-info)    show_panel_info; exit 0 ;;
+  --panel-port)    shift; change_panel_port "${1:-}"; exit 0 ;;
+  --panel)         panel_menu; exit 0 ;;
   --panel-install) shift; install_panel; exit 0 ;;
+  --cli)           shift; NONINTERACTIVE=1; cli_dispatch "$@"; exit $? ;;
 esac
 start_menu

@@ -193,7 +193,7 @@ def _rand_path():
 
 
 def ensure_panel_secrets():
-    """确保 conf.json 中有 .panel.token / .panel.path，返回 (token, path)。
+    """确保 conf.json 中有 .panel.token / .panel.path / .panel.port，返回 (token, path, port)。
 
     环境变量 DEGWD_PANEL_TOKEN 存在时覆盖 token（此时不把环境变量写回 conf.json）。
     """
@@ -215,17 +215,46 @@ def ensure_panel_secrets():
         panel["path"] = path
         dirty = True
 
+    port_val = panel.get("port")
+    valid_port = False
+    if port_val is not None:
+        try:
+            p_int = int(port_val)
+            if 1 <= p_int <= 65535:
+                valid_port = True
+        except (ValueError, TypeError):
+            valid_port = False
+
+    if not valid_port:
+        import random, socket
+        reserved = {53, 80, 443, 1080, 3000, 8388, 8442, 8443, 8444, 8445, 8446, 8447, 8448, 8449, 8450, 8451, 8452, 9853, 9890, 9891, 9892, 9893, 9894, 9895, 9896, 51820}
+        found = None
+        for _ in range(100):
+            cand = random.randint(10000, 60000)
+            if cand in reserved:
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(("0.0.0.0", cand))
+                    found = cand
+                    break
+            except Exception:
+                continue
+        panel["port"] = found or random.randint(20000, 50000)
+        dirty = True
+
     if dirty:
         conf["panel"] = panel
         try:
             _write_conf_atomic(conf)
         except Exception as exc:
-            _log("写入 %s 失败（面板仍可运行，但重启后 token 会变化）: %s" % (CONF, exc))
+            _log("写入 %s 失败（面板仍可运行，但重启后 token/port 会变化）: %s" % (CONF, exc))
 
     env_token = (os.environ.get("DEGWD_PANEL_TOKEN") or "").strip()
     if env_token:
         token = env_token
-    return token, path
+    return token, path, panel.get("port")
 
 
 # --------------------------------------------------------------- server 调用 ---
@@ -733,7 +762,8 @@ function applyStatus(d) {
     (installed ? "已安装" : "未安装");
   var rows = [
     ["域名", d.domain || "—"],
-    ["端口", d.port || "—"],
+    ["服务端口", d.port || "—"],
+    ["面板端口", d.panel_port || "—"],
     ["UUID", d.uuid || "—"],
     ["订阅 token", d.subtoken || "—"],
     ["面板路径", d.panel_path || "—"],
@@ -1498,16 +1528,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        token, path = ensure_panel_secrets()
+        token, path, default_port = ensure_panel_secrets()
     except Exception as exc:
         _log("初始化面板凭据失败: %s: %s" % (type(exc).__name__, exc))
         return 2
 
     bind = args.bind or os.environ.get("DEGWD_PANEL_BIND", "0.0.0.0")
     try:
-        port = args.port or int(os.environ.get("DEGWD_PANEL_PORT", "3000"))
+        env_port = os.environ.get("DEGWD_PANEL_PORT")
+        port = args.port or (int(env_port) if env_port else None) or (int(default_port) if default_port else 3000)
     except ValueError:
-        port = 3000
+        port = int(default_port) if default_port else 3000
 
     if args.print_config:
         _print_config(token, path, bind, port)
