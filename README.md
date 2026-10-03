@@ -77,7 +77,7 @@ https://<你的域名>/<10位随机路径>/?t=<token>
 - **分享链接**:逐条卡片展示全部已启用协议的 v2rayN 链接,单条 / 全部一键复制。**打开面板即渲染**,无需先点「重新拉取链接」(`--cli status` 已自带 `links`)
 - **凭据**:token 与随机路径存于 `/opt/de_GWD/conf.json`(0600),`shuoyue --cli status` 可重新查看
 
-![Web 控制面板](docs/panel-v1.3.4.png)
+![Web 控制面板](docs/panel-v1.3.5.png)
 
 
 安全设计:token 常量时间比较、POST 校验 Origin/Referer 与 Host 一致(CSRF)、请求体上限 256 KiB、协议 id 与域名/UUID/端口全部白名单校验、所有对 server 的调用串行化(`--cli` 单入口,避免并发重建配置)。

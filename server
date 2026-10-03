@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.4"
+VERSION="v1.3.5"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -3009,22 +3009,59 @@ cli_protos() {
     out=$(printf '%s' "$out" | jq -c --arg k "$id" '. + {($k):true}')
   done
   printf '%s' "$out" | jq -e 'length > 0' >/dev/null 2>&1 || { cli_json '{"ok":false,"error":"empty proto list"}'; return 1; }
-  conf_raw '.protos' "$out"
+  # UUID 缺失时先生成: tuic / vmess / vless 等协议的用户凭据都取自 .uuids[0],
+  # 为空会生成一份内核直接拒绝加载的配置(sing-box: missing uuid for user 0;
+  # xray: 空 id 的 clients 同样非法)。菜单安装流程会先跑 gen_uuid, 但 --cli 与
+  # Web 面板可以只勾协议、从没走过安装流程, 所以这里必须自己兜底。
+  [[ -n $(conf_get '.uuids[0]') ]] || { conf_raw '.uuids' "[\"$(xray_uuid_gen)\"]"; conf_set '.path' "/$(uuid6 "$(conf_get '.uuids[0]')")"; }
   # 需要域名的协议被勾选, 但还没装 nginx / 没证书 -> 先补齐
-  if domain_proto_on; then
-    [[ -n $(conf_get '.domain') ]] || { cli_json '{"ok":false,"error":"domain required for selected protos"}'; return 1; }
-    install_nginx
-    install_doh
-    svc_restart doh-server
-    [[ -f $SSLDIR/de_GWD.cer ]] || { [[ $(conf_get '.port') == "443" ]] && make_ssl_webroot || make_ssl_cf; }
-    nginx_main_conf; ssl_params_conf
+  # 注意 proto_needs_domain 自身会打印 0/1, 必须用 [[ ]] 比较, 不能 && echo true 追加一行
+  local domain_want=0 sb_want=0 rl_want=0 i
+  for i in $want; do
+    [[ $(proto_needs_domain "$i") == "1" ]] && domain_want=1
+    [[ $(proto_kernel "$i") == "singbox" ]] && sb_want=1
+    case $i in reality|realityxhttp|anyreality) rl_want=1 ;; esac
+  done
+  if [[ $domain_want == 1 && -z $(conf_get '.domain') ]]; then
+    cli_json '{"ok":false,"error":"domain required for selected protos"}'; return 1
   fi
-  if proto_on reality || proto_on realityxhttp || proto_on anyreality; then
-    [[ -n $(conf_get '.reality.private') ]] || reality_keygen
+
+  # 事务性, 两重保险:
+  # ① 前置步骤(装 nginx/DoH、签证书、拉 ~90 MB 内核) 全部放在写 .protos **之前**。
+  #    这些步骤内部用 die -> exit 1, 而且耗时可能超过面板的 CLI 超时(180s)被直接
+  #    杀掉 —— 只要还没写盘, 进程无论怎么死都不会留下「面板显示已勾选、配置却没
+  #    生成」的半应用状态。m00453 要求「安装后 会生效」, 半应用状态正是它的反例。
+  # ② 真正的应用链仍包在子 shell 里: die 只终结子 shell 并回传非 0, 不再像以前那样
+  #    直接杀掉整个 --cli 进程(server 的 cli_dispatch 是直接调用, 非子 shell);
+  #    失败再把 .protos 回滚回旧值并重建配置, 保持盘上配置与 conf 一致。
+  local old_protos rc=0
+  old_protos=$(conf_get '.protos // {}')
+  # 子 shell 的 stdout 全部改走 stderr: --cli 的 stdout 只允许出现最终那一行 JSON,
+  # 否则安装过程打印的进度文本会和 JSON 混在同一条流里, 面板解析不到。
+  (
+    if [[ $domain_want == 1 ]]; then
+      install_nginx
+      install_doh
+      svc_restart doh-server
+      [[ -f $SSLDIR/de_GWD.cer ]] || { [[ $(conf_get '.port') == "443" ]] && make_ssl_webroot || make_ssl_cf; }
+      nginx_main_conf; ssl_params_conf
+    fi
+    if [[ $rl_want == 1 ]]; then
+      [[ -n $(conf_get '.reality.private') ]] || reality_keygen
+    fi
+    if [[ $sb_want == 1 ]]; then install_singbox; fi
+    # 前置条件都就绪了, 到这里才落盘选择(见上面 ① 的理由)
+    conf_raw '.protos' "$out"
+    apply_protos
+    gen_sub_all
+  ) 1>&2 || rc=$?
+  if [[ $rc != 0 ]]; then
+    # 回滚选择, 并把配置重建回旧选择对应的状态(否则盘上的配置与 conf 又会不一致)
+    conf_raw '.protos' "$old_protos"
+    ( apply_protos ) 1>&2 || true
+    cli_json "{\"ok\":false,\"error\":\"apply failed\",\"code\":$rc}"
+    return 1
   fi
-  if sb_proto_on; then install_singbox; fi
-  apply_protos
-  gen_sub_all
   cli_json '{"ok":true}'
 }
 
