@@ -8,7 +8,7 @@
 #  基于原版 jacyl4/de_GWD (EPL-2.0) 的功能规格重写,全部组件改用官方上游。
 #  LAN 设备将网关与 DNS 指向本机即可生效。仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.7"
+VERSION="v1.3.8"
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
 # 交互式脚本: 不启用 -e(需保留人工交互分支), 但未定义变量与管道错误必须暴露
@@ -780,7 +780,6 @@ define RESERVED_IP = $reserved
 
 table ip de_GWD {
     set CHNROUTE  { type ipv4_addr; flags interval; auto-merge; }
-    set GLOBALDNS { type ipv4_addr; flags interval; auto-merge; }
     set V2NODE    { type ipv4_addr; flags interval; auto-merge; }
     set LISTBLAN  { type ipv4_addr; flags interval; auto-merge; }
     set LISTWLAN  { type ipv4_addr; flags interval; auto-merge; }
@@ -789,7 +788,6 @@ table ip de_GWD {
         type filter hook prerouting priority -280; policy accept;
         meta l4proto udp th dport { 53, 67, 68, 123, 1900, 5350, 5351, 5353 } accept
         meta l4proto tcp th dport { 53, 67, 68, 123 } accept
-        ip daddr @GLOBALDNS accept
         # 入口端口豁免: WG / 中转线 / 本地 socks 入站不得被 TPROXY 劫持
         meta l4proto { tcp, udp } th dport { $ENTRY_PORTS } accept
         ip saddr @LISTBLAN meta l4proto { tcp, udp } tproxy to 127.0.0.1:9896 meta mark set 0x9
@@ -806,7 +804,6 @@ table ip de_GWD {
         meta l4proto tcp th dport { 53, 67, 68, 123 } accept
         meta l4proto { tcp, udp } th dport { $ENTRY_PORTS } accept
         meta mark 0xff accept
-        ip daddr @GLOBALDNS accept
         ip daddr \$RESERVED_IP accept
         ip daddr @V2NODE accept
         ip daddr @CHNROUTE accept
@@ -904,7 +901,7 @@ EOF
   systemctl enable degwd-nftables >/dev/null 2>&1
 }
 
-# 重建 nftables 表并立刻回填所有集合。裸 nft -f 之后 CHNROUTE/V2NODE/GLOBALDNS/
+# 重建 nftables 表并立刻回填所有集合。裸 nft -f 之后 CHNROUTE/V2NODE/
 # LISTBLAN/LISTWLAN 全是空集, 透明代理会瞬间失效 → 所有重建点统一走这里
 nftables_apply() {
   nftables_conf || { err "nftables 规则生成失败"; return 1; }
@@ -947,17 +944,9 @@ nft_reserved_only() {
   return 0
 }
 
-# 全局 DoH 服务器 IP 直连集
+# 全局 DoH 走代理出站, 不进直连白名单(避免被 GFW 阻断导致境外 DNS 瘫痪)
 refresh_globaldns() {
-  local doh; doh=$(conf_get '.dns.doh')
-  local host; host=$(echo "$doh" | sed -E 's|^https?://||; s|[/:].*$||')
-  : > "$BASE/nftables/IP_GLOBALDNS"
-  if [[ "$host" =~ ^[0-9.]+$ ]]; then
-    echo "$host" >> "$BASE/nftables/IP_GLOBALDNS"
-  else
-    dig +short +time=3 +tries=1 @"$DNS_ALI" "$host" A 2>/dev/null | grep -E '^[0-9.]+$' >> "$BASE/nftables/IP_GLOBALDNS"
-  fi
-  nft_sets_reload GLOBALDNS "$BASE/nftables/IP_GLOBALDNS"
+  return 0
 }
 
 # 节点 IP 直连集(防回环)
@@ -1096,7 +1085,7 @@ sb_client_gen() {   # 为当前活动节点生成 client.json
   jq -n --argjson o "$out" '{
     log: { level: "warn" },
     inbounds: [{ type: "socks", tag: "sb-in", listen: "127.0.0.1", listen_port: 10808 }],
-    outbounds: [$o, { type: "direct", tag: "direct" }],
+    outbounds: [ ($o + { routing_mark: 255 }), { type: "direct", tag: "direct", routing_mark: 255 } ],
     route: { rules: [ { action: "sniff" } ], final: "sbproxy" }
   }' | write_atomic "$BASE/singbox/client.json" 600
 }

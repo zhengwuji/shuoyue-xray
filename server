@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.7"
+VERSION="v1.3.8"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -504,7 +504,7 @@ net.core.wmem_max = 8388608
 net.core.optmem_max = 524288
 net.mptcp.enabled = 1
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.ip_local_reserved_ports = 53,9853,9890,9891,9892,8388,8442,8443,8444,8445,8446
+net.ipv4.ip_local_reserved_ports = 53,1080,3000,8388,8442-8452,9853,9890-9894
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.all.rp_filter = 0
@@ -586,33 +586,16 @@ defr=$(ip route show default | head -n1)
 ip link set lo qlen 10000 mtu 65520
 del_ifb
 
-# ---- lo: 本机 nginx<->xray 回环也纳入 AQM
+# lo 只做 egress 整形: 本机 nginx<->xray 回环无需 double-queuing, 避免吞吐自伤
 tc qdisc del dev lo root 2>/dev/null
 tc qdisc add dev lo root cake unlimited rtt 50us diffserv4 dual-srchost nonat nowash no-split-gso ack-filter-aggressive raw egress
-tc qdisc del dev lo ingress 2>/dev/null
-tc qdisc add dev lo handle ffff: ingress 2>/dev/null
-if ! ip link show ifb4lo >/dev/null 2>&1; then ip link add name ifb4lo type ifb; fi
-ip link set ifb4lo qlen 10000 mtu 65520; ip link set ifb4lo up
-tc qdisc del dev ifb4lo root 2>/dev/null
-tc qdisc add dev ifb4lo root cake unlimited rtt 50us diffserv4 dual-dsthost nonat nowash no-split-gso no-ack-filter raw ingress
-tc filter del dev lo ingress 2>/dev/null
-tc filter add dev lo parent ffff: matchall action mirred egress redirect dev ifb4lo 2>/dev/null
 
-# ---- 虚拟网卡(排除 docker/ifb/lo/wg)
-for line in $(find /sys/class/net ! -type d 2>/dev/null | xargs --max-args=1 realpath 2>/dev/null \
-    | grep 'virtual' | grep -v 'ifb' | awk -F'/' '{print$NF}' | grep -v '^lo$' | grep -v '^docker0$'); do
-  tc qdisc del dev "$line" root 2>/dev/null
-  tc qdisc add dev "$line" root cake unlimited rtt 200us diffserv4 dual-srchost nonat nowash no-split-gso ack-filter raw overhead 18 mpu 64 egress
-  tc qdisc del dev "$line" ingress 2>/dev/null
-  tc qdisc add dev "$line" handle ffff: ingress 2>/dev/null
-  ifb="ifb4$(echo "$line" | cut -c1-11)"
-  if ! ip link show "$ifb" >/dev/null 2>&1; then ip link add name "$ifb" type ifb; fi
-  ip link set "$ifb" up
-  tc qdisc del dev "$ifb" root 2>/dev/null
-  tc qdisc add dev "$ifb" root cake unlimited rtt 200us diffserv4 dual-dsthost nonat nowash no-split-gso no-ack-filter raw overhead 18 mpu 64 ingress
-  tc filter del dev "$line" ingress 2>/dev/null
-  tc filter add dev "$line" parent ffff: matchall action mirred egress redirect dev "$ifb" 2>/dev/null
-done
+# 只整形物理/WAN/LAN 网卡(veth/br-* 等虚拟口不整形, 避免与容器网络互相串流)
+ifb_name() {   # 由接口名哈希出稳定且唯一的 ifb 名(原 cut -c1-11 会截断冲突)
+  local h
+  h=$(printf '%s' "$1" | md5sum | cut -c1-10)
+  printf 'ifb%s' "$h"
+}
 
 # ---- 物理网卡
 for line in $(nic_phys); do
@@ -620,7 +603,7 @@ for line in $(nic_phys); do
   tc qdisc add dev "$line" root cake unlimited besteffort dual-srchost nonat nowash no-split-gso ack-filter ethernet egress
   tc qdisc del dev "$line" ingress 2>/dev/null
   tc qdisc add dev "$line" handle ffff: ingress 2>/dev/null
-  ifb="ifb4$(echo "$line" | cut -c1-11)"
+  ifb=$(ifb_name "$line")
   if ! ip link show "$ifb" >/dev/null 2>&1; then ip link add name "$ifb" type ifb; fi
   ip link set "$ifb" up
   tc qdisc del dev "$ifb" root 2>/dev/null
@@ -632,6 +615,7 @@ for line in $(nic_phys); do
   # (no-split-gso 参数本就依赖 GSO 存在; ufo 在 5.x 内核已移除)
   ethtool -K "$line" rx on tx on sg on gro on gso on tso on tx-gso-partial on lro off 2>/dev/null
 done
+
 
 ip tcp_metrics flush >/dev/null 2>&1
 ip route flush cache >/dev/null 2>&1
@@ -1028,10 +1012,12 @@ nginx_web_conf() {
     altsvc='add_header Alt-Svc "h3=\":'"$port"'\";ma=86400" always;'
   fi
   # nginx >= 1.25 用 http2 on 指令, 旧版(如 Debian 1.22)用 listen http2
-  local h2line="    http2 on;"
+  local h2line="" ssl_listen="listen __PORT__ default_server ssl fastopen=500 reuseport;"
   local ngver; ngver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-  if [[ -z $ngver || $(printf '%s\n1.25.0\n' "$ngver" | sort -V | head -n1) != "1.25.0" ]]; then
-    h2line=""
+  if [[ -n $ngver && $(printf '%s\n1.25.0\n' "$ngver" | sort -V | head -n1) == "1.25.0" ]]; then
+    h2line="    http2 on;"
+  else
+    ssl_listen="listen __PORT__ default_server ssl http2 fastopen=500 reuseport;"
   fi
 
   {
@@ -1058,14 +1044,12 @@ upstream xray_vless_enc {
     keepalive 32;
 }
 server {
-    listen __PORT__ default_server ssl fastopen=500 reuseport;
 EOF
+    echo "    $ssl_listen"
     if [[ $quic_enabled == 1 ]]; then
       echo "    listen __PORT__ default_server quic reuseport;"
-      echo "$h2line"
-    else
-      echo "$h2line"
     fi
+    [[ -n $h2line ]] && echo "$h2line"
     cat <<'EOF'
     server_name __DOMAIN__;
     root /var/www/html;
@@ -2281,20 +2265,27 @@ warp_enable() {   # 非交互: 启用 WARP 出站
   spk=$(awk '/PublicKey/{print$3}' /tmp/wgcf-profile.conf)
   rm -f /tmp/wgcf-account.toml /tmp/wgcf-profile.conf
   mkdir -p /etc/wireguard
+  local laddr6
+  laddr6=$(ip -6 addr show scope global 2>/dev/null | grep -oE 'inet6 [0-9a-fA-F:]+' | head -n1 | awk '{print$2}')
+  local postup="ip rule add from $laddr lookup main; ip rule add ipproto udp dport 53 lookup main;"
+  local postdown="ip rule del from $laddr lookup main; ip rule del ipproto udp dport 53 lookup main;"
+  if [[ -n $laddr6 ]]; then
+    postup="$postup ip -6 rule add from $laddr6 lookup main;"
+    postdown="$postdown ip -6 rule del from $laddr6 lookup main;"
+  fi
   cat <<EOF >/etc/wireguard/wgcf.conf
 [Interface]
 PrivateKey = $cpk
 Address = 172.16.0.2/24
 DNS = 1.1.1.1
 MTU = 1420
-PostUp = ip rule add from $laddr lookup main; ip rule add ipproto udp dport 53 lookup main;
-PostDown = ip rule del from $laddr lookup main; ip rule del ipproto udp dport 53 lookup main;
+PostUp = $postup
+PostDown = $postdown
 
 [Peer]
 PublicKey = $spk
 EndPoint = engage.cloudflareclient.com:2408
-AllowedIPs = 0.0.0.0/0
-AllowedIPs = ::/0
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 15
 EOF
   chmod 600 /etc/wireguard/wgcf.conf
@@ -2352,7 +2343,9 @@ defaults
     timeout server 1m
     timeout check 10s
 resolvers local
-    nameserver dns 127.0.0.1:53
+    nameserver dns1 127.0.0.1:53
+    nameserver dns2 1.1.1.1:53
+    nameserver dns3 8.8.8.8:53
     resolve_retries 3
     timeout retry 3s
     hold valid 10s

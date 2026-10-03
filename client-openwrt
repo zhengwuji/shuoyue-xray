@@ -10,7 +10,7 @@
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C
 
-VERSION="v1.3.7"
+VERSION="v1.3.8"
 
 # 允许用 DEGWD_BASE 指向别处(与 server/client/panel.py 一致), 便于真机隔离测试
 BASE="${DEGWD_BASE:-/opt/de_GWD}"
@@ -646,8 +646,7 @@ sb_client_gen() {
   local i; i=$(conf_get '.nodeActive')
   [[ -z $i ]] && return 1
   local proto addr host port uuid password sni insecure
-  addr=$(conf_get ".nodes[$i].address"); host=${addr%%:*}
-  port=$(conf_get ".nodes[$i].port")
+  addr=$(conf_get ".nodes[$i].address"); split_hostport "$addr"; host=$HOST; port=$PORT
   proto=$(conf_get ".nodes[$i].proto")
   uuid=$(conf_get ".nodes[$i].uuid"); password=$(conf_get ".nodes[$i].password")
   sni=$(conf_get ".nodes[$i].tls_sni"); [[ -z $sni ]] && sni=$host
@@ -687,7 +686,7 @@ sb_client_gen() {
       type: "socks", tag: "sb-in", listen: "127.0.0.1", listen_port: 10808,
       udp_timeout: "5m"
     }],
-    outbounds: [ $o, { type: "direct", tag: "direct" } ],
+    outbounds: [ ($o + { routing_mark: 255 }), { type: "direct", tag: "direct", routing_mark: 255 } ],
     route: {
       rules: [ { action: "sniff" } ],
       final: "sbproxy"
@@ -740,7 +739,7 @@ xray_gen_config() {
   local k=0 nh="{}"
   while [[ $k -lt $nodes_cnt ]]; do
     local d ip
-    d=$(conf_get ".nodes[$k].address"); d=${d%%:*}
+    split_hostport "$(conf_get ".nodes[$k].address")"; d=$HOST
     ip=$(conf_get ".nodes[$k].ip")
     [[ -n $ip && -n $d ]] && nh=$(jq -n --argjson h "$nh" --arg d "$d" --arg ip "$ip" '$h + {($d): $ip}')
     k=$((k+1))
@@ -1029,7 +1028,7 @@ init_nft_write() {
   write_atomic /etc/init.d/degwd-nft 755 <<EOF
 #!/bin/sh /etc/rc.common
 # 朔月 Shuoyue — nftables 平面 + 策略路由
-START=21
+START=99
 STOP=89
 USE_PROCD=0
 NAME=degwd-nft
@@ -1125,7 +1124,7 @@ EOF
   nodes=$(conf_get '.nodes'); i=0
   ncnt=$(printf '%s' "$nodes" | jq 'length' 2>/dev/null || echo 0)
   while [[ $i -lt $ncnt ]]; do
-    addr=$(conf_get ".nodes[$i].address"); d=${addr%%:*}
+    addr=$(conf_get ".nodes[$i].address"); split_hostport "$addr"; d=$HOST
     ip=$(conf_get ".nodes[$i].ip")
     [[ -n $ip && -n $d ]] && printf 'address /%s/%s\n' "$d" "$ip" >>"$tmp"
     i=$((i+1))
@@ -1963,7 +1962,7 @@ relay_menu() {
         tt=$(ask "  转发到(host:port, 如 1.2.3.4:443): ")
         [[ -z $tt ]] && continue
         local th tp
-        th=${tt%%:*}; tp=${tt##*:}
+        split_hostport "$tt"; th=$HOST; tp=$PORT
         [[ $th =~ ^[0-9a-zA-Z.-]+$ ]] || { err "目标地址非法"; continue; }
         port_valid "$tp" || { err "目标端口非法"; continue; }
         local r; r=$(jq -n --argjson lp "$lp" --arg th "$th" --argjson tp "$tp" \
