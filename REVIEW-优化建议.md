@@ -158,6 +158,11 @@ else warn "chnroute 条数异常($n)，保留旧表"; fi
 
 - **硬编码集中化**：`REMOTE_BASE`、`BASE`（[client:18](client#L18) 定义了但 [client:367](client#L367)/[372](client#L372)/[413](client#L413) 又写死 `/opt/de_GWD`）、`223.5.5.5`/`119.29.29.29`（10 处）、保留网段、`172.16.66.0/24`、geosite 分类表、规则 URL 全部散落 → 收敛到顶部常量区 + `conf.json` 默认值。
 - **模板抽离**：5 份 systemd unit heredoc（[client:361](client#L361)/[407](client#L407)/[654](client#L654)/[715](client#L715)/[756](client#L756)）+ nft 模板（[client:549](client#L549)）→ `templates/` + `envsubst`。
+  > **结论：不采纳本条建议（已用数据评估，非搁置）。**
+  > 1. **交付模型是单文件**：[client:2474](client#L2474) 的自更新是 `curl -fsSL --max-time 60 "$REMOTE_BASE/client" -o "$new"` 后覆盖自身，`install.sh` 也按固定文件名下载（`dl_checked client-openwrt/server/panel.py/client`）。抽出的 `templates/` 需要额外文件，会**同时打断自更新与首装两条路径**。
+  > 2. **`envsubst` 在目标平台上不存在**：真机 OpenWrt 实测无 `envsubst`、无 `gettext`（`busybox --list` 里也没有），只有 `sed`/`awk`。照建议实施会直接破坏 OpenWrt 客户端。若改用自带渲染器，则等于把「少写几行」换成「多维护一个渲染器」。
+  > 3. **收益有限**：跨脚本同名模板的完全相同行合计仅 **113 行**（实际测量见 `.probe/dup_measure.py`），而两份 `default.nft` 的差异行有 89 行（服务端走 TPROXY 转发、客户端走旁路网关，本就该不同），抽离后仍需条件分支。
+  > 4. **本条里真正有效的部分已单独落地**：抽离过程中的静态审计暴露了两个真缺陷 —— ① 服务端 `Nice=-8` 被 `>>` 追加到 `[Install]` 之后，被 systemd **静默忽略**（已在 [server:803](server#L803) 修复为 `[Service]` 段内条件插入）；② 全部单元从裸 `cat >`（原地截断）改为 `write_atomic` 原子落盘（server 7 处、client 6 处、client-openwrt 4 处）。
 - **JSON 构造**：手拼 `"[{\"name\":\"$(echo $tls | cut -d. -f1)\",...}]"`（[client:1115](client#L1115)）与 `'. + {'\"$cat\"':$v}'`（[client:1413](client#L1413)）→ 一律 `jq -n --arg/--argjson`。
 - **变量引用**：`grep -v de_GWD/xxx` 未加引号且非 `-F`，路径含 `.` 会误匹配（[client:1141](client#L1141)/[1614](client#L1614)/[1721](client#L1721)）→ `grep -F -v -- "$BASE/updateLists"`。
 - **全局变量污染**：`port`（[client:1365](client#L1365)）、`wgport`、`n`/`idx` 未 `local`；`tls=${addr%%:*}`（[client:1349](client#L1349)）实为 host，命名误导且全脚本沿用。
