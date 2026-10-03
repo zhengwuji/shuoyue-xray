@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.3"
+VERSION="v1.3.4"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -2894,6 +2894,11 @@ cli_status() {
   local token; token=$(conf_get '.subtoken')
   local host; host=$(conf_get '.domain'); [[ -z $host ]] && host=$(wan_ip)
   [[ -n $token ]] && suburl="https://$host/sub/$token"
+  # 带上 links: 面板加载时就能直接渲染分享链接区。否则首屏永远是「暂无链接」,
+  # 用户必须先去点「重新拉取链接」才看得到东西 —— 而 cli_links 的输出本就是
+  # 一份现成的结构化数据, 没有任何理由不顺手带上。
+  local links; links=$(cli_links 2>/dev/null | jq -c '.links // []' 2>/dev/null)
+  [[ -z $links ]] && links='[]'
   jq -cn \
     --arg version "$VERSION" \
     --arg domain "$(conf_get '.domain')" \
@@ -2912,11 +2917,13 @@ cli_status() {
     --argjson warp "$([[ $(conf_get '.warp') == "true" ]] && echo true || echo false)" \
     --argjson sub_on "$([[ $(conf_get '.sub_on') == "false" ]] && echo false || echo true)" \
     --argjson protolist "$(proto_table_json)" \
+    --argjson links "$links" \
     --argjson cfg "$(cli_cfg_json)" \
     '{version:$version, installed:$installed, domain:$domain, port:$port, uuid:$uuid,
       path:$path, subtoken:$subtoken, suburl:$suburl, panel_path:$panel_path,
-      protos:$protos, protolist:$protolist, cfg:$cfg, warp:$warp, sub_on:$sub_on,
-      svc:{xray:$xray, nginx:$nginx, singbox:$singbox}, reality_ready:$reality_ready}'
+      protos:$protos, protolist:$protolist, links:$links, cfg:$cfg, warp:$warp,
+      sub_on:$sub_on, svc:{xray:$xray, nginx:$nginx, singbox:$singbox},
+      reality_ready:$reality_ready}'
 }
 
 # 协议元数据 -> JSON 数组 (面板据此渲染勾选框)
