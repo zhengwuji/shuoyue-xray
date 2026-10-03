@@ -3,7 +3,7 @@
 #  朔月 Shuoyue — 一键安装引导脚本
 #  用法(一键):
 #    bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
-#  仅支持 Debian / Ubuntu (amd64/arm64)。
+#  Debian / Ubuntu 支持服务端 + 客户端;OpenWrt / Kwrt 支持客户端。
 #  安装完成后自动打印节点地址、订阅地址与 v2rayN 导入二维码。
 # =============================================================================
 RED='\E[1;31m'; GREEN='\E[1;32m'; YELLOW='\E[1;33m'; CYAN='\E[1;36m'; WHITE='\E[1;37m'; cRES='\E[0m'
@@ -16,15 +16,59 @@ ok()   { echo -e "${WHITE}[ ${GREEN}✓${WHITE} ]${cRES} $*"; }
 warn() { echo -e "${WHITE}[ ${YELLOW}!${WHITE} ]${cRES} $*"; }
 die()  { echo -e "${WHITE}[ ${RED}✕${WHITE} ]${cRES} $*"; exit 1; }
 
+# 本脚本与 server/client 都依赖 bash 语法([[ ]]、数组、read -rp)。
+# 精简版 OpenWrt 默认只有 ash, 直接用 sh 执行会在一堆语法错误里迷路,
+# 故这里先确认 shell, 能换就换, 换不了给一句可操作的提示。
+if [ -z "${BASH_VERSION:-}" ]; then
+  # 仅当 $0 是可读的普通文件时才能安全 re-exec(curl | sh 时 $0 是 stdin, 重跑会读到空)
+  if command -v bash >/dev/null 2>&1 && [ -f "$0" ] && [ -r "$0" ]; then
+    exec bash "$0" "$@"
+  fi
+  echo "本脚本需要 bash,当前是 $(readlink -f /proc/$$/exe 2>/dev/null || echo 未知 shell)。"
+  echo "OpenWrt 请先执行: opkg update && opkg install bash"
+  echo "Debian/Ubuntu 请执行: apt-get update && apt-get install -y bash"
+  echo "然后用 bash 运行本脚本。"
+  exit 1
+fi
+
 [[ $(id -u) -ne 0 ]] && die "请以 root 运行(VPS 默认就是 root;sudo 用户先 sudo -i)"
-command -v apt-get >/dev/null 2>&1 || die "未检测到 apt,本脚本仅支持 Debian / Ubuntu"
-ARCH=$(dpkg --print-architecture 2>/dev/null)
-[[ "$ARCH" != "amd64" && "$ARCH" != "arm64" ]] && die "不支持的架构: ${ARCH:-未知}(仅 amd64/arm64)"
+
+# 命令落点: OpenWrt 上 /usr/local/bin 不存在,统一探测可写目录
+BINDIR=""
+pick_bindir() {
+  local d
+  for d in /usr/local/bin /usr/bin; do
+    [[ -d $d && -w $d ]] && { BINDIR=$d; return 0; }
+  done
+  return 1
+}
+
+is_openwrt() { [[ -f /etc/openwrt_release ]] || command -v opkg >/dev/null 2>&1; }
+
+# OpenWrt 架构 → 统一标签(供 xray / sing-box 下载使用)
+owrt_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)   echo amd64 ;;
+    aarch64|arm64)  echo arm64 ;;
+    armv7l|armv7)   echo armv7 ;;
+    armv6l)         echo armv6 ;;
+    mips64*)        echo mips64 ;;
+    mips*)          echo mips32 ;;
+    *)              echo "" ;;
+  esac
+}
 
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-  echo -e "${CYAN}安装下载工具...${cRES}"
-  apt-get update -qq
-  apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || die "curl 安装失败,请检查软件源"
+  if is_openwrt; then
+    echo -e "${CYAN}安装下载工具...${cRES}"
+    opkg update >/dev/null 2>&1
+    opkg install curl ca-bundle >/dev/null 2>&1 || die "curl 安装失败,请检查软件源"
+  else
+    command -v apt-get >/dev/null 2>&1 || die "未检测到 apt,本脚本仅支持 Debian / Ubuntu"
+    echo -e "${CYAN}安装下载工具...${cRES}"
+    apt-get update -qq
+    apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || die "curl 安装失败,请检查软件源"
+  fi
 fi
 
 # 多源下载: 官方 raw → ghproxy → jsdelivr (任一成功即可)
@@ -42,6 +86,59 @@ dl() {
   return 1
 }
 
+# 下载并做完整性 + 内容校验
+dl_checked() {
+  local name="$1" dest="$2" min="$3"
+  dl "$RAW/$name" "$dest" || die "$name 下载失败(检查网络或稍后重试)"
+  [[ $(du -sk "$dest" 2>/dev/null | awk '{print$1}') -ge "$min" ]] || die "$name 下载不完整"
+  grep -q '朔月\|Shuoyue\|de_GWD' "$dest" || die "$name 下载内容校验失败,已中止"
+}
+
+# =============================================================================
+#  OpenWrt / Kwrt 分支 —— 只提供客户端(旁路网关)
+# =============================================================================
+if is_openwrt; then
+  OWARCH=$(owrt_arch)
+  echo
+  echo -e "${CYAN}=============================================${cRES}"
+  echo -e "${WHITE}   朔月 Shuoyue — OpenWrt 旁路网关客户端${cRES}"
+  echo -e "${CYAN}=============================================${cRES}"
+  echo "  已检测到 OpenWrt / Kwrt (架构: ${OWARCH:-未知})"
+  echo "  将安装客户端(procd 服务 + uci/dnsmasq 集成 + nft TPROXY)"
+  echo "  服务端不适用于 OpenWrt,如需节点请另备一台 Debian/Ubuntu VPS"
+  echo
+
+  mkdir -p "$BASE"
+  # client-openwrt 需要 bash(数组、[[ ]]、read -rp), 精简版 OpenWrt 只有 ash
+  if ! command -v bash >/dev/null 2>&1; then
+    echo -e "${CYAN}安装 bash (OpenWrt 精简版默认只有 ash)...${cRES}"
+    opkg update >/dev/null 2>&1
+    opkg install bash >/dev/null 2>&1 || die "bash 安装失败,请检查软件源(或手动 opkg install bash)"
+  fi
+  echo -n "下载客户端脚本... "
+  dl_checked client-openwrt "$BASE/client-openwrt" 30
+  chmod +x "$BASE/client-openwrt"
+  echo -e "${GREEN}OK${cRES} ($(du -sk "$BASE/client-openwrt" | awk '{print$1}') KB)"
+  dl "$RAW/version" "$BASE/version" 2>/dev/null
+
+  pick_bindir || die "/usr/bin 不可写,无法创建命令"
+  ln -sf "$BASE/client-openwrt" "$BINDIR/shuoyue-gw"
+  ok "已安装命令: shuoyue-gw ($BINDIR/shuoyue-gw)"
+  warn "OpenWrt 的 /opt 位于 overlayfs,sysupgrade 前请执行 sysupgrade -b 备份"
+
+  echo
+  read -rp "现在开始安装并初始化? [Y/n]: " a; a=${a:-y}
+  [[ $a == [Yy] ]] || { ok "完成。以后输入 shuoyue-gw 打开菜单。"; exit 0; }
+  exec bash "$BASE/client-openwrt" --install
+fi
+
+# =============================================================================
+#  Debian / Ubuntu 分支 —— 服务端 + 客户端
+# =============================================================================
+command -v apt-get >/dev/null 2>&1 || die "未检测到 apt,本脚本仅支持 Debian / Ubuntu 与 OpenWrt"
+ARCH=$(dpkg --print-architecture 2>/dev/null)
+[[ "$ARCH" != "amd64" && "$ARCH" != "arm64" ]] && die "不支持的架构: ${ARCH:-未知}(仅 amd64/arm64)"
+
 echo
 echo -e "${CYAN}=============================================${cRES}"
 echo -e "${WHITE}   朔月 Shuoyue — Debian 多协议旁路网关${cRES}"
@@ -52,14 +149,14 @@ echo
 
 mkdir -p "$BASE"
 echo -n "下载主脚本... "
-dl "$RAW/server" "$BASE/server" || die "server 下载失败(检查网络或稍后重试)"
-[[ $(du -sk "$BASE/server" | awk '{print$1}') -ge 30 ]] || die "server 下载不完整"
-grep -q '朔月\|Shuoyue\|xray' "$BASE/server" || die "下载内容校验失败,已中止"
+dl_checked server "$BASE/server" 30
 chmod +x "$BASE/server"
 echo -e "${GREEN}OK${cRES} ($(du -sk "$BASE/server" | awk '{print$1}') KB)"
 dl "$RAW/version" "$BASE/version" 2>/dev/null
+dl "$RAW/panel.py" "$BASE/panel.py" 2>/dev/null && chmod 755 "$BASE/panel.py"
 
-ln -sf "$BASE/server" /usr/local/bin/shuoyue
+pick_bindir || die "/usr/bin 不可写,无法创建命令"
+ln -sf "$BASE/server" "$BINDIR/shuoyue"
 ok "已安装命令: shuoyue (以后随时输入即可打开管理菜单)"
 
 echo
@@ -71,10 +168,9 @@ read -rp "选择 [1/2/3, 回车=1]: " c; c=${c:-1}
 case $c in
   2)
     echo -n "下载客户端脚本... "
-    dl "$RAW/client" "$BASE/client" || die "client 下载失败"
-    [[ $(du -sk "$BASE/client" | awk '{print$1}') -ge 30 ]] || die "client 下载不完整"
+    dl_checked client "$BASE/client" 30
     chmod +x "$BASE/client"
-    ln -sf "$BASE/client" /usr/local/bin/shuoyue-gw
+    ln -sf "$BASE/client" "$BINDIR/shuoyue-gw"
     ok "已安装命令: shuoyue-gw"
     clear
     exec bash "$BASE/client" --install

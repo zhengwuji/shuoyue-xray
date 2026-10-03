@@ -1,2 +1,5 @@
 _original/
 .zcode/
+.probe/
+__pycache__/
+*.pyc

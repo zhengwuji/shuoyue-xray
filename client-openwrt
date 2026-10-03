@@ -1,0 +1,2451 @@
+#!/bin/bash
+# =============================================================================
+#  朔月 Shuoyue — OpenWrt / Kwrt 旁路网关客户端
+#  适配: OpenWrt 21.02+ / Kwrt / ImmortalWrt (busybox ash + bash + procd)
+#  依赖: opkg(bash smartdns qrencode)  xray(已装)  sing-box(可选, hy2/tuic/anytls)
+#  设计: 自建 table ip de_GWD (priority -280), 与 passwall2 / mwan3 / fw4 共存
+#        不占用 53/80/443, 不 flush 任何既有 nft 表
+#  用法: shuoyue-gw --install | --status | --uninstall | --lists | --ddns | --update
+# =============================================================================
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export LC_ALL=C
+
+VERSION="v1.3.0"
+
+BASE=/opt/de_GWD
+CONF=$BASE/conf.json
+XRAYDIR=$BASE/xray
+SBDIR=$BASE/singbox
+SDNSDIR=$BASE/smartdns
+LISTDIR=$BASE/lists
+NFTDIR=$BASE/nft
+RUNNER=$BASE/gw-run.sh
+LOG_FILE=/var/log/de_GWD.log
+
+XRAY_BIN=/usr/bin/xray
+SB_BIN=/usr/bin/sing-box
+SMARTDNS_BIN=/usr/sbin/smartdns
+
+TPROXY_PORT=9896
+DNS_PORT=6053
+SB_SOCKS_PORT=10808
+
+NFT_TABLE="de_GWD"
+NFT_MARK="0x9"
+RT_TABLE=220
+RT_PRIO=100
+
+REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
+
+DNS_ALI="223.5.5.5"
+DNS_TENCENT="119.29.29.29"
+DEFAULT_DOH="https://1.1.1.1/dns-query"
+
+LIST_URL_CHNROUTE="https://raw.githubusercontent.com/gaoyifan/china-route-list/master/chnroute.txt"
+LIST_URL_CHNROUTE_ALT="https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+LIST_URL_CHNDOMAIN="https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf"
+
+# 内网 / 保留网段(直连, 永不代理)
+RESERVED_NETS="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4"
+
+# 直连 DNS(必须直连, 否则解析节点域名会成环)
+GF_DNS_NETS="$DNS_ALI/32 $DNS_TENCENT/32"
+
+WG_NET="172.16.66.0/24"
+WG_PREFIX="172.16.66"
+
+RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; CYAN='\033[1;36m'; WHITE='\033[1;37m'; cRES='\033[0m'
+
+# -----------------------------------------------------------------------------
+# 基础工具
+# -----------------------------------------------------------------------------
+log() { printf '%s [%s] %s\n' "$(date '+%F %T')" "${1:-INFO}" "${*:2}" >>"$LOG_FILE" 2>/dev/null || true; }
+ok()   { echo -e "${WHITE}[ ${GREEN}✓${WHITE} ]${cRES} $*"; log OK "$*"; }
+warn() { echo -e "${WHITE}[ ${YELLOW}!${WHITE} ]${cRES} $*"; log WARN "$*"; }
+err()  { echo -e "${WHITE}[ ${RED}✕${WHITE} ]${cRES} $*"; log ERROR "$*"; }
+die()  { err "$*"; exit 1; }
+
+ask()        { local v; read -r -p "$1" v; printf '%s' "$v"; }
+ask_secret() { local v; read -r -s -p "$1" v; echo >&2; printf '%s' "$v"; }
+yesno()      { local v; read -r -p "$1 [y/N]: " v; [[ ${v,,} == "y" || ${v,,} == "yes" ]]; }
+
+# 原子写: $1=路径 $2=权限, 内容从 stdin
+write_atomic() {
+  local f="$1" m="${2:-644}" d t
+  d=$(dirname "$f"); mkdir -p "$d" 2>/dev/null || return 1
+  t=$(mktemp "$d/.$(basename "$f").XXXXXX") || return 1
+  cat >"$t" || { rm -f "$t"; return 1; }
+  chmod "$m" "$t" 2>/dev/null
+  mv -f "$t" "$f" || { rm -f "$t"; return 1; }
+  return 0
+}
+
+# 端口合法性: 1-65535 且不与保留端口冲突
+RESERVED_PORTS=" 53 80 443 3000 6053 8442 8443 8444 8445 8446 8388 9896 10808 51820 "
+port_valid() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 )) || return 1
+  [[ $RESERVED_PORTS == *" $p "* ]] && return 1
+  return 0
+}
+
+is_openwrt() { [[ -f /etc/openwrt_release ]] || command -v opkg >/dev/null 2>&1; }
+
+# -----------------------------------------------------------------------------
+# 环境探测
+# -----------------------------------------------------------------------------
+# WAN 出口网卡(只读内核路由表, 绝不走外部回显服务)
+wan_if() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+# WAN IP(同上; 外部回显服务在本机会被代理, 返回的是 VPS IP)
+wan_ip() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+lan_if() {
+  local i
+  for i in $(uci -q get network.lan.device 2>/dev/null) $(uci -q get network.lan.ifname 2>/dev/null); do
+    [[ -d /sys/class/net/$i ]] && { printf '%s' "$i"; return 0; }
+  done
+  for i in br-lan br0; do [[ -d /sys/class/net/$i ]] && { printf '%s' "$i"; return 0; }; done
+  for i in /sys/class/net/*; do
+    i=${i##*/}
+    [[ $i == lo || $i == eth* || $i == wlan* || $i == docker* || $i == tailscale* ]] && continue
+    [[ -d /sys/class/net/$i/brif ]] && { printf '%s' "$i"; return 0; }
+  done
+  return 1
+}
+lan_cidr() {
+  local i ip
+  i=$(lan_if) || return 1
+  ip=$(ip -4 -o addr show dev "$i" 2>/dev/null | awk 'NR==1{split($4,a,"/"); print a[1]"/"a[2]}')
+  [[ -n $ip ]] && printf '%s' "$ip"
+}
+
+# -----------------------------------------------------------------------------
+# 配置层 (flock 串行化 + 密钥不经 argv)
+# -----------------------------------------------------------------------------
+conf_init() {
+  mkdir -p "$BASE" "$XRAYDIR" "$SBDIR" "$SDNSDIR" "$LISTDIR" "$NFTDIR" 2>/dev/null
+  [[ -f $CONF ]] && return 0
+  local doh="$DEFAULT_DOH" lanip
+  lanip=$(lan_cidr)
+  write_atomic "$CONF" 600 <<EOF
+{
+  "version": "$VERSION",
+  "lanIf": "$(lan_if)",
+  "lanCidr": "${lanip:-10.10.10.6/24}",
+  "proxyOn": false,
+  "block53": false,
+  "nodeActive": null,
+  "nodes": [],
+  "split": { "domains": [], "ips": [], "mode": "proxy" },
+  "dns": { "doh": "$doh", "china": ["$DNS_ALI", "$DNS_TENCENT"], "hosts": {} },
+  "ddns": { "provider": "", "domain": "", "cfToken": "", "zoneId": "", "recordId": "", "last": "" },
+  "wg": { "enable": false, "serverPriv": "", "serverPub": "", "port": 51820, "clients": [] },
+  "relay": { "enable": false, "port": 0, "target": "" },
+  "autoUpdate": false
+}
+EOF
+  chmod 600 "$CONF" 2>/dev/null
+}
+
+conf_get() { [[ -f $CONF ]] && jq -r "$1 // empty" "$CONF" 2>/dev/null; }
+
+# conf_write <jq filter> [jq args...]  — flock 保护, 写坏即回滚
+conf_write() {
+  local f="$1"; shift
+  [[ -f $CONF ]] || return 1
+  exec 9>"$CONF.lock" 2>/dev/null || return 1
+  flock 9 2>/dev/null
+  local t; t=$(mktemp "$BASE/.conf.XXXXXX") || { flock -u 9; exec 9>&-; return 1; }
+  if jq "$@" "$f" "$CONF" >"$t" 2>/dev/null && jq -e . "$t" >/dev/null 2>&1; then
+    chmod 600 "$t" 2>/dev/null
+    mv -f "$t" "$CONF"
+    flock -u 9 2>/dev/null; exec 9>&-
+    return 0
+  fi
+  rm -f "$t"; flock -u 9 2>/dev/null; exec 9>&-
+  err "配置写入失败(已保留原配置)"
+  return 1
+}
+
+# conf_set <路径> <字符串>  — 经临时文件传入, 密钥不出现在 ps 中
+conf_set() {
+  local tf r; tf=$(mktemp "$BASE/.v.XXXXXX") || return 1
+  printf '%s' "$2" >"$tf"
+  conf_write "$1 = \$v" --rawfile v "$tf"; r=$?
+  rm -f "$tf"; return $r
+}
+# conf_raw <路径> <单个 JSON 值>
+conf_raw() {
+  local tf r; tf=$(mktemp "$BASE/.v.XXXXXX") || return 1
+  printf '%s' "$2" >"$tf"
+  conf_write "$1 = \$v[0]" --slurpfile v "$tf"; r=$?
+  rm -f "$tf"; return $r
+}
+conf_del() { conf_write "del($1)"; }
+
+# -----------------------------------------------------------------------------
+# 依赖
+# -----------------------------------------------------------------------------
+pkg_installed() { opkg list-installed 2>/dev/null | grep -q "^$1 "; }
+pkg_dep() {
+  local need=() p
+  for p in bash jq curl ca-bundle coreutils-base64 flock openssl-util; do
+    pkg_installed "$p" || need+=("$p")
+  done
+  # smartdns 用于 DNS 分流(与 dnsmasq 共存于 127.0.0.1:6053)
+  pkg_installed smartdns || need+=(smartdns)
+  pkg_installed qrencode || need+=(qrencode)
+  if [[ ${#need[@]} -gt 0 ]]; then
+    ok "安装依赖: ${need[*]}"
+    opkg update >/dev/null 2>&1
+    opkg install "${need[@]}" >/dev/null 2>&1
+  fi
+  local miss=()
+  for p in bash jq curl; do pkg_installed "$p" || command -v "$p" >/dev/null 2>&1 || miss+=("$p"); done
+  [[ ${#miss[@]} -gt 0 ]] && die "依赖缺失: ${miss[*]} (请先 opkg update && opkg install ${miss[*]})"
+  return 0
+}
+xray_ok() { [[ -x $XRAY_BIN ]] || command -v xray >/dev/null 2>&1; }
+sb_ok()   { [[ -x $SB_BIN ]] || command -v sing-box >/dev/null 2>&1; }
+xray_path() { [[ -x $XRAY_BIN ]] && printf '%s' "$XRAY_BIN" || command -v xray 2>/dev/null; }
+sb_path()   { [[ -x $SB_BIN ]] && printf '%s' "$SB_BIN" || command -v sing-box 2>/dev/null; }
+sdns_path() { [[ -x $SMARTDNS_BIN ]] && printf '%s' "$SMARTDNS_BIN" || command -v smartdns 2>/dev/null; }
+
+# -----------------------------------------------------------------------------
+# 分享链接解析
+# -----------------------------------------------------------------------------
+b64url_decode() {
+  local s="${1//-/+}"; s="${s//_/\/}"
+  case $(( ${#s} % 4 )) in 2) s="$s==" ;; 3) s="$s=" ;; esac
+  printf '%s' "$s" | base64 -d 2>/dev/null
+}
+b64url_encode() { printf '%s' "$1" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='; }
+
+# URL 百分号编码 (与 server 的 urlenc 行为一致, 用于链接参数)
+urlenc() {
+  local s="$1" out="" c
+  while [[ -n $s ]]; do
+    c=${s:0:1}; s=${s:1}
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) out+=$(printf '%%%02X' "'$c") ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+urldecode() {
+  local s="$1" out="" head c
+  while [[ $s == *%* ]]; do
+    head=${s%%\%*}; out+="$head"; s=${s#*%}
+    c=${s:0:2}; s=${s:2}
+    if [[ $c =~ ^[0-9A-Fa-f]{2}$ ]]; then out+=$(printf "\\x$c"); else out+="%$c"; fi
+  done
+  printf '%s' "$out$s"
+}
+# 取 query 参数。$2 允许传完整链接或已剥掉 '?' 的 query 串, 两种形态都支持。
+# 注意: 生产调用方传入的 q 已剥掉前导 '?', 故必须补一个哨兵 '&',
+# 否则第一个参数(如 encryption= 或 security=)永远匹配不到。
+qget() {
+  local q="$2" v
+  q=${q%%#*}          # 去掉 fragment
+  q=${q#*\?}          # 若含 '?' 则取其后的 query 部分
+  v=$(printf '&%s' "$q" | grep -oE "[&#]$1=[^&]*" | head -n1 | cut -d= -f2-)
+  printf '%s' "$(urldecode "$v")"
+}
+frag_of() { local f="${1##*#}"; [[ $f == "$1" ]] && f=""; printf '%s' "$(urldecode "$f")"; }
+norm_bool() { case "${1,,}" in 1|true|yes) echo 1 ;; *) echo 0 ;; esac; }
+# 拆分 host:port, 支持 [ipv6]:port
+split_hostport() {
+  local hp="$1"
+  if [[ $hp == \[*\]* ]]; then
+    HOST=${hp%%\]*}; HOST=${HOST#[}
+    PORT=${hp##*\]:}
+  else
+    HOST=${hp%%:*}; PORT=${hp##*:}
+  fi
+  [[ $PORT =~ ^[0-9]+$ ]] || PORT=443
+  return 0
+}
+
+parse_vmess() {
+  local raw j
+  raw=$(b64url_decode "${1#vmess://}")
+  [[ -z $raw ]] && return 1
+  j=$(printf '%s' "$raw" | jq -c . 2>/dev/null) || return 1
+  jq -n --argjson j "$j" '{
+    proto:   (if (($j.net // "tcp") | ascii_downcase) == "ws" then "vmess-ws" else "vmess-tcp" end),
+    name:    ($j.ps // $j.add // "vmess"),
+    address: ($j.add | tostring),
+    port:    (($j.port // 443) | tonumber),
+    uuid:    ($j.id | tostring),
+    aid:     (($j.aid // 0) | tonumber),
+    method:  ($j.scy // "auto"),
+    network: ($j.net // "tcp"),
+    path:    ($j.path // ""),
+    host:    ($j.host // ""),
+    tls:     ((($j.tls // "") | tostring) == "tls"),
+    sni:     ($j.sni // $j.host // ""),
+    alpn:    ($j.alpn // ""),
+    fp:      ($j.fp // ""),
+    insecure: (if (((($j.allowInsecure // false) | tostring) == "true") or ((($j.allowInsecure // 0) | tostring) == "1")) then 1 else 0 end)
+  }' 2>/dev/null
+}
+
+parse_vless() {
+  local url="$1" body frag q uuid hostport name
+  local type security pbk sid fp sni flow path host mode alpn enc ins
+  body=${url#vless://}
+  frag=$(frag_of "$body"); name="$frag"
+  body=${body%%#*}; q=""
+  [[ $body == *\?* ]] && { q=${body#*\?}; body=${body%%\?*}; }
+  uuid=${body%%@*}; hostport=${body#*@}
+  split_hostport "$hostport"
+  type=$(qget type "$q");      type=${type:-tcp}
+  security=$(qget security "$q")
+  pbk=$(qget pbk "$q");        sid=$(qget sid "$q")
+  fp=$(qget fp "$q");          sni=$(qget sni "$q")
+  flow=$(qget flow "$q");      path=$(qget path "$q")
+  host=$(qget host "$q");      mode=$(qget mode "$q")
+  alpn=$(qget alpn "$q");      enc=$(qget encryption "$q")
+  ins=$(qget allowInsecure "$q")
+  [[ -z $name ]] && name="$HOST"
+  local proto
+  # VLESS 加密(encryption=mlkem768x25519plus...) 需与传输层一起判定
+  local venc=""; [[ -n $enc && $enc != "none" ]] && venc="1"
+  case "$security:$type" in
+    reality:tcp|reality:raw) proto="vless-reality" ;;
+    reality:xhttp)           proto="vless-reality-xhttp" ;;
+    tls:xhttp)               if [[ -n $venc ]]; then proto="vless-xhttp-enc"; else proto="vless-xhttp-tls"; fi ;;
+    *:ws)                    if [[ -n $venc ]]; then proto="vless-ws-enc"; else proto="vless-ws"; fi ;;
+    *:xhttp)                 if [[ -n $venc ]]; then proto="vless-xhttp-enc"; else proto="vless-xhttp-tls"; fi ;;
+    *)                       proto="vless-tcp" ;;
+  esac
+  jq -n --arg p "$proto" --arg n "$name" --arg a "$HOST" --argjson pt "$PORT" \
+        --arg u "$uuid" --arg ty "$type" --arg se "$security" --arg pbk "$pbk" \
+        --arg sid "$sid" --arg fp "$fp" --arg sni "$sni" --arg flow "$flow" \
+        --arg path "$path" --arg host "$host" --arg mode "$mode" \
+        --arg alpn "$alpn" --arg enc "$enc" --argjson ins "$(norm_bool "$ins")" \
+        '{proto:$p, name:$n, address:$a, port:$pt, uuid:$u, network:$ty, security:$se,
+          pbk:$pbk, sid:$sid, fp:$fp, tls_sni:$sni, flow:$flow, path:$path,
+          host:$host, mode:$mode, alpn:$alpn, enc:$enc, insecure:$ins}' 2>/dev/null
+}
+
+parse_trojan() {
+  local url="$1" body frag q pass hostport name
+  body=${url#trojan://}
+  frag=$(frag_of "$body"); name="$frag"
+  body=${body%%#*}; q=""
+  [[ $body == *\?* ]] && { q=${body#*\?}; body=${body%%\?*}; }
+  pass=${body%%@*}; hostport=${body#*@}
+  split_hostport "$hostport"
+  [[ -z $name ]] && name="$HOST"
+  local type sni ins
+  type=$(qget type "$q"); type=${type:-tcp}
+  sni=$(qget sni "$q"); [[ -z $sni ]] && sni=$(qget peer "$q")
+  ins=$(qget allowInsecure "$q")
+  local proto; [[ $type == "ws" ]] && proto="trojan-ws" || proto="trojan-tcp"
+  jq -n --arg p "$proto" --arg n "$name" --arg a "$HOST" --argjson pt "$PORT" \
+        --arg pw "$pass" --arg ty "$type" --arg sni "$sni" --arg path "$(qget path "$q")" \
+        --arg host "$(qget host "$q")" --argjson ins "$(norm_bool "$ins")" \
+        '{proto:$p, name:$n, address:$a, port:$pt, password:$pw, network:$ty,
+          tls_sni:$sni, path:$path, host:$host, insecure:$ins}' 2>/dev/null
+}
+
+parse_ss() {
+  local url="$1" body frag name userinfo hp method password
+  body=${url#ss://}
+  frag=$(frag_of "$body"); name="$frag"
+  body=${body%%#*}
+  [[ $body == *\?* ]] && body=${body%%\?*}
+  if [[ $body == *@* ]]; then
+    userinfo=${body%%@*}; hp=${body#*@}
+    [[ $userinfo != *:* ]] && userinfo=$(b64url_decode "$userinfo")
+  else
+    local dec; dec=$(b64url_decode "$body")
+    [[ -z $dec ]] && return 1
+    userinfo=${dec%%@*}; hp=${dec#*@}
+  fi
+  method=${userinfo%%:*}; password=${userinfo#*:}
+  split_hostport "$hp"
+  [[ -z $name ]] && name="$HOST"
+  jq -n --arg n "$name" --arg a "$HOST" --argjson pt "$PORT" \
+        --arg m "$method" --arg pw "$password" \
+        '{proto:"ss", name:$n, address:$a, port:$pt, method:$m, password:$pw}' 2>/dev/null
+}
+
+parse_hy2() {
+  local url="$1" body frag q hp name
+  body=${url#hysteria2://}; [[ $body == "$url" ]] && body=${url#hy2://}
+  frag=$(frag_of "$body"); name="$frag"
+  body=${body%%#*}; q=""
+  [[ $body == *\?* ]] && { q=${body#*\?}; body=${body%%\?*}; }
+  local pass hp2; pass=${body%%@*}; hp2=${body#*@}
+  [[ $hp2 == "$body" ]] && { hp2=$body; pass=""; }
+  split_hostport "$hp2"
+  [[ -z $name ]] && name="$HOST"
+  jq -n --arg n "$name" --arg a "$HOST" --argjson pt "$PORT" --arg pw "$pass" \
+        --arg sni "$(qget sni "$q")" --arg obfs "$(qget obfs "$q")" \
+        --argjson ins "$(norm_bool "$(qget insecure "$q")")" \
+        '{proto:"hy2", name:$n, address:$a, port:$pt, password:$pw,
+          tls_sni:$sni, obfs:$obfs, insecure:$ins}' 2>/dev/null
+}
+
+parse_tuic() {
+  local url="$1" body frag q hp name uuid pass
+  body=${url#tuic://}
+  frag=$(frag_of "$body"); name="$frag"
+  body=${body%%#*}; q=""
+  [[ $body == *\?* ]] && { q=${body#*\?}; body=${body%%\?*}; }
+  hp=${body#*@}; [[ $hp == "$body" ]] && hp=$body
+  uuid=${body%%@*}; [[ $uuid == "$body" ]] && uuid=""
+  pass=""
+  [[ $uuid == *:* ]] && { pass=${uuid#*:}; uuid=${uuid%%:*}; }
+  split_hostport "$hp"
+  [[ -z $name ]] && name="$HOST"
+  jq -n --arg n "$name" --arg a "$HOST" --argjson pt "$PORT" --arg u "$uuid" --arg pw "$pass" \
+        --arg sni "$(qget sni "$q")" --arg alpn "$(qget alpn "$q")" \
+        --argjson ins "$(norm_bool "$(qget allow_insecure "$q")")" \
+        '{proto:"tuic", name:$n, address:$a, port:$pt, uuid:$u, password:$pw,
+          tls_sni:$sni, alpn:$alpn, insecure:$ins}' 2>/dev/null
+}
+
+parse_anytls() {
+  local url="$1" body frag q hp name pass
+  body=${url#anytls://}
+  frag=$(frag_of "$body"); name="$frag"
+  body=${body%%#*}; q=""
+  [[ $body == *\?* ]] && { q=${body#*\?}; body=${body%%\?*}; }
+  hp=${body#*@}; pass=${body%%@*}
+  [[ $hp == "$body" ]] && { hp=$body; pass=""; }
+  split_hostport "$hp"
+  [[ -z $name ]] && name="$HOST"
+  jq -n --arg n "$name" --arg a "$HOST" --argjson pt "$PORT" --arg pw "$pass" \
+        --arg sni "$(qget sni "$q")" \
+        --argjson ins "$(norm_bool "$(qget insecure "$q")")" \
+        '{proto:"anytls", name:$n, address:$a, port:$pt, password:$pw,
+          tls_sni:$sni, insecure:$ins}' 2>/dev/null
+}
+
+parse_socks() {
+  local url="$1" body frag q hp name user pass
+  body=${url#socks5://}; [[ $body == "$url" ]] && body=${url#socks://}
+  frag=$(frag_of "$body"); name="$frag"
+  body=${body%%#*}; q=""
+  [[ $body == *\?* ]] && { q=${body#*\?}; body=${body%%\?*}; }
+  if [[ $body == *@* ]]; then hp=${body#*@}; user=${body%%@*}
+  else hp=$body; user=""
+  fi
+  pass=""; [[ $user == *:* ]] && { pass=${user#*:}; user=${user%%:*}; }
+  split_hostport "$hp"
+  [[ -z $name ]] && name="$HOST"
+  jq -n --arg n "$name" --arg a "$HOST" --argjson pt "$PORT" --arg u "$user" --arg pw "$pass" \
+        '{proto:"socks", name:$n, address:$a, port:$pt, uuid:$u, password:$pw}' 2>/dev/null
+}
+
+# naive+https (NaiveProxy; 服务端由 sing-box naive inbound 提供, 仅 sing-box 客户端可用)
+parse_naive() {
+  local url="$1" body frag q hp name user pass
+  body=${url#naive://}; [[ $body == "$url" ]] && body=${url#naive+https://}
+  frag=$(frag_of "$body"); name="$frag"
+  body=${body%%#*}; q=""
+  [[ $body == *\?* ]] && { q=${body#*\?}; body=${body%%\?*}; }
+  if [[ $body == *@* ]]; then hp=${body#*@}; user=$(urldecode "${body%%@*}")
+  else hp=$body; user=""
+  fi
+  pass=""; [[ $user == *:* ]] && { pass=${user#*:}; user=${user%%:*}; }
+  split_hostport "$hp"
+  local sni ins; sni=$(qget sni "$q"); [[ -z $sni ]] && sni=$HOST
+  ins=$(qget insecure "$q"); [[ -z $ins ]] && ins=$(qget allow_insecure "$q")
+  [[ -z $name ]] && name="$HOST"
+  jq -n --arg n "$name" --arg a "$HOST" --argjson pt "$PORT" --arg u "$user" --arg pw "$pass" \
+        --arg sn "$sni" --argjson ins "$(norm_bool "$ins")" \
+        '{proto:"naive", name:$n, address:$a, port:$pt, uuid:$u, password:$pw,
+          tls_sni:$sn, insecure:$ins}' 2>/dev/null
+}
+
+# 统一入口: 输出节点 JSON(失败返回 1)
+parse_share_link() {
+  local url="$1" s
+  url=$(printf '%s' "$url" | tr -d ' \t\r\n')
+  s=${url%%://*}
+  case "$s" in
+    vmess)               parse_vmess   "$url" ;;
+    vless)               parse_vless   "$url" ;;
+    trojan)              parse_trojan  "$url" ;;
+    ss)                  parse_ss      "$url" ;;
+    hysteria2|hy2)       parse_hy2     "$url" ;;
+    tuic)                parse_tuic    "$url" ;;
+    anytls)              parse_anytls  "$url" ;;
+    naive|naive+https)   parse_naive   "$url" ;;
+    socks|socks5|socks4) parse_socks   "$url" ;;
+    *) return 1 ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# Xray 出站 / 配置生成
+# -----------------------------------------------------------------------------
+node_needs_bridge() {
+  local p; p=$(conf_get ".nodes[$1].proto" 2>/dev/null)
+  [[ $p == "hy2" || $p == "tuic" || $p == "anytls" || $p == "naive" || $p == "sssb" ]]
+}
+
+node_outbound() {   # $1=节点下标 $2=tag
+  local i="$1" tag="$2"
+  local proto addr host port uuid password path sni pbk sid flow method ins scy net alpn fp enc mode
+  addr=$(conf_get ".nodes[$i].address")
+  proto=$(conf_get ".nodes[$i].proto")
+  port=$(conf_get ".nodes[$i].port")
+  host=${addr}
+  [[ -z $port ]] && port=$(conf_get ".nodes[$i].port")
+  uuid=$(conf_get ".nodes[$i].uuid")
+  password=$(conf_get ".nodes[$i].password")
+  path=$(conf_get ".nodes[$i].path")
+  sni=$(conf_get ".nodes[$i].tls_sni"); [[ -z $sni ]] && sni=$host
+  pbk=$(conf_get ".nodes[$i].pbk"); sid=$(conf_get ".nodes[$i].sid")
+  flow=$(conf_get ".nodes[$i].flow"); method=$(conf_get ".nodes[$i].method")
+  scy=$(conf_get ".nodes[$i].method"); net=$(conf_get ".nodes[$i].network")
+  alpn=$(conf_get ".nodes[$i].alpn"); fp=$(conf_get ".nodes[$i].fp")
+  enc=$(conf_get ".nodes[$i].enc"); mode=$(conf_get ".nodes[$i].mode")
+  ins=$(conf_get ".nodes[$i].insecure"); [[ $ins == "1" ]] && ins=true || ins=false
+
+  local sockopt='{"mark":255,"tcpFastOpen":true,"tcpNoDelay":true}'
+
+  case "$proto" in
+    vmess-ws)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg path "$path" \
+            --arg h "$(conf_get ".nodes[$i].host")" --arg sn "$sni" --argjson ins "$ins" \
+            --argjson so "$sockopt" \
+            '{protocol:"vmess", tag:$tag,
+              settings:{vnext:[{address:$s, port:$p, users:[{id:$u, alterId:0, security:"auto"}]}]},
+              streamSettings:{network:"ws", security:"tls",
+                tlsSettings:{serverName:$sn, allowInsecure:$ins, fingerprint:"chrome"},
+                wsSettings:{path:$path, headers:(if $h=="" then {} else {Host:$h} end)},
+                sockopt:$so}}' ;;
+    vmess-tcp)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --argjson so "$sockopt" \
+            '{protocol:"vmess", tag:$tag,
+              settings:{vnext:[{address:$s, port:$p, users:[{id:$u, alterId:0, security:"auto"}]}]},
+              streamSettings:{network:"tcp", sockopt:$so}}' ;;
+    vless-reality)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" \
+            --arg pbk "$pbk" --arg sid "$sid" --arg fp "${fp:-chrome}" --arg flow "${flow:-xtls-rprx-vision}" \
+            --argjson so "$sockopt" \
+            '{protocol:"vless", tag:$tag,
+              settings:{vnext:[{address:$s, port:$p, users:[{id:$u, encryption:"none", flow:$flow}]}]},
+              streamSettings:{network:"tcp", security:"reality",
+                realitySettings:{serverName:$sn, publicKey:$pbk, shortId:$sid, fingerprint:$fp, spiderX:"/"},
+                sockopt:$so}}' ;;
+    vless-reality-xhttp)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" \
+            --arg pbk "$pbk" --arg sid "$sid" --arg fp "${fp:-chrome}" --arg path "$path" \
+            --arg h "$(conf_get ".nodes[$i].host")" --arg mode "${mode:-auto}" --argjson so "$sockopt" \
+            '{protocol:"vless", tag:$tag,
+              settings:{vnext:[{address:$s, port:$p, users:[{id:$u, encryption:"none"}]}]},
+              streamSettings:{network:"xhttp", security:"reality",
+                xhttpSettings:{path:$path, host:$h, mode:$mode},
+                realitySettings:{serverName:$sn, publicKey:$pbk, shortId:$sid, fingerprint:$fp, spiderX:"/"},
+                sockopt:$so}}' ;;
+    vless-xhttp-tls)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --arg path "$path" \
+            --arg h "$(conf_get ".nodes[$i].host")" --arg mode "${mode:-auto}" --argjson ins "$ins" \
+            --argjson so "$sockopt" \
+            '{protocol:"vless", tag:$tag,
+              settings:{vnext:[{address:$s, port:$p, users:[{id:$u, encryption:"none"}]}]},
+              streamSettings:{network:"xhttp", security:"tls",
+                xhttpSettings:{path:$path, host:$h, mode:$mode},
+                tlsSettings:{serverName:$sn, allowInsecure:$ins, fingerprint:"chrome"},
+                sockopt:$so}}' ;;
+    vless-ws-enc)
+      # VLESS 加密: users[].encryption 携带客户端 encryption 串 (xray vlessenc 输出)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg path "$path" \
+            --arg h "$(conf_get ".nodes[$i].host")" --arg sn "$sni" --arg enc "$enc" \
+            --argjson ins "$ins" --argjson so "$sockopt" \
+            '{protocol:"vless", tag:$tag,
+              settings:{vnext:[{address:$s, port:$p, users:[{id:$u, encryption:$enc}]}]},
+              streamSettings:{network:"ws", security:"tls",
+                tlsSettings:{serverName:$sn, allowInsecure:$ins, fingerprint:"chrome"},
+                wsSettings:{path:$path, headers:(if $h=="" then {} else {Host:$h} end)},
+                sockopt:$so}}' ;;
+    vless-xhttp-enc)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" \
+            --arg path "$path" --arg h "$(conf_get ".nodes[$i].host")" --arg mode "${mode:-auto}" \
+            --arg enc "$enc" --argjson ins "$ins" --argjson so "$sockopt" \
+            '{protocol:"vless", tag:$tag,
+              settings:{vnext:[{address:$s, port:$p, users:[{id:$u, encryption:$enc}]}]},
+              streamSettings:{network:"xhttp", security:"tls",
+                xhttpSettings:{path:$path, host:$h, mode:$mode},
+                tlsSettings:{serverName:$sn, allowInsecure:$ins, fingerprint:"chrome"},
+                sockopt:$so}}' ;;
+    vless-ws)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg path "$path" \
+            --arg h "$(conf_get ".nodes[$i].host")" --arg sn "$sni" --argjson ins "$ins" \
+            --argjson so "$sockopt" \
+            '{protocol:"vless", tag:$tag,
+              settings:{vnext:[{address:$s, port:$p, users:[{id:$u, encryption:"none"}]}]},
+              streamSettings:{network:"ws", security:"tls",
+                tlsSettings:{serverName:$sn, allowInsecure:$ins, fingerprint:"chrome"},
+                wsSettings:{path:$path, headers:(if $h=="" then {} else {Host:$h} end)},
+                sockopt:$so}}' ;;
+    vless-tcp)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg sn "$sni" --argjson ins "$ins" \
+            --argjson so "$sockopt" \
+            '{protocol:"vless", tag:$tag,
+              settings:{vnext:[{address:$s, port:$p, users:[{id:$u, encryption:"none"}]}]},
+              streamSettings:{network:"tcp", security:"tls",
+                tlsSettings:{serverName:$sn, allowInsecure:$ins, fingerprint:"chrome"},
+                sockopt:$so}}' ;;
+    trojan-ws)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg pw "$password" --arg path "$path" \
+            --arg h "$(conf_get ".nodes[$i].host")" --arg sn "$sni" --argjson ins "$ins" \
+            --argjson so "$sockopt" \
+            '{protocol:"trojan", tag:$tag,
+              settings:{servers:[{address:$s, port:$p, password:$pw}]},
+              streamSettings:{network:"ws", security:"tls",
+                tlsSettings:{serverName:$sn, allowInsecure:$ins, fingerprint:"chrome"},
+                wsSettings:{path:$path, headers:(if $h=="" then {} else {Host:$h} end)},
+                sockopt:$so}}' ;;
+    trojan-tcp)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg pw "$password" --arg sn "$sni" --argjson ins "$ins" \
+            --argjson so "$sockopt" \
+            '{protocol:"trojan", tag:$tag,
+              settings:{servers:[{address:$s, port:$p, password:$pw}]},
+              streamSettings:{network:"tcp", security:"tls",
+                tlsSettings:{serverName:$sn, allowInsecure:$ins, fingerprint:"chrome"},
+                sockopt:$so}}' ;;
+    ss)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg m "${method:-chacha20-ietf-poly1305}" --arg pw "$password" \
+            --argjson so "$sockopt" \
+            '{protocol:"shadowsocks", tag:$tag,
+              settings:{servers:[{address:$s, port:$p, method:$m, password:$pw, uot:true}]},
+              streamSettings:{network:"tcp", sockopt:$so}}' ;;
+    socks)
+      jq -n --arg tag "$tag" --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg pw "$password" --argjson so "$sockopt" \
+            '{protocol:"socks", tag:$tag,
+              settings:{servers:[{address:$s, port:$p,
+                users:(if $u=="" then [] else [{user:$u, pass:$pw}] end)}]},
+              streamSettings:{network:"tcp", sockopt:$so}}' ;;
+    hy2|tuic|anytls|naive|sssb)
+      # 由 sing-box 桥接: xray 出口指向 127.0.0.1:10808 (socks)
+      jq -n --arg tag "$tag" --argjson so "$sockopt" \
+            '{protocol:"socks", tag:$tag,
+              settings:{servers:[{address:"127.0.0.1", port:10808}]},
+              streamSettings:{network:"tcp", sockopt:$so}}' ;;
+    *) return 1 ;;
+  esac
+}
+
+# 生成 sing-box 客户端配置(仅 hy2/tuic/anytls 需要)
+sb_client_gen() {
+  local i; i=$(conf_get '.nodeActive')
+  [[ -z $i ]] && return 1
+  local proto addr host port uuid password sni insecure
+  addr=$(conf_get ".nodes[$i].address"); host=${addr%%:*}
+  port=$(conf_get ".nodes[$i].port")
+  proto=$(conf_get ".nodes[$i].proto")
+  uuid=$(conf_get ".nodes[$i].uuid"); password=$(conf_get ".nodes[$i].password")
+  sni=$(conf_get ".nodes[$i].tls_sni"); [[ -z $sni ]] && sni=$host
+  insecure=$(conf_get ".nodes[$i].insecure"); [[ $insecure == "1" ]] && insecure=true || insecure=false
+  local out
+  case "$proto" in
+    hy2)
+      out=$(jq -n --arg s "$host" --argjson p "$port" --arg pw "$password" --arg sn "$sni" --argjson ins "$insecure" \
+        '{type:"hysteria2", tag:"sbproxy", server:$s, server_port:$p, password:$pw,
+          tls:{enabled:true, server_name:$sn, insecure:$ins}}') ;;
+    tuic)
+      out=$(jq -n --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" --argjson ins "$insecure" \
+        '{type:"tuic", tag:"sbproxy", server:$s, server_port:$p, uuid:$u, password:$pw,
+          congestion_control:"bbr",
+          tls:{enabled:true, server_name:$sn, insecure:$ins, alpn:["h3"]}}') ;;
+    anytls)
+      out=$(jq -n --arg s "$host" --argjson p "$port" --arg pw "$password" --arg sn "$sni" --argjson ins "$insecure" \
+        '{type:"anytls", tag:"sbproxy", server:$s, server_port:$p, password:$pw,
+          tls:{enabled:true, server_name:$sn, insecure:$ins}}') ;;
+    naive)
+      # sing-box 1.14 的 naive outbound 既不支持 insecure 也不支持 alpn, 仅保留 TLS 基本项
+      out=$(jq -n --arg s "$host" --argjson p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" \
+        '{type:"naive", tag:"sbproxy", server:$s, server_port:$p, username:$u, password:$pw,
+          quic:false,
+          tls:{enabled:true, server_name:$sn}}') ;;
+    sssb)
+      local m; m=$(conf_get ".nodes[$i].method"); [[ -z $m ]] && m="2022-blake3-aes-128-gcm"
+      out=$(jq -n --arg s "$host" --argjson p "$port" --arg m "$m" --arg pw "$password" \
+        '{type:"shadowsocks", tag:"sbproxy", server:$s, server_port:$p, method:$m, password:$pw}') ;;
+    *) return 1 ;;
+  esac
+  [[ -z $out ]] && return 1
+  # 注意: sing-box 1.12+ 已移除 inbound 的 sniff 字段, 改为 route.rules action=sniff
+  jq -n --argjson o "$out" '{
+    log: { level: "warn", timestamp: true },
+    inbounds: [{
+      type: "socks", tag: "sb-in", listen: "127.0.0.1", listen_port: 10808,
+      udp_timeout: "5m"
+    }],
+    outbounds: [ $o, { type: "direct", tag: "direct" } ],
+    route: {
+      rules: [ { action: "sniff" } ],
+      final: "sbproxy"
+    }
+  }' | write_atomic "$SBDIR/client.json" 600
+}
+
+sb_bridge_on() {
+  sb_ok || { warn "未找到 sing-box, hy2/tuic/anytls 节点不可用"; return 1; }
+  sb_client_gen || { warn "sing-box 配置生成失败"; return 1; }
+  /etc/init.d/degwd-sb enable >/dev/null 2>&1
+  /etc/init.d/degwd-sb restart >/dev/null 2>&1
+  sleep 1
+  /etc/init.d/degwd-sb running >/dev/null 2>&1
+}
+sb_bridge_off() {
+  /etc/init.d/degwd-sb stop >/dev/null 2>&1
+  /etc/init.d/degwd-sb disable >/dev/null 2>&1
+  return 0
+}
+apply_node_bridge() {
+  local act; act=$(conf_get '.nodeActive'); [[ -z $act ]] && return 0
+  if node_needs_bridge "$act"; then
+    sb_bridge_on || warn "sing-box 桥接未就绪(hy2/tuic/anytls 节点将不可用)"
+  else
+    sb_bridge_off
+  fi
+}
+
+# 生成 xray 配置
+xray_gen_config() {
+  local i act mode
+  i=$(conf_get '.nodeActive')
+  [[ -z $i ]] && { warn "未选择节点"; return 1; }
+  mode=$(conf_get '.split.mode'); [[ -z $mode ]] && mode=proxy
+
+  local ob; ob=$(node_outbound "$i" "proxy") || { err "节点配置生成失败(协议不支持?)"; return 1; }
+
+  # DNS: 优先 smartdns(分流), 回退直连
+  local dnsport=$DNS_PORT
+  local dnsservers
+  dnsservers=$(jq -n --argjson p "$dnsport" --arg a "$DNS_ALI" \
+    '[{address:"127.0.0.1", port:$p, skipFallback:false}, $a, "1.1.1.1"]')
+
+  # hosts: 用户自定义 + 节点域名钉死
+  local hosts
+  hosts=$(jq -n --argjson u "$(conf_get '.dns.hosts' | jq -c '. // {}' 2>/dev/null || echo '{}')" '$u')
+
+  local nodes_cnt; nodes_cnt=$(conf_get '.nodes | length'); [[ -z $nodes_cnt ]] && nodes_cnt=0
+  local k=0 nh="{}"
+  while [[ $k -lt $nodes_cnt ]]; do
+    local d ip
+    d=$(conf_get ".nodes[$k].address"); d=${d%%:*}
+    ip=$(conf_get ".nodes[$k].ip")
+    [[ -n $ip && -n $d ]] && nh=$(jq -n --argjson h "$nh" --arg d "$d" --arg ip "$ip" '$h + {($d): $ip}')
+    k=$((k+1))
+  done
+  hosts=$(jq -n --argjson a "$hosts" --argjson b "$nh" '$a + $b')
+
+  # 分流规则
+  local sdom sips rules
+  sdom=$(conf_get '.split.domains' | jq -c '. // []' 2>/dev/null || echo '[]')
+  sips=$(conf_get '.split.ips'     | jq -c '. // []' 2>/dev/null || echo '[]')
+  if [[ $mode == "direct" ]]; then
+    # 白名单: 列表内直连, 其余走代理
+    rules=$(jq -n --argjson d "$sdom" --argjson p "$sips" '[
+      {type:"field", inboundTag:["tproxy-in"], domain:$d, outboundTag:"direct"},
+      {type:"field", inboundTag:["tproxy-in"], ip:$p,      outboundTag:"direct"},
+      {type:"field", inboundTag:["tproxy-in"], ip:["geoip:private"], outboundTag:"direct"}
+    ]')
+  else
+    # 黑名单(默认): 国内直连, 其余代理
+    rules=$(jq -n --argjson d "$sdom" --argjson p "$sips" '[
+      {type:"field", inboundTag:["tproxy-in"], domain:$d, outboundTag:"proxy"},
+      {type:"field", inboundTag:["tproxy-in"], ip:$p,      outboundTag:"proxy"},
+      {type:"field", inboundTag:["tproxy-in"], ip:["geoip:private"], outboundTag:"direct"},
+      {type:"field", inboundTag:["tproxy-in"], domain:["geosite:cn"], outboundTag:"direct"},
+      {type:"field", inboundTag:["tproxy-in"], ip:["geoip:cn"], outboundTag:"direct"}
+    ]')
+  fi
+
+  local tmp; tmp=$(mktemp "$XRAYDIR/.config.XXXXXX") || return 1
+  jq -n --argjson ob "$ob" --argjson dns "$dnsservers" --argjson hosts "$hosts" \
+        --argjson rules "$rules" --argjson tp "$TPROXY_PORT" --arg errlog "$XRAYDIR/error.log" '
+    {
+      log: { loglevel: "warning", access: "none", error: $errlog },
+      dns: { servers: $dns, hosts: $hosts, queryStrategy: "UseIPv4", disableFallbackIfMatch: true },
+      inbounds: [{
+        tag: "tproxy-in", listen: "127.0.0.1", port: $tp, protocol: "dokodemo-door",
+        settings: { network: "tcp,udp", followRedirect: true },
+        streamSettings: { sockopt: { tproxy: "tproxy", mark: 255, tcpFastOpen: true, tcpMptcp: true } },
+        sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
+      }],
+      outbounds: [ $ob, { protocol: "freedom", tag: "direct" }, { protocol: "blackhole", tag: "block" } ],
+      routing: { domainMatcher: "hybrid", domainStrategy: "AsIs", rules: $rules }
+    }' >"$tmp" 2>/dev/null
+
+  if [[ ! -s $tmp ]] || ! jq -e . "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; err "Xray 配置生成失败(已保留旧配置)"; return 1
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$XRAYDIR/config.json"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# nftables 平面 (table ip de_GWD, priority -280, 与 passwall2/mwan3/fw4 共存)
+# -----------------------------------------------------------------------------
+# 重要: 绝不可调用 /etc/init.d/firewall stop 或 fw4 flush —— 那会删除机器上所有 nft 表
+nft_gen() {
+  local lanif lanip reserved gfdns
+  lanif=$(conf_get '.lanIf'); [[ -z $lanif ]] && lanif=$(lan_if)
+  lanip=$(conf_get '.lanCidr')
+  local lanbase; lanbase=${lanip%%/*}
+
+  reserved=""
+  local n; for n in $RESERVED_NETS; do reserved="$reserved$n,"; done
+  reserved="${reserved%,}"
+  gfdns=""
+  for n in $GF_DNS_NETS; do gfdns="$gfdns$n,"; done
+  gfdns="${gfdns%,}"
+
+  local block53_line=""
+  if [[ $(conf_get '.block53') == "true" ]]; then
+    block53_line='        meta l4proto tcp th dport 853 counter reject with tcp reset comment "block DoT"'
+  fi
+
+  local tmp; tmp=$(mktemp "$NFTDIR/.de_GWD.XXXXXX") || return 1
+  cat >"$tmp" <<EOF
+#!/usr/sbin/nft -f
+# 朔月 Shuoyue — OpenWrt 旁路网关 (自建表, 不影响 fw4/passwall2/mwan3)
+# priority -280: 早于 mangle(-150) 与 passwall2 的 mangle-1(-151), 晚于 raw(-300)
+table ip ${NFT_TABLE} {
+    set selfip {
+        type ipv4_addr
+        flags interval
+        elements = { 127.0.0.1, ${lanbase}, 172.17.0.1 }
+    }
+
+    set reserved {
+        type ipv4_addr
+        flags interval
+        elements = { ${reserved} }
+    }
+
+    set gfdns {
+        type ipv4_addr
+        flags interval
+        elements = { ${gfdns} }
+    }
+
+    # chnroute / 节点 IP / 分流名单: 由 refresh_nft_sets 动态填充
+    set chnroute {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    set v2node {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    set listblan {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    set listwlan {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    chain prerouting {
+        type filter hook prerouting priority -280; policy accept;
+
+        # 本机自身流量不代理
+        ip saddr @selfip accept comment "self"
+
+        # 基础服务端口(仅本机)
+        udp dport { 53, 67, 68, 123, 1900, 5350, 5351, 5353 } accept comment "udp svc"
+        tcp dport { 53, 67, 68, 123 } accept comment "tcp svc"
+
+        # 国内 DNS 直连(防止解析节点域名成环)
+        ip daddr @gfdns accept comment "china dns"
+
+        # 分流名单
+        meta l4proto { tcp, udp } ip saddr @listblan tproxy to 127.0.0.1:${TPROXY_PORT} meta mark set ${NFT_MARK} comment "blacklist"
+        ip saddr @listwlan accept comment "whitelist"
+
+        # 内网/保留/节点 IP/国内 IP 直连
+        ip daddr @reserved accept comment "reserved"
+        ip daddr @v2node accept comment "v2node"
+        ip daddr @chnroute accept comment "chnroute direct"
+${block53_line}
+
+        # 本机所有本地地址(含公网 WAN IP)不代理, 保护路由器自身服务(nginx/dnsmasq/ssh/luci)
+        fib daddr type local accept comment "router local addr"
+
+        # 其余全部 tproxy 到 xray
+        meta l4proto { tcp, udp } tproxy to 127.0.0.1:${TPROXY_PORT} meta mark set ${NFT_MARK} comment "tproxy all"
+    }
+
+    chain output {
+        type route hook output priority -280; policy accept;
+
+        oifname "lo" accept comment "loopback"
+        meta mark 0xff accept comment "xray own"
+        # 本机发起的连接标记后交由 prerouting 之外的 route 决策
+        meta l4proto tcp socket transparent 1 meta mark set ${NFT_MARK} comment "local tcp"
+    }
+}
+EOF
+  printf '%s' "$tmp"
+}
+
+nft_apply() {
+  local f="$1"
+  [[ -f $f ]] || { err "nft 规则文件不存在"; return 1; }
+  if ! nft -c -f "$f" >/dev/null 2>&1; then
+    err "nft 规则语法校验失败:"; nft -c -f "$f" 2>&1 | head -n 5
+    return 1
+  fi
+  # 只删除自建表, 绝不触碰其他表
+  nft list table ip "$NFT_TABLE" >/dev/null 2>&1 && nft delete table ip "$NFT_TABLE" 2>/dev/null
+  nft -f "$f" || { err "nft 规则加载失败"; return 1; }
+  return 0
+}
+
+nft_sets_reload() {   # $1=集合名 $2=文本列表(每行一个 CIDR/IP)
+  local setname="$1" file="$2"
+  [[ -s $file ]] || return 0
+  local total; total=$(wc -l <"$file" | tr -d ' ')
+  [[ -z $total || $total -eq 0 ]] && return 0
+  # 重建集合元素: 先清空, 再分批 add(500/批)
+  nft flush set ip "$NFT_TABLE" "$setname" 2>/dev/null
+  local batch="" cnt=0 line
+  while IFS= read -r line; do
+    line=$(printf '%s' "$line" | tr -d ' \t\r')
+    [[ -z $line || $line == \#* ]] && continue
+    batch="$batch$line,"
+    cnt=$((cnt+1))
+    if [[ $cnt -ge 500 ]]; then
+      nft add element ip "$NFT_TABLE" "$setname" "{ ${batch%,} }" 2>/dev/null
+      batch=""; cnt=0
+    fi
+  done <"$file"
+  [[ -n $batch ]] && nft add element ip "$NFT_TABLE" "$setname" "{ ${batch%,} }" 2>/dev/null
+  return 0
+}
+
+nft_reserved_only() {   # 只放行保留网段(关闭代理时用)
+  nft flush chain ip "$NFT_TABLE" prerouting 2>/dev/null
+  nft add rule ip "$NFT_TABLE" prerouting ip daddr @reserved accept 2>/dev/null
+  nft add rule ip "$NFT_TABLE" prerouting ip saddr @selfip accept 2>/dev/null
+  return 0
+}
+
+# 路由策略: fwmark 0x9 → table 220 (local default dev lo)
+route_rule_on() {
+  ip rule list 2>/dev/null | grep -q "fwmark ${NFT_MARK} lookup ${RT_TABLE}" || \
+    ip rule add fwmark "$NFT_MARK" table "$RT_TABLE" prio "$RT_PRIO" 2>/dev/null
+  ip route show table "$RT_TABLE" 2>/dev/null | grep -q "^local default dev lo" || \
+    ip route add local default dev lo scope host table "$RT_TABLE" 2>/dev/null
+  return 0
+}
+route_rule_off() {
+  ip rule del fwmark "$NFT_MARK" table "$RT_TABLE" prio "$RT_PRIO" 2>/dev/null
+  ip route del local default dev lo scope host table "$RT_TABLE" 2>/dev/null
+  return 0
+}
+route_rule_ok() {
+  ip rule list 2>/dev/null | grep -q "fwmark ${NFT_MARK} lookup ${RT_TABLE}" && \
+  ip route show table "$RT_TABLE" 2>/dev/null | grep -q "^local default dev lo"
+}
+
+# -----------------------------------------------------------------------------
+# procd init 脚本 (OpenWrt 无 systemd)
+# -----------------------------------------------------------------------------
+init_xray_write() {
+  write_atomic /etc/init.d/degwd-gw 755 <<EOF
+#!/bin/sh /etc/rc.common
+# 朔月 Shuoyue — xray 旁路网关 (procd)
+START=99
+STOP=15
+USE_PROCD=1
+NAME=degwd-gw
+
+start_service() {
+    mkdir -p $XRAYDIR
+    procd_open_instance
+    procd_set_param command $(xray_path) run -c $XRAYDIR/config.json
+    procd_set_param respawn 1 1 0
+    procd_set_param pidfile /var/run/degwd-gw.pid
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param env XRAY_LOCATION_ASSET=/usr/share/xray
+    procd_close_service
+}
+
+stop_service() {
+    return 0
+}
+
+service_triggers() {
+    procd_add_reload_trigger "degwd"
+}
+EOF
+  chmod 755 /etc/init.d/degwd-gw 2>/dev/null
+}
+
+init_sb_write() {
+  write_atomic /etc/init.d/degwd-sb 755 <<EOF
+#!/bin/sh /etc/rc.common
+# 朔月 Shuoyue — sing-box 桥接 (hy2/tuic/anytls)
+START=98
+STOP=16
+USE_PROCD=1
+NAME=degwd-sb
+
+start_service() {
+    [ -f $SBDIR/client.json ] || return 0
+    procd_open_instance
+    procd_set_param command $(sb_path) run -c $SBDIR/client.json
+    procd_set_param respawn 1 1 0
+    procd_set_param pidfile /var/run/degwd-sb.pid
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_service
+}
+EOF
+  chmod 755 /etc/init.d/degwd-sb 2>/dev/null
+}
+
+init_nft_write() {
+  write_atomic /etc/init.d/degwd-nft 755 <<EOF
+#!/bin/sh /etc/rc.common
+# 朔月 Shuoyue — nftables 平面 + 策略路由
+START=21
+STOP=89
+USE_PROCD=0
+NAME=degwd-nft
+
+start() {
+    [ -f $NFTDIR/de_GWD.nft ] || return 0
+    nft list table ip ${NFT_TABLE} >/dev/null 2>&1 && nft delete table ip ${NFT_TABLE} 2>/dev/null
+    nft -f $NFTDIR/de_GWD.nft 2>/dev/null
+    ip rule list 2>/dev/null | grep -q "fwmark ${NFT_MARK} lookup ${RT_TABLE}" || \
+        ip rule add fwmark ${NFT_MARK} table ${RT_TABLE} prio ${RT_PRIO} 2>/dev/null
+    ip route show table ${RT_TABLE} 2>/dev/null | grep -q "^local default dev lo" || \
+        ip route add local default dev lo scope host table ${RT_TABLE} 2>/dev/null
+    return 0
+}
+
+stop() {
+    nft delete table ip ${NFT_TABLE} 2>/dev/null
+    ip rule del fwmark ${NFT_MARK} table ${RT_TABLE} prio ${RT_PRIO} 2>/dev/null
+    ip route del local default dev lo scope host table ${RT_TABLE} 2>/dev/null
+    return 0
+}
+
+reload() { stop; start; }
+EOF
+  chmod 755 /etc/init.d/degwd-nft 2>/dev/null
+}
+
+init_sdns_write() {
+  write_atomic /etc/init.d/degwd-dns 755 <<EOF
+#!/bin/sh /etc/rc.common
+# 朔月 Shuoyue — smartdns (仅 127.0.0.1:${DNS_PORT}, 不占用 53)
+START=20
+STOP=90
+USE_PROCD=1
+NAME=degwd-dns
+
+start_service() {
+    [ -f $SDNSDIR/smartdns.conf ] || return 0
+    procd_open_instance
+    procd_set_param command $(sdns_path) -f -c $SDNSDIR/smartdns.conf
+    procd_set_param respawn 1 1 0
+    procd_set_param pidfile /var/run/degwd-dns.pid
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_service
+}
+EOF
+  chmod 755 /etc/init.d/degwd-dns 2>/dev/null
+}
+
+init_write_all() { init_xray_write; init_sb_write; init_nft_write; init_sdns_write; }
+
+# -----------------------------------------------------------------------------
+# DNS: smartdns 分流 (127.0.0.1:6053) + dnsmasq 转发 (可逆)
+# -----------------------------------------------------------------------------
+smartdns_conf() {
+  local doh china dnsport
+  doh=$(conf_get '.dns.doh'); [[ -z $doh ]] && doh="$DEFAULT_DOH"
+  china=$(conf_get '.dns.china[]' | tr '\n' ' '); [[ -z $china ]] && china="$DNS_ALI $DNS_TENCENT"
+
+  local tmp; tmp=$(mktemp "$SDNSDIR/.smartdns.XXXXXX") || return 1
+  cat >"$tmp" <<EOF
+# 朔月 Shuoyue — smartdns (OpenWrt)
+server-name de_GWD
+bind 127.0.0.1:${DNS_PORT}
+bind-tcp 127.0.0.1:${DNS_PORT}
+speed-check-mode tcp:443,ping,tcp:80
+response-mode first-ping
+force-AAAA-SOA yes
+force-qtype-soa 65
+dualstack-ip-selection yes
+cache-size 4096
+cache-persist yes
+cache-file $SDNSDIR/cache.dat
+prefetch-domain yes
+serve-expired yes
+serve-expired-ttl 86400
+rr-ttl-min 60
+rr-ttl-max 86400
+log-level warn
+EOF
+  if [[ -s $SDNSDIR/chn_domains.txt ]]; then
+    printf 'domain-set -name chn -file %s\n' "$SDNSDIR/chn_domains.txt" >>"$tmp"
+    printf 'nameserver /domain-set:chn/chn\n' >>"$tmp"
+  fi
+  local s
+  for s in $china; do printf 'server %s -group chn -exclude-default-group\n' "$s" >>"$tmp"; done
+  printf 'server-https %s -group global -exclude-default-group -no-check-certificate\n' "$doh" >>"$tmp"
+  # 用户自定义 hosts
+  conf_get '.dns.hosts' 2>/dev/null | jq -r 'to_entries[] | "address /\(.key)/\(.value)"' >>"$tmp" 2>/dev/null
+  # 节点域名钉死 IP(防回环)
+  local nodes i addr d ip ncnt
+  nodes=$(conf_get '.nodes'); i=0
+  ncnt=$(printf '%s' "$nodes" | jq 'length' 2>/dev/null || echo 0)
+  while [[ $i -lt $ncnt ]]; do
+    addr=$(conf_get ".nodes[$i].address"); d=${addr%%:*}
+    ip=$(conf_get ".nodes[$i].ip")
+    [[ -n $ip && -n $d ]] && printf 'address /%s/%s\n' "$d" "$ip" >>"$tmp"
+    i=$((i+1))
+  done
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$SDNSDIR/smartdns.conf"
+  return 0
+}
+
+# 把 dnsmasq 的解析转给 smartdns (照抄 smartdns 官方 init 的可逆做法)
+# 注意: UCI CLI 不支持 dhcp.@dnsmasq[0].server[N] 这种数组索引取值,
+#       增删列表项必须用 add_list / del_list, 否则永远定位不到自己的那一项。
+dns_forward_on() {
+  local cur
+  cur=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
+  if printf '%s\n' "$cur" | grep -q "127.0.0.1#${DNS_PORT}"; then
+    return 0   # 已配置, 幂等
+  fi
+  # 首次修改前记录原始值, 供卸载精确还原(不覆盖已存在的备份)
+  if [[ $(conf_get '.dnsBackup.done' 2>/dev/null) != "true" ]]; then
+    conf_raw '.dnsBackup' "$(jq -n \
+      --arg srv "$cur" \
+      --arg nr  "$(uci -q get dhcp.@dnsmasq[0].noresolv 2>/dev/null)" \
+      --arg rp  "$(uci -q get dhcp.@dnsmasq[0].rebind_protection 2>/dev/null)" \
+      --arg dn  "$(uci -q get dhcp.@dnsmasq[0].domainneeded 2>/dev/null)" \
+      '{done:true, server:$srv, noresolv:$nr, rebind_protection:$rp, domainneeded:$dn}')" \
+      || warn "无法记录 dnsmasq 原始配置(卸载时可能无法完全还原)"
+  fi
+  uci -q add_list "dhcp.@dnsmasq[0].server=127.0.0.1#${DNS_PORT}" || return 1
+  uci -q set dhcp.@dnsmasq[0].noresolv='1' || return 1
+  uci -q set dhcp.@dnsmasq[0].rebind_protection='0' || return 1
+  uci -q set dhcp.@dnsmasq[0].domainneeded='0' || return 1
+  uci commit dhcp || return 1
+  conf_set '.dnsForward' "true"
+  /etc/init.d/dnsmasq reload >/dev/null 2>&1
+  return 0
+}
+
+dns_forward_off() {
+  # 仅移除我们添加的那条 server 项, 其余保持原样
+  uci -q del_list "dhcp.@dnsmasq[0].server=127.0.0.1#${DNS_PORT}" 2>/dev/null
+  # 按备份还原被我们改过的三个键(有备份才动, 无备份则保持现状)
+  if [[ $(conf_get '.dnsBackup.done' 2>/dev/null) == "true" ]]; then
+    local k v
+    for k in noresolv rebind_protection domainneeded; do
+      v=$(conf_get ".dnsBackup.$k" 2>/dev/null)
+      if [[ -n $v ]]; then
+        uci -q set "dhcp.@dnsmasq[0].$k=$v" 2>/dev/null
+      else
+        uci -q delete "dhcp.@dnsmasq[0].$k" 2>/dev/null
+      fi
+    done
+    conf_del '.dnsBackup'
+  fi
+  uci commit dhcp 2>/dev/null
+  conf_set '.dnsForward' "false"
+  /etc/init.d/dnsmasq reload >/dev/null 2>&1
+  return 0
+}
+
+dns_forward_ok() {
+  local cur; cur=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
+  printf '%s\n' "$cur" | grep -q "127.0.0.1#${DNS_PORT}"
+}
+
+# 解析测试(不用 dig; 用 xray/smartdns 自带的查询能力, 回退 nc)
+dns_query_test() {
+  local host="${1:-www.baidu.com}"
+  if command -v nslookup >/dev/null 2>&1; then
+    nslookup "$host" 127.0.0.1 >/dev/null 2>&1 && return 0
+  fi
+  # 回退: 用 socat 发一个最小 DNS 查询(A 记录 0x0001)
+  command -v socat >/dev/null 2>&1 || return 2
+  printf '\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x06baidu\x03com\x00\x00\x01\x00\x01' \
+    | socat -T3 - "UDP:127.0.0.1:${DNS_PORT}" 2>/dev/null | head -c 4 | grep -q . && return 0
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# 名单下载
+# -----------------------------------------------------------------------------
+dl_file() {   # $1=url $2=out
+  local url="$1" out="$2" t
+  t=$(mktemp "$LISTDIR/.dl.XXXXXX") || return 1
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 120 -o "$t" "$url" 2>/dev/null || { rm -f "$t"; return 1; }
+  else
+    wget -qO "$t" --timeout=120 "$url" 2>/dev/null || { rm -f "$t"; return 1; }
+  fi
+  [[ -s $t ]] || { rm -f "$t"; return 1; }
+  mv -f "$t" "$out"
+  return 0
+}
+
+download_lists() {
+  mkdir -p "$LISTDIR"
+  local okc=0
+  ok "下载 chnroute 名单..."
+  if dl_file "$LIST_URL_CHNROUTE" "$LISTDIR/chnroute.txt"; then
+    okc=1
+  elif dl_file "$LIST_URL_CHNROUTE_ALT" "$LISTDIR/chnroute.txt"; then
+    okc=1
+  fi
+  if [[ $okc -eq 1 ]]; then
+    # 统一为纯 CIDR(剔除注释/空行/非法行)
+    local tmp; tmp=$(mktemp "$LISTDIR/.cnr.XXXXXX")
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$LISTDIR/chnroute.txt" 2>/dev/null | sort -u >"$tmp"
+    local cnt; cnt=$(wc -l <"$tmp" | tr -d ' ')
+    if [[ ${cnt:-0} -ge 1000 ]]; then
+      mv -f "$tmp" "$LISTDIR/chnroute.txt"; ok "chnroute: $cnt 条"
+    else
+      rm -f "$tmp"; warn "chnroute 条数异常($cnt), 保留旧名单"
+    fi
+  else
+    warn "chnroute 下载失败(保留旧名单)"
+  fi
+
+  ok "下载国内域名名单..."
+  if dl_file "$LIST_URL_CHNDOMAIN" "$LISTDIR/china_domains.raw"; then
+    local tmp; tmp=$(mktemp "$LISTDIR/.cnd.XXXXXX")
+    sed -n 's|^server=/\([^/]*\)/.*|\1|p' "$LISTDIR/china_domains.raw" 2>/dev/null | sort -u >"$tmp"
+    local cnt; cnt=$(wc -l <"$tmp" | tr -d ' ')
+    if [[ ${cnt:-0} -ge 1000 ]]; then
+      mv -f "$tmp" "$SDNSDIR/chn_domains.txt"
+      rm -f "$LISTDIR/china_domains.raw"
+      ok "chn_domains: $cnt 条"
+    else
+      rm -f "$tmp"; warn "域名名单条数异常($cnt), 保留旧名单"
+    fi
+  else
+    warn "域名名单下载失败(保留旧名单)"
+  fi
+}
+
+refresh_nft_sets() {
+  if [[ -s $LISTDIR/chnroute.txt ]]; then
+    ok "刷新 chnroute 集合..."
+    nft_sets_reload chnroute "$LISTDIR/chnroute.txt"
+  fi
+  [[ -s $LISTDIR/v2node.txt ]] && nft_sets_reload v2node "$LISTDIR/v2node.txt"
+  [[ -s $LISTDIR/listblan.txt ]] && nft_sets_reload listblan "$LISTDIR/listblan.txt"
+  [[ -s $LISTDIR/listwlan.txt ]] && nft_sets_reload listwlan "$LISTDIR/listwlan.txt"
+  # 节点 IP 钉死
+  local nodes i ncnt addr ip
+  nodes=$(conf_get '.nodes'); i=0
+  ncnt=$(printf '%s' "$nodes" | jq 'length' 2>/dev/null || echo 0)
+  if [[ ${ncnt:-0} -gt 0 ]]; then
+    : >"$LISTDIR/v2node.txt"
+    while [[ $i -lt $ncnt ]]; do
+      addr=$(conf_get ".nodes[$i].address"); ip=$(conf_get ".nodes[$i].ip")
+      if [[ -n $ip ]]; then printf '%s\n' "$ip" >>"$LISTDIR/v2node.txt"
+      elif [[ $addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then printf '%s\n' "$addr" >>"$LISTDIR/v2node.txt"
+      fi
+      i=$((i+1))
+    done
+    [[ -s $LISTDIR/v2node.txt ]] && nft_sets_reload v2node "$LISTDIR/v2node.txt"
+  fi
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 代理开关
+# -----------------------------------------------------------------------------
+proxy_on() {
+  local n; n=$(conf_get '.nodes | length')
+  [[ -z $n || $n -eq 0 ]] && { err "请先添加节点"; return 1; }
+
+  local i; i=$(conf_get '.nodeActive')
+  if [[ -z $i ]]; then
+    i=0; conf_raw '.nodeActive' "$i"
+  fi
+
+  smartdns_conf
+  /etc/init.d/degwd-dns restart >/dev/null 2>&1
+  dns_forward_on || warn "dnsmasq 转发设置失败(DNS 分流可能不生效)"
+
+  xray_gen_config || { err "xray 配置生成失败, 未开启代理"; return 1; }
+  init_write_all
+  /etc/init.d/degwd-gw restart >/dev/null 2>&1
+  sleep 1
+  /etc/init.d/degwd-gw running >/dev/null 2>&1 || { err "xray 启动失败, 查看 $XRAYDIR/error.log"; return 1; }
+
+  apply_node_bridge
+
+  # 生成 nft 规则并应用
+  local f; f=$(nft_gen) || return 1
+  cp -f "$f" "$NFTDIR/de_GWD.nft" 2>/dev/null
+  rm -f "$f"
+  nft_apply "$NFTDIR/de_GWD.nft" || return 1
+  route_rule_on
+  refresh_nft_sets
+  /etc/init.d/degwd-nft enable >/dev/null 2>&1
+  /etc/init.d/degwd-gw enable >/dev/null 2>&1
+  /etc/init.d/degwd-dns enable >/dev/null 2>&1
+  conf_raw '.proxyOn' "true"
+  ok "旁路网关已开启 (节点: $(conf_get ".nodes[$i].name"))"
+  return 0
+}
+
+proxy_off() {
+  /etc/init.d/degwd-gw stop >/dev/null 2>&1
+  /etc/init.d/degwd-gw disable >/dev/null 2>&1
+  sb_bridge_off
+  /etc/init.d/degwd-nft stop >/dev/null 2>&1
+  /etc/init.d/degwd-nft disable >/dev/null 2>&1
+  route_rule_off
+  conf_raw '.proxyOn' "false"
+  ok "旁路网关已关闭 (流量恢复直连)"
+  return 0
+}
+
+proxy_toggle() {
+  if [[ $(conf_get '.proxyOn') == "true" ]]; then
+    proxy_off
+  else
+    proxy_on
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# 节点管理
+# -----------------------------------------------------------------------------
+nodes_list() {
+  local n i
+  n=$(conf_get '.nodes | length'); [[ -z $n ]] && n=0
+  if [[ $n -eq 0 ]]; then
+    warn "暂无节点, 请先添加"
+    return 1
+  fi
+  local act; act=$(conf_get '.nodeActive')
+  printf '  %-3s %-20s %-14s %-8s %s\n' "序号" "名称" "地址" "协议" "状态"
+  i=0
+  while [[ $i -lt $n ]]; do
+    local nm ad pt pr mk=""
+    nm=$(conf_get ".nodes[$i].name")
+    ad=$(conf_get ".nodes[$i].address")
+    pt=$(conf_get ".nodes[$i].port")
+    pr=$(conf_get ".nodes[$i].proto")
+    [[ $i == "$act" ]] && mk="${GREEN}● 当前${cRES}"
+    printf '  %-3s %-20s %-14s %-8s %b\n' "$i" "${nm:0:20}" "${ad:0:14}" "$pr" "$mk"
+    i=$((i+1))
+  done
+  return 0
+}
+
+nodes_add() {
+  echo "  支持: vmess:// vless:// trojan:// ss:// hysteria2:// tuic:// anytls:// socks5://"
+  local url; url=$(ask "  粘贴分享链接(可多个, 空格分隔): ")
+  [[ -z $url ]] && return 1
+  local added=0 fail=0 u node
+  for u in $url; do
+    node=$(parse_share_link "$u") || { warn "无法解析: ${u:0:40}..."; fail=$((fail+1)); continue; }
+    [[ -z $node ]] && { fail=$((fail+1)); continue; }
+    # 解析地址为 IP(用于防回环钉死); 有 nslookup 才做
+    local h ip=""
+    h=$(printf '%s' "$node" | jq -r '.address')
+    if [[ $h =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      ip=$h
+    elif command -v nslookup >/dev/null 2>&1; then
+      ip=$(nslookup "$h" "$DNS_ALI" 2>/dev/null | awk '/^Address: /{print $2}' | grep -E '^[0-9.]+$' | head -n1)
+    fi
+    [[ -n $ip ]] && node=$(printf '%s' "$node" | jq -c --arg ip "$ip" '. + {ip:$ip}')
+    if conf_write '.nodes += [$n]' --argjson n "$node"; then
+      added=$((added+1))
+    else
+      fail=$((fail+1))
+    fi
+  done
+  [[ $added -gt 0 ]] && ok "已添加 $added 个节点"
+  [[ $fail -gt 0 ]] && warn "$fail 个链接解析失败"
+  # 首个节点自动激活
+  [[ -z $(conf_get '.nodeActive') && $added -gt 0 ]] && conf_raw '.nodeActive' "0"
+  [[ $added -gt 0 ]] && [[ $(conf_get '.proxyOn') == "true" ]] && proxy_on
+  return 0
+}
+
+nodes_switch() {
+  nodes_list || return 1
+  local n i; n=$(conf_get '.nodes | length')
+  local idx; idx=$(ask "  选择节点序号: ")
+  [[ -z $idx ]] && return 1
+  [[ $idx =~ ^[0-9]+$ ]] || { err "请输入数字"; return 1; }
+  (( idx >= 0 && idx < n )) || { err "序号超范围 (0-$((n-1)))"; return 1; }
+  conf_raw '.nodeActive' "$idx"
+  ok "已切换到: $(conf_get ".nodes[$idx].name")"
+  [[ $(conf_get '.proxyOn') == "true" ]] && proxy_on
+  return 0
+}
+
+nodes_ping() {
+  local n i; n=$(conf_get '.nodes | length'); [[ -z $n || $n -eq 0 ]] && { warn "暂无节点"; return 1; }
+  command -v nc >/dev/null 2>&1 || { warn "缺少 nc, 无法测试"; return 1; }
+  ok "测试节点连通性..."
+  i=0
+  while [[ $i -lt $n ]]; do
+    local h p nm
+    h=$(conf_get ".nodes[$i].address"); p=$(conf_get ".nodes[$i].port")
+    nm=$(conf_get ".nodes[$i].name" | cut -c1-20)
+    # busybox nc 只支持 nc IP PORT, 无 -z; 用 timeout 包一层判断退出码
+    if timeout 3 nc "$h" "$p" </dev/null >/dev/null 2>&1; then
+      printf '  %-3s %-20s %b\n' "$i" "$nm" "${GREEN}✓ 可达${cRES}"
+    else
+      # 443/8443 等 TLS 端口 nc 无数据即断开属正常, 再用 /dev/tcp 兜底
+      if timeout 3 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null; then
+        printf '  %-3s %-20s %b\n' "$i" "$nm" "${GREEN}✓ 可达${cRES}"
+      else
+        printf '  %-3s %-20s %b\n' "$i" "$nm" "${RED}✕ 不可达${cRES}"
+      fi
+    fi
+    i=$((i+1))
+  done
+  return 0
+}
+
+nodes_speed() {
+  local n; n=$(conf_get '.nodes | length'); [[ -z $n || $n -eq 0 ]] && { warn "暂无节点"; return 1; }
+  local idx; idx=$(ask "  选择节点序号测速: ")
+  [[ $idx =~ ^[0-9]+$ ]] || return 1
+  (( idx >= 0 && idx < n )) || { err "序号超范围"; return 1; }
+  local h p t0 t1 ms
+  h=$(conf_get ".nodes[$idx].address"); p=$(conf_get ".nodes[$idx].port")
+  # 用 curl 的 time_connect 测 TCP 握手延迟(不依赖外网)
+  local out
+  out=$(curl -s -o /dev/null -w '%{time_connect}' --max-time 8 --connect-timeout 5 \
+        "http://$h:$p/" 2>/dev/null)
+  if [[ -z $out || $out == "0.000000" ]]; then
+    warn "连接失败(节点不可达或端口未开放)"
+    return 1
+  fi
+  ms=$(awk -v t="$out" 'BEGIN{printf "%.0f", t*1000}')
+  ok "TCP 握手延迟: ${ms}ms"
+  return 0
+}
+
+nodes_del() {
+  nodes_list || return 1
+  local n idx; n=$(conf_get '.nodes | length')
+  idx=$(ask "  删除哪个节点序号: ")
+  [[ $idx =~ ^[0-9]+$ ]] || { err "请输入数字"; return 1; }
+  (( idx >= 0 && idx < n )) || { err "序号超范围"; return 1; }
+  local nm; nm=$(conf_get ".nodes[$idx].name")
+  yesno "确认删除 [$idx] $nm ?" || return 0
+  conf_write 'del(.nodes[$n])' --argjson n "$idx" || return 1
+  # 修正活动节点
+  local act newn
+  act=$(conf_get '.nodeActive')
+  newn=$(conf_get '.nodes | length')
+  if [[ $newn -eq 0 ]]; then
+    conf_write 'del(.nodeActive)'
+    proxy_off
+  elif [[ $act == "$idx" ]]; then
+    conf_raw '.nodeActive' "0"
+    ok "活动节点已重置为 0"
+  elif [[ $act -gt $idx ]]; then
+    conf_raw '.nodeActive' "$((act-1))"
+  fi
+  ok "已删除节点: $nm"
+  [[ $(conf_get '.proxyOn') == "true" ]] && proxy_on
+  return 0
+}
+
+nodes_menu() {
+  while :; do
+    echo
+    echo -e "${CYAN}---- 节点管理 ----${cRES}"
+    nodes_list 2>/dev/null
+    echo "  [1] 添加节点(粘贴分享链接)"
+    echo "  [2] 切换活动节点"
+    echo "  [3] 测试连通性"
+    echo "  [4] 测试延迟"
+    echo "  [5] 删除节点"
+    echo "  [6] 显示当前节点链接/二维码"
+    echo "  [0] 返回"
+    local c; c=$(ask "选择: ")
+    case "$c" in
+      1) nodes_add ;;
+      2) nodes_switch ;;
+      3) nodes_ping ;;
+      4) nodes_speed ;;
+      5) nodes_del ;;
+      6) printNode ;;
+      0|"") return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+    [[ -n $c ]] && echo && read -r -p "回车继续..." _
+  done
+}
+
+# -----------------------------------------------------------------------------
+# 分流规则
+# -----------------------------------------------------------------------------
+ip_cidr_ok() {
+  local v="$1"
+  [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && {
+    local IFS=. a; read -r -a a <<<"$v"
+    local o; for o in "${a[@]}"; do (( o >= 0 && o <= 255 )) || return 1; done
+    return 0
+  }
+  [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] || return 1
+  local ip="${v%%/*}" pf="${v##*/}"
+  (( pf >= 0 && pf <= 32 )) || return 1
+  local IFS=. a; read -r -a a <<<"$ip"
+  local o; for o in "${a[@]}"; do (( o >= 0 && o <= 255 )) || return 1; done
+  return 0
+}
+
+split_domains() {
+  echo "  当前域名规则:"
+  conf_get '.split.domains[]' 2>/dev/null | sed 's/^/    /'
+  echo "  输入域名(逗号/空格分隔, 支持 geosite:xxx, 空回车=不修改):"
+  local v; v=$(ask "  > ")
+  [[ -z $v ]] && return 0
+  local arr; arr=$(printf '%s' "$v" | tr ',' '\n' | tr ' ' '\n' | grep -v '^$' | \
+    jq -R . | jq -s -c .)
+  conf_raw '.split.domains' "$arr" && ok "域名规则已更新"
+  return 0
+}
+
+split_ips() {
+  echo "  当前 IP 规则:"
+  conf_get '.split.ips[]' 2>/dev/null | sed 's/^/    /'
+  echo "  输入 IP/CIDR(逗号/空格分隔, 支持 geoip:xxx, 空回车=不修改):"
+  local v; v=$(ask "  > ")
+  [[ -z $v ]] && return 0
+  local tok bad=0 good=()
+  for tok in $(printf '%s' "$v" | tr ',' ' '); do
+    [[ -z $tok ]] && continue
+    if [[ $tok == geoip:* ]] || ip_cidr_ok "$tok"; then
+      good+=("$tok")
+    else
+      warn "非法条目已忽略: $tok"; bad=$((bad+1))
+    fi
+  done
+  [[ ${#good[@]} -eq 0 ]] && { err "无有效条目"; return 1; }
+  local arr; arr=$(printf '%s\n' "${good[@]}" | jq -R . | jq -s -c .)
+  conf_raw '.split.ips' "$arr" && ok "IP 规则已更新 (忽略 $bad 条非法项)"
+  return 0
+}
+
+split_mode_set() {
+  local m; m=$(conf_get '.split.mode')
+  echo "  当前模式: ${m:-proxy}  (proxy=国内直连其余代理 / direct=仅名单走代理)"
+  local c; c=$(ask "  选择 [1] proxy(默认) [2] direct: ")
+  case "$c" in
+    1) conf_set '.split.mode' "proxy" ;;
+    2) conf_set '.split.mode' "direct" ;;
+    *) return 0 ;;
+  esac
+  ok "模式已更新"
+  [[ $(conf_get '.proxyOn') == "true" ]] && proxy_on
+  return 0
+}
+
+split_clear() {
+  yesno "确认清空所有分流规则?" || return 0
+  conf_raw '.split.domains' "[]"
+  conf_raw '.split.ips' "[]"
+  ok "分流规则已清空"
+  return 0
+}
+
+split_menu() {
+  while :; do
+    echo
+    echo -e "${CYAN}---- 分流规则 ----${cRES}"
+    echo "  模式: $(conf_get '.split.mode')"
+    echo "  域名规则: $(conf_get '.split.domains | length') 条"
+    echo "  IP 规则:   $(conf_get '.split.ips | length') 条"
+    echo "  [1] 编辑域名规则"
+    echo "  [2] 编辑 IP 规则"
+    echo "  [3] 切换分流模式"
+    echo "  [4] 清空规则"
+    echo "  [0] 返回"
+    local c; c=$(ask "选择: ")
+    case "$c" in
+      1) split_domains ;;
+      2) split_ips ;;
+      3) split_mode_set ;;
+      4) split_clear ;;
+      0|"") return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+    [[ -n $c ]] && echo && read -r -p "回车继续..." _
+  done
+}
+
+# -----------------------------------------------------------------------------
+# DNS 菜单
+# -----------------------------------------------------------------------------
+dns_menu() {
+  while :; do
+    echo
+    echo -e "${CYAN}---- DNS 设置 ----${cRES}"
+    echo "  smartdns: 127.0.0.1:${DNS_PORT}  $(/etc/init.d/degwd-dns running >/dev/null 2>&1 && echo "${GREEN}运行中${cRES}" || echo "${RED}未运行${cRES}")"
+    echo "  dnsmasq 转发: $(dns_forward_ok && echo "${GREEN}已启用${cRES}" || echo "${YELLOW}未启用${cRES}")"
+    echo "  国内 DNS: $(conf_get '.dns.china[]' | tr '\n' ' ')"
+    echo "  国外 DoH: $(conf_get '.dns.doh')"
+    echo "  [1] 修改国内 DNS"
+    echo "  [2] 修改国外 DoH"
+    echo "  [3] 添加/修改 hosts"
+    echo "  [4] 启用 dnsmasq 转发到 smartdns"
+    echo "  [5] 关闭 dnsmasq 转发(还原)"
+    echo "  [6] DNS 解析测试"
+    echo "  [0] 返回"
+    local c; c=$(ask "选择: ")
+    case "$c" in
+      1)
+        local v; v=$(ask "  国内 DNS(空格分隔, 如 223.5.5.5 119.29.29.29): ")
+        if [[ -n $v ]]; then
+          local arr; arr=$(printf '%s' "$v" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s -c .)
+          conf_raw '.dns.china' "$arr" && ok "已更新"
+        fi ;;
+      2)
+        local v; v=$(ask "  国外 DoH(如 https://1.1.1.1/dns-query): ")
+        [[ -n $v ]] && conf_set '.dns.doh' "$v" && ok "已更新" ;;
+      3)
+        local d ip
+        d=$(ask "  域名: "); [[ -z $d ]] && continue
+        ip=$(ask "  IP: "); [[ -z $ip ]] && continue
+        conf_write '.dns.hosts[$d] = $ip' --arg d "$d" --arg ip "$ip" && ok "已添加 $d → $ip" ;;
+      4) dns_forward_on && ok "已启用 dnsmasq 转发" ;;
+      5) dns_forward_off && ok "已还原 dnsmasq" ;;
+      6) dns_query_test && ok "DNS 解析正常" || warn "DNS 解析异常" ;;
+      0|"") return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+    [[ -n $c ]] && echo && read -r -p "回车继续..." _
+  done
+}
+
+block53_toggle() {
+  if [[ $(conf_get '.block53') == "true" ]]; then
+    conf_raw '.block53' "false"
+    ok "已关闭 853 端口阻断"
+  else
+    conf_raw '.block53' "true"
+    ok "已启用 853 端口阻断(防止客户端绕过 DNS 分流)"
+  fi
+  [[ $(conf_get '.proxyOn') == "true" ]] && proxy_on
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# WireGuard 服务端
+# -----------------------------------------------------------------------------
+wg_keygen() { command -v wg >/dev/null 2>&1 && wg genkey 2>/dev/null || openssl rand -base64 32; }
+wg_pubkey() { command -v wg >/dev/null 2>&1 && printf '%s' "$1" | wg pubkey 2>/dev/null; }
+
+wg_menu() {
+  while :; do
+    echo
+    echo -e "${CYAN}---- WireGuard 服务端 ----${cRES}"
+    local en; en=$(conf_get '.wg.enable')
+    echo "  状态: $([[ $en == "true" ]] && echo "${GREEN}已启用${cRES}" || echo "未启用")"
+    echo "  端口: $(conf_get '.wg.port')   网段: $WG_NET"
+    local ccl; ccl=$(conf_get '.wg.clients | length'); echo "  客户端: ${ccl:-0} 个"
+    echo "  [1] 启用 WireGuard"
+    echo "  [2] 停用 WireGuard"
+    echo "  [3] 添加客户端"
+    echo "  [4] 列出客户端配置"
+    echo "  [5] 删除客户端"
+    echo "  [0] 返回"
+    local c; c=$(ask "选择: ")
+    case "$c" in
+      1) wg_enable ;;
+      2) wg_disable ;;
+      3) wg_add_client ;;
+      4) wg_list_clients ;;
+      5) wg_del_client ;;
+      0|"") return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+    [[ -n $c ]] && echo && read -r -p "回车继续..." _
+  done
+}
+
+wg_enable() {
+  command -v wg >/dev/null 2>&1 || { err "缺少 wireguard-tools, 请 opkg install wireguard-tools"; return 1; }
+  local port; port=$(conf_get '.wg.port'); [[ -z $port ]] && port=51820
+  local priv pub
+  priv=$(conf_get '.wg.serverPriv')
+  if [[ -z $priv ]]; then
+    priv=$(wg_keygen); pub=$(wg_pubkey "$priv")
+    conf_set '.wg.serverPriv' "$priv"
+    conf_set '.wg.serverPub' "$pub"
+  fi
+  pub=$(conf_get '.wg.serverPub')
+  local wanip; wanip=$(wan_ip)
+
+  # 用 uci 建接口(可逆, 不覆盖既有配置)
+  : >/etc/config/degwd 2>/dev/null
+  uci -q get network.degwdwg >/dev/null 2>&1 && uci -q delete network.degwdwg
+  uci set network.degwdwg=interface
+  uci set network.degwdwg.proto='wireguard'
+  uci set network.degwdwg.private_key="$priv"
+  uci set network.degwdwg.listen_port="$port"
+  uci set network.degwdwg.mtu='1420'
+  uci add_list network.degwdwg.addresses="$WG_PREFIX.1/24"
+  uci commit network
+  uci set firewall.degwdwg=rule 2>/dev/null
+  uci set firewall.degwdwg.name='Allow-deGWD-WG'
+  uci set firewall.degwdwg.src='wan'
+  uci set firewall.degwdwg.proto='udp'
+  uci set firewall.degwdwg.dest_port="$port"
+  uci set firewall.degwdwg.target='ACCEPT'
+  uci commit firewall
+  # 仅 reload, 绝不 restart(会短暂断网)
+  /etc/init.d/network reload >/dev/null 2>&1
+  /etc/init.d/firewall reload >/dev/null 2>&1
+  conf_raw '.wg.enable' "true"
+  ok "WireGuard 已启用 端口 $port"
+  [[ -n $wanip ]] && ok "客户端 EndPoint: $wanip:$port"
+  return 0
+}
+
+wg_disable() {
+  uci -q delete network.degwdwg 2>/dev/null
+  uci -q delete firewall.degwdwg 2>/dev/null
+  uci commit network 2>/dev/null
+  uci commit firewall 2>/dev/null
+  /etc/init.d/network reload >/dev/null 2>&1
+  /etc/init.d/firewall reload >/dev/null 2>&1
+  conf_raw '.wg.enable' "false"
+  ok "WireGuard 已停用"
+  return 0
+}
+
+wg_add_client() {
+  local spub; spub=$(conf_get '.wg.serverPub')
+  [[ -z $spub ]] && { err "请先启用 WireGuard"; return 1; }
+  local name; name=$(ask "  客户端名称: "); [[ -z $name ]] && return 1
+  local cpriv cpub idx ip
+  cpriv=$(wg_keygen); cpub=$(wg_pubkey "$cpriv")
+  idx=$(conf_get '.wg.clients | length'); [[ -z $idx ]] && idx=0
+  ip="$WG_PREFIX.$((idx+2))"
+  local cl; cl=$(jq -n --arg n "$name" --arg pub "$cpub" --arg ip "$ip" \
+    '{name:$n, pubkey:$pub, ip:$ip}')
+  conf_write '.wg.clients += [$c]' --argjson c "$cl" || return 1
+
+  # 把客户端公钥加入服务端 peer
+  local i=1
+  uci -q delete network.degwdwg_$name 2>/dev/null
+  uci set "network.degwdwg_$name=wireguard_degwdwg"
+  uci set "network.degwdwg_$name.public_key=$cpub"
+  uci set "network.degwdwg_$name.allowed_ips=$ip/32"
+  uci commit network
+  /etc/init.d/network reload >/dev/null 2>&1
+
+  local port wanip; port=$(conf_get '.wg.port'); wanip=$(wan_ip)
+  echo
+  ok "客户端配置(复制到 WireGuard 客户端):"
+  echo "-----------------------------------------------"
+  cat <<EOF
+[Interface]
+PrivateKey = $cpriv
+Address = $ip/24
+DNS = $(conf_get '.lanCidr' | cut -d/ -f1)
+
+[Peer]
+PublicKey = $spub
+AllowedIPs = 0.0.0.0/0
+Endpoint = ${wanip:-<你的公网IP>}:${port}
+PersistentKeepalive = 25
+EOF
+  echo "-----------------------------------------------"
+  [[ -n $name ]] && printf '%s' "$cpriv" | write_atomic "$BASE/wg-$name.conf" 600 2>/dev/null
+  return 0
+}
+
+wg_list_clients() {
+  local n; n=$(conf_get '.wg.clients | length'); [[ -z $n || $n -eq 0 ]] && { warn "暂无客户端"; return 1; }
+  local i=0
+  while [[ $i -lt $n ]]; do
+    printf '  %-3s %-16s %s\n' "$i" "$(conf_get ".wg.clients[$i].name")" "$(conf_get ".wg.clients[$i].ip")"
+    i=$((i+1))
+  done
+  return 0
+}
+
+wg_del_client() {
+  wg_list_clients || return 1
+  local n idx nm
+  n=$(conf_get '.wg.clients | length')
+  idx=$(ask "  删除序号: ")
+  [[ $idx =~ ^[0-9]+$ ]] || return 1
+  (( idx >= 0 && idx < n )) || { err "序号超范围"; return 1; }
+  nm=$(conf_get ".wg.clients[$idx].name")
+  conf_write 'del(.wg.clients[$n])' --argjson n "$idx" || return 1
+  uci -q delete "network.degwdwg_$nm" 2>/dev/null
+  uci commit network 2>/dev/null
+  /etc/init.d/network reload >/dev/null 2>&1
+  ok "已删除客户端: $nm"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# DDNS (Cloudflare)
+# -----------------------------------------------------------------------------
+ddns_menu() {
+  while :; do
+    echo
+    echo -e "${CYAN}---- DDNS (Cloudflare) ----${cRES}"
+    echo "  域名: $(conf_get '.ddns.domain')"
+    echo "  Token: $(conf_get '.ddns.cfToken' | sed 's/./*/g' | cut -c1-12)"
+    echo "  上次更新: $(conf_get '.ddns.last')"
+    echo "  [1] 设置 Token / 域名"
+    echo "  [2] 立即更新"
+    echo "  [3] 安装定时任务(每 5 分钟)"
+    echo "  [4] 移除定时任务"
+    echo "  [0] 返回"
+    local c; c=$(ask "选择: ")
+    case "$c" in
+      1)
+        local t d
+        t=$(ask_secret "  Cloudflare API Token: ")
+        [[ -n $t ]] && conf_set '.ddns.cfToken' "$t" && ok "Token 已保存"
+        d=$(ask "  域名(如 home.example.com): ")
+        [[ -n $d ]] && conf_set '.ddns.domain' "$d" && ok "域名已保存" ;;
+      2) ddns_update_cf ;;
+      3) ddns_cron_on ;;
+      4) ddns_cron_off ;;
+      0|"") return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+    [[ -n $c ]] && echo && read -r -p "回车继续..." _
+  done
+}
+
+# 从完整域名推导 zone: 从最长后缀开始试, 找到 token 有权访问的 zone
+ddns_zone_of() {
+  local domain="$1" token="$2" cand
+  local IFS='.'; local -a parts; read -r -a parts <<<"$domain"
+  local cnt=${#parts[@]} i
+  for (( i=1; i<cnt; i++ )); do
+    cand=$(IFS=.; echo "${parts[*]:i}")
+    local zid
+    zid=$(curl -s --max-time 15 -H "Authorization: Bearer $token" \
+      "https://api.cloudflare.com/client/v4/zones?name=$cand" 2>/dev/null | \
+      jq -r 'if .success then (.result[0].id // empty) else empty end' 2>/dev/null)
+    if [[ -n $zid ]]; then printf '%s' "$zid"; return 0; fi
+  done
+  return 1
+}
+
+ddns_update_cf() {
+  local token domain
+  token=$(conf_get '.ddns.cfToken')
+  domain=$(conf_get '.ddns.domain')
+  [[ -z $token || -z $domain ]] && { err "请先设置 Token 与域名"; return 1; }
+  local ip; ip=$(wan_ip)
+  [[ -z $ip ]] && { err "无法获取 WAN IP"; return 1; }
+
+  local zone; zone=$(ddns_zone_of "$domain" "$token") || { err "无法确定 zone(检查 Token 权限)"; return 1; }
+  conf_set '.ddns.zoneId' "$zone"
+
+  local sub="$domain"
+  local root
+  local IFS='.'; local -a parts; read -r -a parts <<<"$domain"
+  # 记录名 = 域名去掉 zone 后缀
+  local zname
+  zname=$(curl -s --max-time 15 -H "Authorization: Bearer $token" \
+    "https://api.cloudflare.com/client/v4/zones/$zone" 2>/dev/null | jq -r '.result.name // empty')
+  if [[ -n $zname && $domain == *".$zname" ]]; then
+    sub=${domain%".$zname"}
+  elif [[ $domain == "$zname" ]]; then
+    sub="@"
+  fi
+
+  local rec recid
+  rec=$(curl -s --max-time 15 -H "Authorization: Bearer $token" \
+    "https://api.cloudflare.com/client/v4/zones/$zone/dns_records?type=A&name=$domain" 2>/dev/null)
+  recid=$(printf '%s' "$rec" | jq -r 'if .success then (.result[0].id // empty) else empty end' 2>/dev/null)
+
+  local resp
+  if [[ -n $recid ]]; then
+    resp=$(curl -s --max-time 20 -X PUT \
+      -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+      --data "{\"type\":\"A\",\"name\":\"$sub\",\"content\":\"$ip\",\"ttl\":120,\"proxied\":false}" \
+      "https://api.cloudflare.com/client/v4/zones/$zone/dns_records/$recid" 2>/dev/null)
+  else
+    resp=$(curl -s --max-time 20 -X POST \
+      -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+      --data "{\"type\":\"A\",\"name\":\"$sub\",\"content\":\"$ip\",\"ttl\":120,\"proxied\":false}" \
+      "https://api.cloudflare.com/client/v4/zones/$zone/dns_records" 2>/dev/null)
+  fi
+
+  if printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+    conf_set '.ddns.last' "$(date '+%F %T') → $ip"
+    conf_set '.ddns.recordId' "${recid:-new}"
+    ok "DDNS 已更新: $domain → $ip"
+    return 0
+  fi
+  err "DDNS 更新失败: $(printf '%s' "$resp" | jq -r '.errors[0].message // "未知错误"' 2>/dev/null)"
+  return 1
+}
+
+ddns_cron_on() {
+  grep -qF "shuoyue-gw --ddns" /etc/crontabs/root 2>/dev/null || {
+    mkdir -p /etc/crontabs
+    printf '*/5 * * * * /usr/bin/shuoyue-gw --ddns >/dev/null 2>&1\n' >>/etc/crontabs/root
+  }
+  /etc/init.d/cron enable >/dev/null 2>&1
+  /etc/init.d/cron restart >/dev/null 2>&1
+  ok "DDNS 定时任务已安装(每 5 分钟)"
+  return 0
+}
+ddns_cron_off() {
+  if [[ -f /etc/crontabs/root ]]; then
+    local t; t=$(mktemp)
+    grep -vF "shuoyue-gw --ddns" /etc/crontabs/root >"$t" 2>/dev/null
+    mv -f "$t" /etc/crontabs/root
+  fi
+  /etc/init.d/cron restart >/dev/null 2>&1
+  ok "DDNS 定时任务已移除"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 中继 (端口转发)
+# -----------------------------------------------------------------------------
+relay_menu() {
+  while :; do
+    echo
+    echo -e "${CYAN}---- 端口中继 ----${cRES}"
+    printRelay
+    echo "  [1] 添加中继"
+    echo "  [2] 清空中继"
+    echo "  [0] 返回"
+    local c; c=$(ask "选择: ")
+    case "$c" in
+      1)
+        local lp tt
+        lp=$(ask "  本机监听端口: ")
+        port_valid "$lp" || { err "端口非法或与保留端口冲突"; continue; }
+        tt=$(ask "  转发到(host:port, 如 1.2.3.4:443): ")
+        [[ -z $tt ]] && continue
+        local th tp
+        th=${tt%%:*}; tp=${tt##*:}
+        [[ $th =~ ^[0-9a-zA-Z.-]+$ ]] || { err "目标地址非法"; continue; }
+        port_valid "$tp" || { err "目标端口非法"; continue; }
+        local r; r=$(jq -n --argjson lp "$lp" --arg th "$th" --argjson tp "$tp" \
+          '{listen:$lp, target:$th, port:$tp}')
+        conf_write '.relay.list = ((.relay.list // []) + [$r])' --argjson r "$r" || continue
+        relay_apply
+        ok "中继已添加: $lp → $th:$tp" ;;
+      2)
+        yesno "确认清空所有中继?" || continue
+        conf_raw '.relay.list' "[]"
+        relay_apply
+        ok "已清空" ;;
+      0|"") return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+    [[ -n $c ]] && echo && read -r -p "回车继续..." _
+  done
+}
+
+printRelay() {
+  local n; n=$(conf_get '.relay.list | length'); [[ -z $n || $n -eq 0 ]] && { echo "  (无)"; return 0; }
+  local i=0
+  while [[ $i -lt $n ]]; do
+    printf '  %s → %s:%s\n' "$(conf_get ".relay.list[$i].listen")" \
+      "$(conf_get ".relay.list[$i].target")" "$(conf_get ".relay.list[$i].port")"
+    i=$((i+1))
+  done
+}
+
+# 用 nft 自建表做 DNAT (不触碰既有 nat 表)
+relay_apply() {
+  local n; n=$(conf_get '.relay.list | length'); [[ -z $n ]] && n=0
+  nft delete table ip degwd_relay 2>/dev/null
+  [[ $n -eq 0 ]] && return 0
+  local rules="" i=0
+  while [[ $i -lt $n ]]; do
+    local lp th tp
+    lp=$(conf_get ".relay.list[$i].listen"); th=$(conf_get ".relay.list[$i].target")
+    tp=$(conf_get ".relay.list[$i].port")
+    rules="$rules
+    chain prerouting_$i {
+        type nat hook prerouting priority dstnat - 10; policy accept;
+        tcp dport $lp counter dnat to $th:$tp
+        udp dport $lp counter dnat to $th:$tp
+    }
+    chain postrouting_$i {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip daddr $th tcp dport $tp counter masquerade
+        ip daddr $th udp dport $tp counter masquerade
+    }"
+    i=$((i+1))
+  done
+  local tmp; tmp=$(mktemp) || return 1
+  printf 'table ip degwd_relay {%s\n}\n' "$rules" >"$tmp"
+  if nft -c -f "$tmp" >/dev/null 2>&1; then
+    nft -f "$tmp" || warn "中继规则加载失败"
+  else
+    warn "中继规则语法错误, 未应用"
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 健康检查 / 内核 / 自动更新
+# -----------------------------------------------------------------------------
+health_check() {   # $1="full" 才跑外网探测
+  local issues=0
+  echo -e "${CYAN}---- 健康检查 ----${cRES}"
+
+  # 代理开启但组件未运行
+  if [[ $(conf_get '.proxyOn') == "true" ]]; then
+    /etc/init.d/degwd-gw running >/dev/null 2>&1 || { err "xray 未运行"; issues=$((issues+1)); }
+    /etc/init.d/degwd-nft running >/dev/null 2>&1 || true
+    nft list table ip "$NFT_TABLE" >/dev/null 2>&1 || { err "nft 表 $NFT_TABLE 缺失"; issues=$((issues+1)); }
+    route_rule_ok || { err "策略路由缺失(fwmark $NFT_MARK → table $RT_TABLE)"; issues=$((issues+1)); }
+    [[ $(conf_get '.block53') == "true" ]] && true
+    local act; act=$(conf_get '.nodeActive')
+    if node_needs_bridge "$act"; then
+      /etc/init.d/degwd-sb running >/dev/null 2>&1 || { err "sing-box 桥接未运行"; issues=$((issues+1)); }
+    fi
+  else
+    echo "  代理未开启"
+  fi
+
+  # 关键文件
+  [[ -f $XRAYDIR/config.json ]] && jq -e . "$XRAYDIR/config.json" >/dev/null 2>&1 || \
+    { [[ $(conf_get '.proxyOn') == "true" ]] && { err "xray 配置无效"; issues=$((issues+1)); }; }
+  [[ -s $LISTDIR/chnroute.txt ]] || warn "chnroute 名单缺失(运行 --lists)"
+
+  # 与既有服务共存检查
+  nft list table inet fw4 >/dev/null 2>&1 || warn "fw4 表不存在(可能被 flush 过)"
+  nft list table inet passwall2 >/dev/null 2>&1 && echo "  passwall2 表存在(未受影响)"
+
+  # 端口监听检查(不依赖 netstat: 直接读 /proc/net/tcp 的本地端口十六进制)
+  if [[ $(conf_get '.proxyOn') == "true" ]]; then
+    local hexport; hexport=$(printf '%04X' "$TPROXY_PORT")
+    if awk -v p=":$hexport" 'NR>1 { split($2,a,":"); if (":" a[2] == p) { found=1; exit } } END { exit !found }' \
+         /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+      echo "  tproxy 端口 $TPROXY_PORT: 监听中"
+    else
+      warn "tproxy 端口 $TPROXY_PORT 未监听"
+      issues=$((issues+1))
+    fi
+  fi
+
+  if [[ ${1:-} == "full" ]]; then
+    local ip; ip=$(wan_ip)
+    echo "  WAN IP: ${ip:-未知}"
+    if [[ -n $ip ]]; then
+      local code
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://www.gstatic.com/generate_204" 2>/dev/null)
+      if [[ $code == "204" ]]; then
+        echo -e "  代理连通性: ${GREEN}✓ 正常${cRES}"
+      else
+        warn "代理连通性异常 (HTTP $code)"
+        issues=$((issues+1))
+      fi
+    fi
+  fi
+
+  [[ $issues -eq 0 ]] && ok "检查通过" || warn "发现 $issues 个问题"
+  return $issues
+}
+
+installkernel() {
+  warn "OpenWrt 内核由系统固件管理, 无法通过本脚本升级"
+  echo "  如需新内核, 请使用官方固件升级流程(sysupgrade)"
+  return 1
+}
+
+autoupdate_on() {
+  grep -qF "shuoyue-gw --update" /etc/crontabs/root 2>/dev/null || {
+    mkdir -p /etc/crontabs
+    printf '0 5 * * * /usr/bin/shuoyue-gw --update >/dev/null 2>&1\n' >>/etc/crontabs/root
+  }
+  /etc/init.d/cron enable >/dev/null 2>&1
+  /etc/init.d/cron restart >/dev/null 2>&1
+  conf_raw '.autoUpdate' "true"
+  ok "自动更新已开启(每天 05:00)"
+  return 0
+}
+autoupdate_off() {
+  if [[ -f /etc/crontabs/root ]]; then
+    local t; t=$(mktemp)
+    grep -vF "shuoyue-gw --update" /etc/crontabs/root >"$t" 2>/dev/null
+    mv -f "$t" /etc/crontabs/root
+  fi
+  /etc/init.d/cron restart >/dev/null 2>&1
+  conf_raw '.autoUpdate' "false"
+  ok "自动更新已关闭"
+  return 0
+}
+
+updateGWD() {
+  local tmp; tmp=$(mktemp) || return 1
+  ok "检查更新..."
+  if ! dl_file "$REMOTE_BASE/client-openwrt" "$tmp"; then
+    rm -f "$tmp"; err "下载失败"; return 1
+  fi
+  bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; err "新版本语法校验失败, 已放弃"; return 1; }
+  grep -q '^start_menu()' "$tmp" || { rm -f "$tmp"; err "新版本内容校验失败"; return 1; }
+  local newv; newv=$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)
+  if [[ "$newv" == "$VERSION" ]]; then
+    rm -f "$tmp"; ok "已是最新版本 $VERSION"; return 0
+  fi
+  cp -f "$0" "$BASE/client-openwrt.bak" 2>/dev/null
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$BASE/client-openwrt"
+  ln -sf "$BASE/client-openwrt" /usr/bin/shuoyue-gw 2>/dev/null
+  ok "已更新: $VERSION → $newv (旧版备份在 $BASE/client-openwrt.bak)"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 节点链接 / 二维码
+# -----------------------------------------------------------------------------
+gen_node_link() {   # $1 = idx
+  local i="$1"
+  local proto addr port uuid password path sni pbk sid flow method enc mode host
+  proto=$(conf_get ".nodes[$i].proto")
+  addr=$(conf_get ".nodes[$i].address")
+  port=$(conf_get ".nodes[$i].port")
+  uuid=$(conf_get ".nodes[$i].uuid")
+  password=$(conf_get ".nodes[$i].password")
+  path=$(conf_get ".nodes[$i].path")
+  sni=$(conf_get ".nodes[$i].tls_sni"); [[ -z $sni ]] && sni=$addr
+  pbk=$(conf_get ".nodes[$i].pbk"); sid=$(conf_get ".nodes[$i].sid")
+  flow=$(conf_get ".nodes[$i].flow"); method=$(conf_get ".nodes[$i].method")
+  enc=$(conf_get ".nodes[$i].enc"); mode=$(conf_get ".nodes[$i].mode")
+  host=$(conf_get ".nodes[$i].host")
+  local name; name=$(conf_get ".nodes[$i].name")
+  local tag; tag=$(printf '%s' "$name" | jq -sRr @uri)
+
+  case "$proto" in
+    vmess-ws|vmess-tcp)
+      jq -nc --arg ps "$name" --arg add "$addr" --argjson port "$port" --arg id "$uuid" \
+             --arg net "${proto#vmess-}" --arg path "$path" --arg host "$host" \
+             '{v:"2", ps:$ps, add:$add, port:$port, id:$id, aid:"0", scy:"auto",
+               net:$net, type:"none", host:$host, path:$path, tls:"tls", sni:$host}' | \
+        base64 | tr -d '\n' | { read -r b; printf 'vmess://%s#%s' "$b" "$tag"; } ;;
+    vless-reality)
+      printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&flow=%s&type=tcp#%s' \
+        "$uuid" "$addr" "$port" "$sni" "$pbk" "$sid" "${flow:-xtls-rprx-vision}" "$tag" ;;
+    vless-reality-xhttp)
+      printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=%s#%s' \
+        "$uuid" "$addr" "$port" "$sni" "$pbk" "$sid" "${path:-/}" "${mode:-auto}" "$tag" ;;
+    vless-xhttp-tls)
+      printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&path=%s&mode=%s#%s' \
+        "$uuid" "$addr" "$port" "$sni" "${path:-/}" "${mode:-auto}" "$tag" ;;
+    vless-ws-enc)
+      printf 'vless://%s@%s:%s?encryption=%s&security=tls&sni=%s&fp=chrome&type=ws&path=%s#%s' \
+        "$uuid" "$addr" "$port" "$(urlenc "$enc")" "$sni" "$path" "$tag" ;;
+    vless-xhttp-enc)
+      printf 'vless://%s@%s:%s?encryption=%s&security=tls&sni=%s&fp=chrome&type=xhttp&path=%s&mode=%s#%s' \
+        "$uuid" "$addr" "$port" "$(urlenc "$enc")" "$sni" "${path:-/}" "${mode:-auto}" "$tag" ;;
+    vless-ws)
+      printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&type=ws&path=%s#%s' \
+        "$uuid" "$addr" "$port" "$sni" "$path" "$tag" ;;
+    vless-tcp)
+      printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&type=tcp#%s' \
+        "$uuid" "$addr" "$port" "$sni" "$tag" ;;
+    trojan-ws)
+      printf 'trojan://%s@%s:%s?security=tls&sni=%s&type=ws&path=%s#%s' \
+        "$password" "$addr" "$port" "$sni" "$path" "$tag" ;;
+    trojan-tcp)
+      printf 'trojan://%s@%s:%s?security=tls&sni=%s&type=tcp#%s' \
+        "$password" "$addr" "$port" "$sni" "$tag" ;;
+    ss)
+      local ui; ui=$(b64url_encode "${method}:${password}")
+      printf 'ss://%s@%s:%s#%s' "$ui" "$addr" "$port" "$tag" ;;
+    hy2)
+      printf 'hysteria2://%s@%s:%s?sni=%s#%s' "$password" "$addr" "$port" "$sni" "$tag" ;;
+    tuic)
+      printf 'tuic://%s:%s@%s:%s?sni=%s&alpn=h3#%s' "$uuid" "$password" "$addr" "$port" "$sni" "$tag" ;;
+    anytls)
+      printf 'anytls://%s@%s:%s?sni=%s#%s' "$password" "$addr" "$port" "$sni" "$tag" ;;
+    naive)
+      printf 'naive://%s@%s:%s?sni=%s#%s' "$(urlenc "$uuid:$password")" "$addr" "$port" "$sni" "$tag" ;;
+    sssb)
+      local ui; ui=$(b64url_encode "${method:-2022-blake3-aes-128-gcm}:${password}")
+      printf 'ss://%s@%s:%s#%s' "$ui" "$addr" "$port" "$tag" ;;
+    socks)
+      local si; si=$(b64url_encode "${uuid}:${password}")
+      printf 'socks://%s@%s:%s#%s' "$si" "$addr" "$port" "$tag" ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+printNode() {
+  local n; n=$(conf_get '.nodes | length'); [[ -z $n || $n -eq 0 ]] && { warn "暂无节点"; return 1; }
+  local i; i=$(conf_get '.nodeActive'); [[ -z $i ]] && i=0
+  local link; link=$(gen_node_link "$i") || { err "链接生成失败"; return 1; }
+  echo
+  echo -e "${CYAN}---- 当前节点分享链接 ----${cRES}"
+  echo "$link"
+  echo
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t ANSIUTF8 -m 1 "$link" 2>/dev/null || qrencode -t ANSI -m 1 "$link" 2>/dev/null
+  else
+    warn "未安装 qrencode, 无法显示二维码 (opkg install qrencode)"
+  fi
+  echo
+  ok "复制上面的链接到 v2rayN: 服务器 → 从剪贴板导入批量URL"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 安装 / 卸载 / 状态
+# -----------------------------------------------------------------------------
+installGWD() {
+  is_openwrt || die "本脚本仅支持 OpenWrt / Kwrt (未检测到 opkg)"
+  echo
+  echo -e "${CYAN}=============================================${cRES}"
+  echo -e "${WHITE}   朔月 Shuoyue — OpenWrt 旁路网关客户端${cRES}"
+  echo -e "${CYAN}=============================================${cRES}"
+  echo
+
+  pkg_dep
+
+  if ! xray_ok; then
+    warn "未找到 xray, 尝试通过 opkg 安装..."
+    opkg install xray-core >/dev/null 2>&1
+    xray_ok || die "xray 不可用, 请先 opkg install xray-core"
+  fi
+  ok "xray: $(xray_path) $( $(xray_path) version 2>/dev/null | head -n1 | awk '{print $2}' )"
+
+  sb_ok && ok "sing-box: $(sb_path) (hy2/tuic/anytls 可用)" || warn "未找到 sing-box (hy2/tuic/anytls 节点将不可用)"
+
+  conf_init
+  mkdir -p "$XRAYDIR" "$SBDIR" "$SDNSDIR" "$LISTDIR" "$NFTDIR"
+
+  # 写入 procd init 脚本(不启动, 避免影响现网)
+  init_write_all
+  ok "已写入 procd 服务脚本: degwd-gw / degwd-sb / degwd-nft / degwd-dns"
+
+  smartdns_conf
+  ok "smartdns 配置已生成 (127.0.0.1:${DNS_PORT}, 不占用 53)"
+
+  # 下载名单
+  download_lists
+
+  # 命令软链 (OpenWrt 无 /usr/local/bin)
+  ln -sf "$BASE/client-openwrt" /usr/bin/shuoyue-gw 2>/dev/null
+  ln -sf "$BASE/client-openwrt" /usr/bin/shuoyue-gw 2>/dev/null || true
+  ok "已安装命令: shuoyue-gw"
+
+  echo
+  echo -e "${YELLOW}注意: 未自动开启代理。${cRES}"
+  echo "  1) 运行 shuoyue-gw 添加节点"
+  echo "  2) 在主菜单选择「开启旁路网关」"
+  echo
+  local c; c=$(ask "现在添加节点? [Y/n]: ")
+  if [[ -z $c || ${c,,} == "y" ]]; then
+    nodes_add
+    [[ -n $(conf_get '.nodeActive') ]] && {
+      local c2; c2=$(ask "立即开启旁路网关? [Y/n]: ")
+      [[ -z $c2 || ${c2,,} == "y" ]] && proxy_on
+    }
+  fi
+  echo
+  ok "安装完成"
+  return 0
+}
+
+uninstallGWD() {
+  yesno "确认卸载朔月 OpenWrt 客户端? (将关闭代理并还原 DNS)" || return 0
+
+  # 停止并禁用自建服务
+  local s
+  for s in degwd-gw degwd-sb degwd-nft degwd-dns; do
+    /etc/init.d/$s stop >/dev/null 2>&1
+    /etc/init.d/$s disable >/dev/null 2>&1
+    rm -f /etc/init.d/$s
+  done
+
+  # 只删自建表与策略路由
+  nft delete table ip "$NFT_TABLE" 2>/dev/null
+  nft delete table ip degwd_relay 2>/dev/null
+  ip rule del fwmark "$NFT_MARK" table "$RT_TABLE" prio "$RT_PRIO" 2>/dev/null
+  ip route del local default dev lo scope host table "$RT_TABLE" 2>/dev/null
+
+  # 还原 dnsmasq
+  dns_forward_off
+
+  # 移除 cron
+  if [[ -f /etc/crontabs/root ]]; then
+    local t; t=$(mktemp)
+    grep -vF "shuoyue-gw" /etc/crontabs/root >"$t" 2>/dev/null
+    mv -f "$t" /etc/crontabs/root
+  fi
+  /etc/init.d/cron restart >/dev/null 2>&1
+
+  # WireGuard 还原
+  uci -q delete network.degwdwg 2>/dev/null
+  uci -q delete firewall.degwdwg 2>/dev/null
+  uci commit network 2>/dev/null
+  uci commit firewall 2>/dev/null
+  /etc/init.d/network reload >/dev/null 2>&1
+  /etc/init.d/firewall reload >/dev/null 2>&1
+
+  rm -f /usr/bin/shuoyue-gw
+  rm -rf "$BASE"
+  ok "卸载完成 (DNS 与网络配置已还原)"
+  return 0
+}
+
+status_panel() {
+  echo
+  echo -e "${CYAN}=============================================${cRES}"
+  echo -e "${WHITE}   朔月 Shuoyue — OpenWrt 旁路网关${cRES}"
+  echo -e "${CYAN}=============================================${cRES}"
+  local on; on=$(conf_get '.proxyOn')
+  echo "  版本:     $VERSION"
+  echo "  系统:     $(grep -m1 DISTRIB_DESCRIPTION /etc/openwrt_release 2>/dev/null | cut -d"'" -f2)"
+  echo "  代理状态: $([[ $on == "true" ]] && echo -e "${GREEN}● 已开启${cRES}" || echo -e "${YELLOW}○ 已关闭${cRES}")"
+  echo "  LAN:      $(lan_if) $(lan_cidr)"
+  echo "  WAN IP:   $(wan_ip)"
+  echo "  节点:     $(conf_get '.nodes | length' 2>/dev/null || echo 0) 个 (当前: $(conf_get '.nodeActive' 2>/dev/null || echo -))"
+  echo
+  printf '  %-12s %s\n' "xray:"    "$(/etc/init.d/degwd-gw running >/dev/null 2>&1 && echo -e "${GREEN}运行中${cRES}" || echo "已停止")"
+  printf '  %-12s %s\n' "sing-box:" "$(/etc/init.d/degwd-sb running >/dev/null 2>&1 && echo -e "${GREEN}运行中${cRES}" || echo "已停止")"
+  printf '  %-12s %s\n' "smartdns:" "$(/etc/init.d/degwd-dns running >/dev/null 2>&1 && echo -e "${GREEN}运行中${cRES}" || echo "已停止")"
+  printf '  %-12s %s\n' "nft 表:"   "$(nft list table ip "$NFT_TABLE" >/dev/null 2>&1 && echo -e "${GREEN}已加载${cRES}" || echo "未加载")"
+  printf '  %-12s %s\n' "策略路由:" "$(route_rule_ok && echo -e "${GREEN}正常${cRES}" || echo "缺失")"
+  printf '  %-12s %s\n' "DNS 转发:" "$(dns_forward_ok && echo -e "${GREEN}已启用${cRES}" || echo "未启用")"
+  echo
+  echo "  共存检查:"
+  nft list table inet fw4 >/dev/null 2>&1 && echo "    fw4:       正常" || echo "    fw4:       缺失"
+  nft list table inet passwall2 >/dev/null 2>&1 && echo "    passwall2: 正常" || true
+  nft list table ip mangle >/dev/null 2>&1 && echo "    mwan3:     正常" || true
+  echo
+  [[ $on == "true" ]] && nodes_list 2>/dev/null
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 主菜单
+# -----------------------------------------------------------------------------
+start_menu() {
+  while :; do
+    clear 2>/dev/null
+    status_panel
+    echo "  ─────────────────────────────────────────────"
+    echo "  [1] 节点管理"
+    echo "  [2] 分流规则"
+    echo "  [3] DNS 设置"
+    echo "  [4] $([[ $(conf_get '.proxyOn') == "true" ]] && echo "关闭旁路网关" || echo "开启旁路网关")"
+    echo "  [5] 阻断 DoT(853 端口)"
+    echo "  [6] WireGuard 服务端"
+    echo "  [7] DDNS (Cloudflare)"
+    echo "  [8] 端口中继"
+    echo "  [9] 下载/更新名单"
+    echo "  [A] 健康检查"
+    echo "  [B] 显示当前节点链接/二维码"
+    echo "  [C] 自动更新开关"
+    echo "  [D] 卸载"
+    echo "  [0] 退出"
+    echo "  ─────────────────────────────────────────────"
+    local c; c=$(ask "选择: ")
+    case "${c,,}" in
+      1) nodes_menu ;;
+      2) split_menu ;;
+      3) dns_menu ;;
+      4) proxy_toggle ;;
+      5) block53_toggle ;;
+      6) wg_menu ;;
+      7) ddns_menu ;;
+      8) relay_menu ;;
+      9) download_lists; refresh_nft_sets ;;
+      a) health_check full ;;
+      b) printNode ;;
+      c) [[ $(conf_get '.autoUpdate') == "true" ]] && autoupdate_off || autoupdate_on ;;
+      d) uninstallGWD; exit 0 ;;
+      0|q|"") clear 2>/dev/null; return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+    [[ -n $c ]] && echo && read -r -p "回车继续..." _
+  done
+}
+
+usage() {
+  cat <<EOF
+朔月 Shuoyue — OpenWrt 旁路网关客户端 $VERSION
+
+用法: shuoyue-gw [选项]
+
+  --install     安装并初始化(不自动开启代理)
+  --uninstall   卸载并还原 DNS / 网络配置
+  --status      显示运行状态
+  --update      检查并更新到最新版本
+  --lists       下载/更新 chnroute 与国内域名名单
+  --ddns        执行一次 Cloudflare DDNS 更新(cron 调用)
+  --proxy on|off 开启/关闭旁路网关
+  --version     显示版本
+  --help        显示本帮助
+
+无参数时进入交互菜单。
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# 入口
+# -----------------------------------------------------------------------------
+case "${1:-}" in
+  --install)   installGWD ;;
+  --uninstall) uninstallGWD ;;
+  --status)    status_panel ;;
+  --update)    updateGWD ;;
+  --lists)     download_lists; refresh_nft_sets ;;
+  --ddns)      ddns_update_cf ;;
+  --proxy)
+    case "${2:-}" in
+      on)  proxy_on ;;
+      off) proxy_off ;;
+      *)   err "用法: shuoyue-gw --proxy on|off"; exit 1 ;;
+    esac ;;
+  --version)   echo "$VERSION" ;;
+  --help|-h)   usage ;;
+  "")
+    is_openwrt || die "本脚本仅支持 OpenWrt / Kwrt"
+    [[ -f $CONF ]] || die "尚未安装, 请先运行: shuoyue-gw --install"
+    start_menu ;;
+  *) err "未知参数: $1"; usage; exit 1 ;;
+esac
