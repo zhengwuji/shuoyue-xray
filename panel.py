@@ -25,6 +25,7 @@ CLI 契约（由主脚本 server 提供，本文件只消费）::
 """
 
 import argparse
+import gzip
 import hmac
 import http.cookies
 import http.server
@@ -1079,8 +1080,18 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Date", self.date_time_string())
 
     def _send(self, status, payload, raw=None, ctype="application/json; charset=utf-8", extra=None):
-        """统一发送响应，始终带 Content-Length。"""
+        """统一发送响应，始终带 Content-Length，支持 gzip 压缩。"""
         body = raw if raw is not None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = list(extra or [])
+        accept_enc = self.headers.get("Accept-Encoding", "")
+        if "gzip" in accept_enc and len(body) > 256:
+            try:
+                compressed = gzip.compress(body, compresslevel=6)
+                if len(compressed) < len(body):
+                    body = compressed
+                    headers.append(("Content-Encoding", "gzip"))
+            except Exception:
+                pass
         try:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
@@ -1088,11 +1099,15 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
-            for key, value in (extra or []):
+            for key, value in headers:
                 self.send_header(key, value)
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
         except (BrokenPipeError, ConnectionResetError):
             pass
         return status
@@ -1326,13 +1341,14 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
         finally:
             self._log_request(started, path, status)
 
-    # ---- 未允许的方法一律 404 ----
-    def do_HEAD(self):
-        """未开放的方法统一返回 404。"""
-        self._drain_body()
-        self._send_error_json(404, "路径不存在")
+    # ---- HEAD 请求按 GET 逻辑处理 (报头一致, _send 内部根据 command != 'HEAD' 跳过响应体) ----
+    do_HEAD = do_GET
 
-    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = do_HEAD
+    def _method_not_allowed(self):
+        self._drain_body()
+        self._send_error_json(405, "方法不允许")
+
+    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = _method_not_allowed
 
     # ---- 业务处理 ----
     def _finish_cli(self, result):

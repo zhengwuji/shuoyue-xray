@@ -202,12 +202,34 @@ pick_bindir || die "/usr/bin 不可写,无法创建命令"
 ln -sf "$BASE/server" "$BINDIR/shuoyue"
 ok "已安装命令: shuoyue (以后随时输入即可打开管理菜单)"
 
-echo
-echo "请选择安装目标:"
-echo "  [1] 服务端 — 一键部署 Web 控制面板，通过网页 GUI 勾选并安装 19 种协议  ← 推荐"
-echo "  [2] 客户端 — 家里闲置设备做旁路网关,其他设备把网关指向它"
-echo "  [3] 退出(以后输入 shuoyue 打开菜单)"
-read -rp "选择 [1/2/3, 回车=1]: " c; c=${c:-1}
+has_installed=0
+cur_ver=""
+if [[ -f "$BASE/conf.json" || -f "$BASE/server" ]]; then
+  has_installed=1
+  [[ -f "$BASE/version" ]] && cur_ver=$(head -n1 "$BASE/version" 2>/dev/null)
+fi
+
+if [[ "${1:-}" == "--update" || "${1:-}" == "-u" ]]; then
+  c=4
+else
+  echo
+  if [[ $has_installed -eq 1 ]]; then
+    echo -e "${GREEN}★ 检测到本机已安装 朔月 Shuoyue${cur_ver:+ ($cur_ver)}${cRES}"
+    echo "  已安装环境推荐选择 [4] 直接升级，将无损保留您的所有节点与配置。"
+    echo
+  fi
+  echo "请选择操作目标:"
+  echo "  [1] 服务端全新安装 — 部署 Web 控制面板，通过网页 GUI 勾选并安装 19 种协议"
+  echo "  [2] 客户端 — 家里闲置设备做旁路网关,其他设备把网关指向它"
+  echo "  [3] 退出(以后输入 shuoyue 打开菜单)"
+  echo "  [4] 升级更新 — 直接升级服务端核心、Web 控制面板及后续新增功能与修复补丁"
+  if [[ $has_installed -eq 1 ]]; then
+    read -rp "选择 [1/2/3/4, 已安装推荐 4, 回车=4]: " c; c=${c:-4}
+  else
+    read -rp "选择 [1/2/3/4, 回车=1]: " c; c=${c:-1}
+  fi
+fi
+
 case $c in
   2)
     echo -n "下载客户端脚本... "
@@ -221,6 +243,10 @@ case $c in
   3)
     ok "完成。输入 shuoyue 打开菜单。"
     exit 0
+    ;;
+  4|[Uu]|[Uu][Pp][Dd][Aa][Tt][Ee])
+    clear
+    exec bash "$BASE/server" --update
     ;;
   *)
     clear

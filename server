@@ -460,8 +460,11 @@ EOF
   tcpTime; [[ $VIRT_TYPE != "container" ]] && "$BASE/tcpTime"
   echo "debconf debconf/frontend select Noninteractive" | debconf-set-selections
   apt-get update -qq
-  # full-upgrade 可能替换内核/删除软件包, 必须询问(默认 N)
-  read -rsp "是否执行系统全面升级(apt full-upgrade)? [y/N]: " -n1 up; echo
+  # full-upgrade 可能替换内核/删除软件包, 必须询问(默认 N, 非交互时默认跳过)
+  local up="n"
+  if [[ "${NONINTERACTIVE:-0}" != "1" && -t 0 ]]; then
+    read -rsp "是否执行系统全面升级(apt full-upgrade)? [y/N]: " -n1 up; echo
+  fi
   if [[ "$up" =~ ^[Yy] ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade || warn "系统升级未完全成功(继续安装)"
   else
@@ -2068,7 +2071,7 @@ installGWD() {
   install_xray
 
   ok "部署并启动 Web 控制面板..."
-  install_panel
+  install_panel || die "Web 控制面板部署失败"
 
   local pport; pport=$(panel_port)
   # 防火墙放行面板端口 (若开启了 ufw)
@@ -2180,36 +2183,68 @@ cli_install_legacy() {
 }
 
 updateGWD() {
-  echo -e "${CYAN}=== 更新 de_GWD Remake ===${cRES}"
+  echo -e "${CYAN}=====================================================${cRES}"
+  echo -e "${WHITE}   朔月 Shuoyue — 升级更新 (核心 / Web 面板 / 修复)${cRES}"
+  echo -e "${CYAN}=====================================================${cRES}"
   conf_init
-  any_proto || die "尚未安装,请先选择菜单 1"
+
+  ok "更新系统基线与依赖..."
   apt_baseline
   pkg_dep
+
+  ok "更新基础代理内核 (Xray)..."
   install_xray
-  if domain_proto_on; then
-    install_nginx
-    install_doh
-    svc_restart doh-server
-    [[ -f $SSLDIR/de_GWD.cer ]] || { [[ $(conf_get '.port') == "443" ]] && make_ssl_webroot || make_ssl_cf; }
-    nginx_main_conf; ssl_params_conf; nginx_web_conf
-    systemctl restart nginx
+
+  # 更新与重启 Web 控制面板 (确保 systemd unit、配置和端口同步)
+  if [[ -f "$PANEL_PY" || -f "$BASE/panel.py" || -f /etc/systemd/system/degwd-panel.service ]]; then
+    ok "更新 Web 控制面板组件与服务单元..."
+    mkdir -p "$PANEL_DIR" /etc/nginx/conf.d
+    if [[ -f "$BASE/panel.py" && "$BASE/panel.py" != "$PANEL_PY" ]]; then
+      cp -a "$BASE/panel.py" "$PANEL_PY" 2>/dev/null || true
+    fi
+    panel_unit_conf
+    systemctl daemon-reload
+    svc_restart degwd-panel && ok "Web 控制面板服务已重新加载" || warn "Web 控制面板重启异常"
+    local pport; pport=$(panel_port)
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+      ufw allow "$pport/tcp" >/dev/null 2>&1
+    fi
+    if domain_proto_on && [[ -f /etc/nginx/conf.d/default.conf ]]; then
+      nginx_panel_conf >/dev/null 2>&1 || true
+    fi
   fi
-  if sb_proto_on; then
-    install_singbox --force
-    singbox_gen_config
-    svc_restart sing-box
-  else
-    systemctl stop sing-box >/dev/null 2>&1
-    systemctl disable sing-box >/dev/null 2>&1
+
+  if any_proto; then
+    ok "更新已启用的代理协议与服务..."
+    if domain_proto_on; then
+      install_nginx
+      install_doh
+      svc_restart doh-server
+      [[ -f $SSLDIR/de_GWD.cer ]] || { [[ $(conf_get '.port') == "443" ]] && make_ssl_webroot || make_ssl_cf; }
+      nginx_main_conf; ssl_params_conf; nginx_web_conf
+      systemctl restart nginx
+    fi
+    if sb_proto_on; then
+      install_singbox --force
+      singbox_gen_config
+      svc_restart sing-box
+    else
+      systemctl stop sing-box >/dev/null 2>&1
+      systemctl disable sing-box >/dev/null 2>&1
+    fi
+    svc_restart unbound
+    xray_gen_config
+    svc_restart xray
+    svc_restart degwd-nftables 2>/dev/null
+    /etc/rc_online.local 2>/dev/null
+    gen_sub_all
+    printNode
   fi
-  svc_restart unbound
-  xray_gen_config
-  svc_restart xray
-  svc_restart degwd-nftables 2>/dev/null
-  /etc/rc_online.local 2>/dev/null
-  gen_sub_all
-  printNode
-  ok "更新完成"
+
+  ok "升级完成！核心、Web 面板及运行环境已全部同步为最新状态。"
+  if [[ -f /etc/systemd/system/degwd-panel.service ]]; then
+    show_panel_info
+  fi
 }
 
 # ================================================================ 菜单功能 ===
@@ -2878,11 +2913,6 @@ Environment=DEGWD_PANEL_PORT=$pport
 ExecStart=$(command -v python3) $PANEL_PY
 Restart=on-failure
 RestartSec=3
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectHome=yes
-ProtectSystem=full
-ReadWritePaths=$BASE /etc/nginx/conf.d /etc/systemd/system
 LimitNOFILE=65535
 
 [Install]
@@ -2932,7 +2962,7 @@ install_panel() {
     apt-get install -y -qq python3 >/dev/null 2>&1
     command -v python3 >/dev/null 2>&1 || die "python3 不可用, 无法安装面板"
   }
-  mkdir -p "$PANEL_DIR"
+  mkdir -p "$PANEL_DIR" /etc/nginx/conf.d
   echo -n "下载 panel.py... "
   fetch_panel_py "$PANEL_PY" || die "panel.py 下载或语法校验失败"
   chmod 755 "$PANEL_PY"
