@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """朔月 Shuoyue / de_GWD —— 单文件标准库 Web 面板。
 
-只依赖 Python3 标准库，由 systemd 以 root 运行，默认监听 127.0.0.1:3000，
+只依赖 Python3 标准库，由 systemd 以 root 运行，默认监听 0.0.0.0:3000，
 由 nginx 反向代理暴露在 https://<域名>/<随机路径段>/ 之下。
 
 面板本身不实现任何代理逻辑，只通过 subprocess 调用
@@ -898,12 +898,17 @@ function busy(btn, promise, title) {
   return promise.then(function (r) {
     if (btn) { btn.disabled = false; }
     logOp(title, r);
-    if (r.ok && r.data && r.data.ok !== false) { toast(title + " 完成"); }
-    else { toast(title + " 失败，见日志"); }
+    if (r && r.ok && (!r.data || r.data.ok !== false)) {
+      toast(title + " 完成");
+    } else {
+      var err = (r && r.data && (r.data.error || (r.data.data && r.data.data.error))) || "";
+      toast(title + (err ? (" 失败: " + err) : " 失败，见日志"));
+    }
     return r;
   }, function (err) {
     if (btn) { btn.disabled = false; }
     logOp(title, { ok: false, status: 0, ms: 0, method: "?", path: "?", data: { error: String(err) } });
+    toast(title + " 出错: " + String(err));
     return null;
   });
 }
@@ -920,7 +925,27 @@ $("#btn-refresh").addEventListener("click", function () { loadStatus(this); });
 $("#btn-save").addEventListener("click", function () {
   var ids = checkedIds();
   if (!ids.length) { toast("请至少勾选一个协议"); return; }
-  busy(this, api("/api/protos", "POST", { protos: ids }), "保存并应用协议").then(function (r) {
+  var needDomain = false;
+  var protos = SERVER_PROTOS || PROTOCOLS;
+  for (var i = 0; i < protos.length; i++) {
+    if (protos[i].needs_domain && ids.indexOf(protos[i].id) >= 0) {
+      needDomain = true;
+      break;
+    }
+  }
+  var domainVal = ($("#f-domain").value || "").trim();
+  if (needDomain && !domainVal) {
+    toast("所选协议需要域名，请先在全局配置中填入域名");
+    $("#f-domain").focus();
+    return;
+  }
+  var prepJob = Promise.resolve();
+  if (domainVal) {
+    prepJob = api("/api/cfg", "POST", { domain: domainVal });
+  }
+  busy(this, prepJob.then(function () {
+    return api("/api/protos", "POST", { protos: ids });
+  }), "保存并应用协议").then(function (r) {
     if (r && r.ok && r.data) { applyStatus(r.data.data || r.data); }
   });
 });
@@ -1468,7 +1493,7 @@ def main(argv=None):
                         help="打印 PANEL_TOKEN/PANEL_PATH/PANEL_BIND/PANEL_PORT 后退出")
     parser.add_argument("--check", action="store_true",
                         help="自检：读取 conf.json 并调用一次 --cli status")
-    parser.add_argument("--bind", default=None, help="监听地址（默认 127.0.0.1）")
+    parser.add_argument("--bind", default=None, help="监听地址（默认 0.0.0.0）")
     parser.add_argument("--port", type=int, default=None, help="监听端口（默认 3000）")
     args = parser.parse_args(argv)
 
@@ -1478,7 +1503,7 @@ def main(argv=None):
         _log("初始化面板凭据失败: %s: %s" % (type(exc).__name__, exc))
         return 2
 
-    bind = args.bind or os.environ.get("DEGWD_PANEL_BIND", "127.0.0.1")
+    bind = args.bind or os.environ.get("DEGWD_PANEL_BIND", "0.0.0.0")
     try:
         port = args.port or int(os.environ.get("DEGWD_PANEL_PORT", "3000"))
     except ValueError:

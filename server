@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.8"
+VERSION="v1.3.9"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -2043,7 +2043,72 @@ protos_select() {
 
 installGWD() {
   echo
-  echo -e "${CYAN}=== de_GWD Remake 安装 (多协议) ===${cRES}"
+  echo -e "${CYAN}=====================================================${cRES}"
+  echo -e "${WHITE}   朔月 Shuoyue — 一键部署 Web 控制面板 (网页化安装)${cRES}"
+  echo -e "${CYAN}=====================================================${cRES}"
+  conf_init
+
+  # 基础凭据预生成 (保证 panel / xray / cli 随时就绪)
+  [[ -n $(conf_get '.uuids[0]') ]] || conf_raw '.uuids' "[\"$(xray_uuid_gen)\"]"
+  [[ -n $(conf_get '.path') ]] || conf_set '.path' "/$(uuid6 "$(conf_get '.uuids[0]')")"
+  [[ -n $(conf_get '.subtoken') ]] || conf_set '.subtoken' "$(openssl rand -hex 8)"
+  [[ -n $(conf_get '.port') ]] || conf_set '.port' "443"
+
+  ok "初始化基线系统环境..."
+  apt_baseline; pkg_dep; limits_conf; sysctl_conf
+  unbound_conf
+  svc_restart unbound && ok "unbound DNS 缓存服务" || warn "unbound 未启动"
+  shaping_conf; nftables_conf
+  svc_restart degwd-shaping 2>/dev/null
+  svc_restart degwd-nftables && ok "nftables 防火墙 + CAKE 流量整形" || warn "nftables 未启动"
+
+  # 防火墙放行面板端口 (若开启了 ufw)
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow 3000/tcp >/dev/null 2>&1 && ok "ufw 已放行 3000/tcp"
+  fi
+
+  ok "安装基础代理内核 (Xray)..."
+  install_xray
+
+  ok "部署并启动 Web 控制面板..."
+  install_panel
+
+  enable_autoupdate_ask
+
+  local wan laddr tok path panel_url
+  wan=$(wan_ip)
+  laddr=$(local_ip)
+  path=$(conf_get '.panel.path')
+  tok=$(conf_get '.panel.token')
+  panel_url="http://${wan:-$laddr}:${PANEL_PORT}/${path}/?t=${tok}"
+
+  echo
+  echo -e "${GREEN}===================================================================${cRES}"
+  echo -e "${GREEN}✓ 朔月 Web 控制面板已成功部署并启动！${cRES}"
+  echo -e "${GREEN}===================================================================${cRES}"
+  echo
+  echo -e "  请在浏览器访问以下链接，进入网页 GUI 完成协议勾选与一键部署："
+  echo
+  echo -e "  ${CYAN}▶ 面板访问地址:${cRES}  ${YELLOW}${panel_url}${cRES}"
+  if [[ -n $wan && -n $laddr && $wan != "$laddr" ]]; then
+    echo -e "  ${CYAN}▶ 内网备用地址:${cRES}  http://${laddr}:${PANEL_PORT}/${path}/?t=${tok}"
+  fi
+  echo
+  echo -e "${WHITE}  使用说明:${cRES}"
+  echo "    1. 在浏览器打开上述链接，即可看到 19 种主流协议清单"
+  echo "    2. 根据需求勾选所需协议（支持全选、仅Xray、仅Sing-box或任意组合）"
+  echo "    3. 若勾选需域名的协议，在网页「全局配置」填入已解析的域名"
+  echo "    4. 点击「保存并应用」，系统将在后台自动完成配置生成与服务启动"
+  echo "    5. 部署完成后，网页将实时自动生成 v2rayN 订阅地址与导入链接！"
+  echo
+  echo -e "  提示: 随时在终端输入 ${CYAN}shuoyue${cRES} 可打开管理控制台。"
+  echo -e "${GREEN}===================================================================${cRES}"
+  echo
+}
+
+cli_install_legacy() {
+  echo
+  echo -e "${CYAN}=== de_GWD 终端命令行交互安装 (多协议) ===${cRES}"
   protos_print_menu
   conf_init
   protos_select
@@ -2102,6 +2167,7 @@ installGWD() {
   fi
   svc_restart xray && ok "Xray" || { err "Xray 未启动"; journalctl -u xray -n 20 --no-pager; }
 
+  install_panel
   gen_sub_all
   enable_autoupdate_ask
   printNode
@@ -2593,7 +2659,7 @@ start_menu() {
     echo -e "${CYAN}=====================================================${cRES}"
     status_panel
     echo
-    echo "  1. 安装 (Install, 19 种协议勾选)"
+    echo "  1. 一键部署 Web 控制面板 (推荐: 网页化勾选 19 种协议与一键配置)"
     echo "  2. 升级 (Update: 组件最新版 + 系统全面升级)"
     echo "  3. 卸载 (Uninstall, 完整移除)"
     echo "  4. 更改配置 (域名/协议开关/Reality/WS path/WARP/转发/面板)"
@@ -2602,7 +2668,8 @@ start_menu() {
     echo "  7. 节点信息/订阅 (Info + v2rayN 导入示例)"
     echo "  8. Cloudflare 测速"
     [[ $VIRT_TYPE != "container" ]] && echo "  9. 升级内核 (Kernel, Zabbly)"
-    echo "  P. 安装 Web 面板 (浏览器勾选协议 + 复制 v2rayN 链接)"
+    echo "  P. 查看 / 重启 Web 面板 (获取面板登录 URL / 状态)"
+    echo "  C. 终端命令行交互安装 (旧版 CLI 字符界面勾选)"
     echo "  0. 自动更新开关 (AutoUpdate)"
     echo " CTRL+C 退出"
     echo
@@ -2618,6 +2685,7 @@ start_menu() {
       8) CFspeedTest ;;
       9) installkernel ;;
       [Pp]) install_panel ;;
+      [Cc]) cli_install_legacy ;;
       0) autoUpdateGWD ;;
       *) warn "输入有误" ;;
     esac
@@ -2704,17 +2772,20 @@ apply_protos() {
 }
 
 # =============================================================== Web 面板 ====
-# 单文件 Python3 标准库面板(panel.py), 监听 127.0.0.1:3000, 由 nginx 反代到
-# https://<域名>/<随机路径>/   —— 只有持有 token 的人能打开
+# 单文件 Python3 标准库面板(panel.py), 默认监听 0.0.0.0:3000 (支持 DEGWD_PANEL_BIND 覆盖)
+# 由 nginx 反代到 https://<域名>/<随机路径>/ (若配置了域名) 或直接访问 http://<IP>:3000/<随机路径>/
 PANEL_DIR="$BASE/panel"
 PANEL_PY="$PANEL_DIR/panel.py"
-PANEL_BIND="127.0.0.1"
+PANEL_BIND="${DEGWD_PANEL_BIND:-0.0.0.0}"
 PANEL_PORT="3000"
 
 # 从仓库拉 panel.py(多源回退 + 内容校验)
 fetch_panel_py() {
   local dest="$1" url
   mkdir -p "$(dirname "$dest")"
+  if [[ -f "$BASE/panel.py" && "$BASE/panel.py" != "$dest" ]]; then
+    cp -a "$BASE/panel.py" "$dest" && chmod 755 "$dest" && return 0
+  fi
   for url in "$REMOTE_BASE/panel.py" \
              "https://ghproxy.net/$REMOTE_BASE/panel.py" \
              "https://cdn.jsdelivr.net/gh/zhengwuji/shuoyue-xray@main/panel.py"; do
@@ -2842,21 +2913,17 @@ PYEOF
     if nginx_panel_conf; then
       ok "面板已挂到 nginx (https://$(conf_get '.domain')/$path/)"
     else
-      warn "写入面板反代失败, 面板仍可本机访问 127.0.0.1:$PANEL_PORT"
+      warn "写入面板反代失败, 面板仍可通过端口 $PANEL_PORT 访问"
     fi
-  else
-    warn "当前无 nginx 站点, 面板仅本机可访问(127.0.0.1:$PANEL_PORT)"
   fi
 
-  local host; host=$(conf_get '.domain')
+  local host wan; host=$(conf_get '.domain'); wan=$(wan_ip)
   echo
-  ok "面板安装完成"
+  ok "Web 面板服务已就绪"
   if [[ -n $host && -f /etc/nginx/conf.d/default.conf ]]; then
-    echo -e "  面板地址: ${GREEN}https://$host/$path/?t=$tok${cRES}"
-  else
-    echo -e "  本机地址: ${GREEN}http://127.0.0.1:$PANEL_PORT/$path/?t=$tok${cRES}"
-    echo "  (SSH 隧道: ssh -L 3000:127.0.0.1:3000 root@<服务器IP> 后访问上面地址)"
+    echo -e "  域名地址: ${GREEN}https://$host/$path/?t=$tok${cRES}"
   fi
+  echo -e "  直连地址: ${GREEN}http://${wan:-127.0.0.1}:$PANEL_PORT/$path/?t=$tok${cRES}"
   echo "  重新查看: shuoyue --cli status | jq -r '.panel_path'"
   echo "  凭据存储: $CONF 的 .panel.token / .panel.path (chmod 600)"
 }
@@ -3021,7 +3088,7 @@ cli_protos() {
     case $i in reality|realityxhttp|anyreality) rl_want=1 ;; esac
   done
   if [[ $domain_want == 1 && -z $(conf_get '.domain') ]]; then
-    cli_json '{"ok":false,"error":"domain required for selected protos"}'; return 1
+    cli_json '{"ok":false,"error":"所选协议需要域名, 请先在全局配置中填写域名并保存"}'; return 1
   fi
 
   # 事务性, 两重保险:
@@ -3141,10 +3208,11 @@ cli_dispatch() {
 
 # -------------------------------------------------------------------- 入口 ---
 case "${1:-}" in
-  --update)   updateGWD; exit 0 ;;
-  --install)  installGWD; exit 0 ;;
-  --version)  echo "$VERSION"; exit 0 ;;
-  --cli)      shift; NONINTERACTIVE=1; cli_dispatch "$@"; exit $? ;;
+  --update)       updateGWD; exit 0 ;;
+  --install)      installGWD; exit 0 ;;
+  --install-cli)  cli_install_legacy; exit 0 ;;
+  --version)      echo "$VERSION"; exit 0 ;;
+  --cli)          shift; NONINTERACTIVE=1; cli_dispatch "$@"; exit $? ;;
   --panel-install) shift; install_panel; exit 0 ;;
 esac
 start_menu
