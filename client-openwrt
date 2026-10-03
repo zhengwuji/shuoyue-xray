@@ -10,7 +10,7 @@
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C
 
-VERSION="v1.3.2"
+VERSION="v1.3.3"
 
 # 允许用 DEGWD_BASE 指向别处(与 server/client/panel.py 一致), 便于真机隔离测试
 BASE="${DEGWD_BASE:-/opt/de_GWD}"

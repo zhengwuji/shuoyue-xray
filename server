@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.2"
+VERSION="v1.3.3"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -2948,12 +2948,18 @@ cli_cfg_json() {
 
 cli_links() {
   conf_init
-  local out='[]' line id name link
+  local out='[]' line id name link nd
   # GEN_LINKS_TAGGED=1 -> gen_links 输出 "id|显示名|链接"
   while IFS='|' read -r id name link; do
     [[ -z $id || -z $link ]] && continue
+    # 注意: 不能写 $(proto_needs_domain "$id" && echo true || echo false) ——
+    # proto_needs_domain 自己会打印字段值(0/1), 于是命令替换拿到两行
+    # "1\ntrue", 交给 --argjson 直接报 invalid JSON text, 整条链接被丢弃。
+    # 必须先取值再比较。
+    nd=false
+    [[ $(proto_needs_domain "$id") == "1" ]] && nd=true
     out=$(printf '%s' "$out" | jq -c --arg id "$id" --arg n "$name" --arg l "$link" \
-      --argjson p "$(proto_port "$id")" --argjson d "$(proto_needs_domain "$id" && echo true || echo false)" \
+      --argjson p "$(proto_port "$id")" --argjson d "$nd" \
       '. + [{id:$id,name:$n,link:$l,port:$p,needs_domain:$d}]')
   done < <(GEN_LINKS_TAGGED=1 gen_links)
   jq -cn --argjson links "$out" '{ok:true, links:$links}'
