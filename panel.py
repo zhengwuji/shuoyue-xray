@@ -505,6 +505,18 @@ border:1px solid var(--acc);border-radius:8px;padding:8px 16px;opacity:0;pointer
 transition:opacity .2s;z-index:9;max-width:90vw}
 #toast.show{opacity:1}
 @media(max-width:640px){body{padding:10px}section{padding:11px}.grid{grid-template-columns:1fr}}
+.alert-box{border:1px solid #d29922;background:rgba(210,153,34,.12);border-radius:8px;padding:10px 12px;font-size:13px;color:#e3b341;margin-bottom:12px;line-height:1.5}
+.core-card{border:1px solid var(--bd);border-radius:8px;padding:8px 10px;background:var(--panel2);display:flex;flex-direction:column;gap:3px}
+.core-card .chead{display:flex;justify-content:space-between;align-items:center}
+.core-card .cname{font-weight:600;font-size:13px}
+.core-card .cpath{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--dim);word-break:break-all}
+.core-card .cver{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--fg)}
+.proc-card{border:1px solid var(--bd);border-radius:8px;padding:10px;background:var(--panel2);margin-bottom:8px;font-size:12px}
+.proc-card.third-party{border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.06)}
+.phead{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:6px}
+.phead .p-title{font-weight:600;font-size:13px}
+.ports-tag{font-family:ui-monospace,Consolas,monospace;background:#162436;color:#58a6ff;border:1px solid #388bfd44;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600}
+.cmd-box{background:#0d1117;border:1px solid var(--bd);border-radius:6px;padding:6px 8px;margin-top:6px;font-family:ui-monospace,Consolas,monospace;font-size:11px;word-break:break-all;color:#8b949e}
 </style>
 </head>
 <body>
@@ -521,6 +533,26 @@ transition:opacity .2s;z-index:9;max-width:90vw}
   <section>
     <h2>当前状态 <button class="mini" id="btn-refresh">刷新状态</button></h2>
     <div id="info"><div class="kv"><b>提示</b><span>尚未获取状态</span></div></div>
+  </section>
+
+  <section id="sec-detect">
+    <h2>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-right:4px">
+        <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+      </svg>
+      服务端组件与进程检测
+      <button class="mini" id="btn-detect-refresh">重新探测</button>
+    </h2>
+    <div id="detect-alert"></div>
+    <div id="detect-summary" class="toolbar" style="margin-bottom:10px"></div>
+    <h3 style="font-size:13px;color:var(--dim);margin:10px 0 6px">已安装服务端核心 / 工具</h3>
+    <div id="detect-bins" class="grid" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px;margin-bottom:14px">
+      <div class="dim">正在检测服务端核心组件…</div>
+    </div>
+    <h3 style="font-size:13px;color:var(--dim);margin:10px 0 6px">运行中的代理进程与监听端口</h3>
+    <div id="detect-procs">
+      <div class="dim">正在探测运行中的代理进程…</div>
+    </div>
   </section>
 
   <section>
@@ -802,6 +834,86 @@ function applyStatus(d) {
   $("#sw-sub").className = "tag " + (d.sub_on === false ? "warn" : "");
   setSub(d.suburl);
   if (Array.isArray(d.links)) { renderLinks(d.links); }
+  if (d.proxy_env) { renderDetection(d.proxy_env); }
+}
+function renderDetection(env) {
+  if (!env || typeof env !== "object") { return; }
+  var bins = Array.isArray(env.binaries) ? env.binaries : [];
+  var procs = Array.isArray(env.running) ? env.running : [];
+  var sum = env.summary || {};
+
+  var sHost = $("#detect-summary");
+  if (sHost) {
+    sHost.innerHTML =
+      '<span class="tag ok">已检出核心: ' + (sum.total_installed || bins.length) + ' 个</span>' +
+      '<span class="tag">运行中进程: ' + (sum.total_running || procs.length) + ' 个</span>' +
+      '<span class="tag">本系统托管: ' + (sum.degwd_running || 0) + ' 个</span>' +
+      ((sum.third_party_running || 0) > 0 ?
+        '<span class="tag warn">⚠️ 外部/第三方进程: ' + sum.third_party_running + ' 个</span>' :
+        '<span class="tag ok">无第三方冲突</span>');
+  }
+
+  var aHost = $("#detect-alert");
+  if (aHost) {
+    if (sum.has_third_party) {
+      var thirdProcs = procs.filter(function (p) { return !p.is_degwd; });
+      var thirdPorts = [];
+      thirdProcs.forEach(function (p) {
+        if (p.ports) {
+          p.ports.split(",").forEach(function (pt) {
+            pt = pt.trim();
+            if (pt && thirdPorts.indexOf(pt) < 0) { thirdPorts.push(pt); }
+          });
+        }
+      });
+      aHost.innerHTML =
+        '<div class="alert-box"><strong>⚠️ 检测到服务器上运行有外部/第三方代理进程：</strong>共发现 ' +
+        thirdProcs.length + ' 个非本系统托管的服务实例' +
+        (thirdPorts.length ? '，已占用端口：<code>' + esc(thirdPorts.join(", ")) + '</code>' : '') +
+        '。配置或修改本系统协议服务端口时，请避免使用已被占用的端口，以防冲突启动失败。</div>';
+    } else {
+      aHost.innerHTML = '';
+    }
+  }
+
+  var bHost = $("#detect-bins");
+  if (bHost) {
+    if (!bins.length) {
+      bHost.innerHTML = '<div class="dim">暂未检出标准代理核心程序（勾选协议并保存后系统将按需自动安装）。</div>';
+    } else {
+      bHost.innerHTML = bins.map(function (b) {
+        var isRun = procs.some(function (p) { return p.name === b.name; });
+        return '<div class="core-card">' +
+          '<div class="chead"><span class="cname">' + esc(b.name) + '</span>' +
+          (isRun ? '<span class="tag ok">运行中</span>' : '<span class="tag">未运行</span>') +
+          '</div>' +
+          '<div class="cver">版本: ' + esc(b.version || "已安装") + '</div>' +
+          '<div class="cpath" title="' + esc(b.path) + '">路径: ' + esc(b.path) + '</div>' +
+          '</div>';
+      }).join("");
+    }
+  }
+
+  var pHost = $("#detect-procs");
+  if (pHost) {
+    if (!procs.length) {
+      pHost.innerHTML = '<div class="dim">当前无运行中的代理服务进程。</div>';
+    } else {
+      pHost.innerHTML = procs.map(function (p, idx) {
+        return '<div class="proc-card ' + (p.is_degwd ? '' : 'third-party') + '">' +
+          '<div class="phead">' +
+            '<span class="p-title">#' + (idx + 1) + ' ' + esc(p.name) + '</span>' +
+            '<span class="tag">PID: ' + esc(p.pid) + '</span>' +
+            '<span class="tag">用户: ' + esc(p.user) + '</span>' +
+            (p.is_degwd ? '<span class="tag ok">本系统托管</span>' : '<span class="tag warn">⚠️ 第三方/已有脚本</span>') +
+            (p.ports ? '<span class="ports-tag">监听: ' + esc(p.ports) + '</span>' : '<span class="tag">无外部监听</span>') +
+          '</div>' +
+          (p.config ? '<div style="margin:2px 0"><span class="dim">配置文件: </span><code>' + esc(p.config) + '</code></div>' : '') +
+          '<div class="cmd-box">' + esc(p.cmd || p.exe || '') + '</div>' +
+          '</div>';
+      }).join("");
+    }
+  }
 }
 function setSub(url) {
   $("#suburl").value = url || "";
@@ -952,6 +1064,17 @@ function loadStatus(btn) {
   });
 }
 $("#btn-refresh").addEventListener("click", function () { loadStatus(this); });
+var btnDetect = $("#btn-detect-refresh");
+if (btnDetect) {
+  btnDetect.addEventListener("click", function () {
+    busy(this, api("/api/detect"), "探测代理环境").then(function (r) {
+      if (r && r.ok && r.data) {
+        renderDetection(r.data.data || r.data);
+        toast("探测完成");
+      }
+    });
+  });
+}
 
 $("#btn-save").addEventListener("click", function () {
   var ids = checkedIds();
@@ -1289,6 +1412,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                                             "img-src 'self' data:; base-uri 'none'; form-action 'none'")])
             elif path == "/api/status":
                 status = self._handle_status()
+            elif path == "/api/detect":
+                status = self._handle_detect()
             elif path == "/api/links":
                 status = self._handle_links()
             else:
@@ -1362,6 +1487,10 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
     def _handle_status(self):
         """GET /api/status —— 透传 --cli status。"""
         return self._finish_cli(run_cli(["status"]))
+
+    def _handle_detect(self):
+        """GET /api/detect —— 探测服务端已有代理组件与进程。"""
+        return self._finish_cli(run_cli(["detect"]))
 
     def _handle_links(self):
         """GET /api/links —— 优先用 status 的结构化 links，否则调 --cli links 解析。"""

@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.9"
+VERSION="v1.4.0"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -2705,6 +2705,14 @@ status_panel() {
   svc_ok wg-quick@wgcf && echo -e "${PURPLE}  [Enabled] Cloudflare WARP${cRES}"
   svc_ok haproxy && echo -e "${PURPLE}  [Enabled] HAProxy TCP Port Forward${cRES}"
   svc_ok degwd-panel && echo -e "${PURPLE}  [Enabled] Web 控制面板 (端口: $(panel_port))${cRES}"
+  local d_raw; d_raw=$(detect_proxy_servers_json 2>/dev/null || true)
+  if [[ -n $d_raw ]]; then
+    local t_b t_r d_r o_r
+    t_b=$(echo "$d_raw" | jq -r '.summary.total_installed // 0' 2>/dev/null || echo 0)
+    t_r=$(echo "$d_raw" | jq -r '.summary.total_running // 0' 2>/dev/null || echo 0)
+    o_r=$(echo "$d_raw" | jq -r '.summary.third_party_running // 0' 2>/dev/null || echo 0)
+    echo -e "  服务端探测: 已安装 ${GREEN}${t_b}${cRES} 个核心, 运行中 ${GREEN}${t_r}${cRES} 个进程$([[ $o_r -gt 0 ]] && echo -e " (${YELLOW}⚠️ 含 $o_r 个外部已有进程${cRES})")"
+  fi
 }
 
 start_menu() {
@@ -2724,12 +2732,13 @@ start_menu() {
     echo "  7. 节点信息/订阅 (Info + v2rayN 导入示例)"
     echo "  8. Cloudflare 测速"
     [[ $VIRT_TYPE != "container" ]] && echo "  9. 升级内核 (Kernel, Zabbly)"
+    echo "  D. 探测服务器已有代理服务端与占用端口 (Detect Proxy Servers)"
     echo "  P. Web 控制面板管理 (查看完整地址 / 修改端口 / 重启)"
     echo "  C. 终端命令行交互安装 (旧版 CLI 字符界面勾选)"
     echo "  0. 自动更新开关 (AutoUpdate)"
     echo " CTRL+C 退出"
     echo
-    read -rp "请输入数字: " num
+    read -rp "请输入选项: " num
     case $num in
       1) installGWD ;;
       2) updateGWD ;;
@@ -2740,6 +2749,7 @@ start_menu() {
       7) printNode ;;
       8) CFspeedTest ;;
       9) installkernel ;;
+      [Dd]) show_proxy_detection; read -rsp "按任意键返回主菜单..." -n1; echo ;;
       [Pp]) panel_menu ;;
       [Cc]) cli_install_legacy ;;
       0) autoUpdateGWD ;;
@@ -3240,9 +3250,215 @@ panel_menu() {
   done
 }
 
+# -------------------------------------------------- 服务端组件与运行环境自动检测 ---
+# 自动扫描系统内已安装的 v2rayN 支持的核心服务端二进制(Xray/V2Ray/Singbox/Hysteria/TUIC/SS/Trojan/Cloudflared等)
+# 以及当前正在运行的代理进程、配置文件、监听端口，输出结构化 JSON，供终端/Web 面板消费
+detect_proxy_servers_json() {
+  local binaries='[]' running='[]'
+  local bins=(
+    "Xray-core|xray|xray version"
+    "V2Ray-core|v2ray|v2ray version"
+    "Sing-box|sing-box|sing-box version"
+    "Hysteria2|hysteria|hysteria version"
+    "Hysteria2|hy2|hy2 version"
+    "TUIC-server|tuic-server|tuic-server -v"
+    "Shadowsocks|ssserver|ssserver --version"
+    "Shadowsocks|ss-server|ss-server -h"
+    "Trojan-Go|trojan-go|trojan-go -v"
+    "Trojan|trojan|trojan -v"
+    "NaiveProxy|naive|naive --version"
+    "Cloudflared|cloudflared|cloudflared --version"
+    "Snell-server|snell-server|snell-server -v"
+    "Juicity|juicity-server|juicity-server version"
+    "Nginx|nginx|nginx -v"
+    "Caddy|caddy|caddy version"
+    "HAProxy|haproxy|haproxy -v"
+  )
+
+  local seen_names=" "
+  local item bname bcmd bver_cmd bpath bver
+  for item in "${bins[@]}"; do
+    IFS='|' read -r bname bcmd bver_cmd <<< "$item"
+    [[ "$seen_names" == *" $bname "* ]] && continue
+    bpath=$(command -v "$bcmd" 2>/dev/null || true)
+    [[ -z $bpath && -x "/usr/local/bin/$bcmd" ]] && bpath="/usr/local/bin/$bcmd"
+    [[ -z $bpath && -x "/usr/bin/$bcmd" ]] && bpath="/usr/bin/$bcmd"
+    [[ -z $bpath && -x "/opt/$bcmd/$bcmd" ]] && bpath="/opt/$bcmd/$bcmd"
+    if [[ -n $bpath && -x $bpath ]]; then
+      seen_names="$seen_names$bname "
+      bver=$($bver_cmd 2>&1 | head -n2 | grep -oE 'v?[0-9]+(\.[0-9]+)+(-[a-zA-Z0-9.]+)?' | head -n1 || true)
+      [[ -z $bver ]] && bver="已安装"
+      binaries=$(printf '%s' "$binaries" | jq -c \
+        --arg n "$bname" --arg p "$bpath" --arg v "$bver" \
+        '. + [{name:$n, path:$p, version:$v, installed:true}]')
+    fi
+  done
+
+  # 端口映射 PID -> 端口列表 (兼容 mawk / gawk / nawk / busybox)
+  local port_map=""
+  if command -v ss >/dev/null 2>&1; then
+    port_map=$(ss -tulpn -H 2>/dev/null | awk '{
+      proto = $1
+      n = split($5, a, ":")
+      port = a[n]
+      if (match($0, /pid=[0-9]+/)) {
+        pid = substr($0, RSTART + 4, RLENGTH - 4)
+        print pid, port "/" proto
+      }
+    }' | sort -u)
+  fi
+
+  # 扫描代理进程
+  local p_out
+  p_out=$(ps -eo pid,user,args 2>/dev/null | grep -E 'xray|v2ray|sing-box|hysteria|hy2|tuic|trojan|ssserver|ss-server|shadowsocks|naive|cloudflared|snell|juicity' | grep -vE 'grep|panel\.py|python|degwd-panel|bash.*server|detect_test' || true)
+
+  local degwd_count=0 third_count=0
+  while read -r pid u cmd; do
+    [[ -z $pid || ! "$pid" =~ ^[0-9]+$ ]] && continue
+
+    local sname="未知代理"
+    case "$cmd" in
+      *xray*)        sname="Xray-core" ;;
+      *v2ray*)       sname="V2Ray-core" ;;
+      *sing-box*)    sname="Sing-box" ;;
+      *hysteria*|*hy2*) sname="Hysteria2" ;;
+      *tuic*)        sname="TUIC" ;;
+      *trojan*)      sname="Trojan" ;;
+      *ssserver*|*shadowsocks*|*ss-server*) sname="Shadowsocks" ;;
+      *naive*)       sname="NaiveProxy" ;;
+      *cloudflared*) sname="Cloudflared" ;;
+      *snell*)       sname="Snell" ;;
+      *juicity*)     sname="Juicity" ;;
+    esac
+
+    local real_exe=""
+    if [[ -d "/proc/$pid" ]]; then
+      real_exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    fi
+
+    # 如果有该进程的二进制但上面未扫出(如位于 /root/ 或 /opt/ 自定义目录), 补入 binaries
+    if [[ -n $real_exe && "$seen_names" != *" $sname "* ]]; then
+      seen_names="$seen_names$sname "
+      local bver="运行中"
+      binaries=$(printf '%s' "$binaries" | jq -c \
+        --arg n "$sname" --arg p "$real_exe" --arg v "$bver" \
+        '. + [{name:$n, path:$p, version:$v, installed:true, custom_path:true}]')
+    fi
+
+    local conf=""
+    if [[ "$cmd" =~ (-c|-config|--config)[[:space:]]+([^[:space:]]+) ]]; then
+      conf="${BASH_REMATCH[2]}"
+    fi
+
+    local is_degwd=false
+    if [[ "$cmd" == *"/opt/de_GWD"* || "$conf" == *"/opt/de_GWD"* || "$conf" == *"/usr/local/etc/xray"* || "$cmd" == *"/usr/local/bin/xray"* ]]; then
+      is_degwd=true
+      ((degwd_count++)) || true
+    else
+      ((third_count++)) || true
+    fi
+
+    local p_ports=""
+    if [[ -n $port_map ]]; then
+      p_ports=$(awk -v p="$pid" '$1==p {print $2}' <<< "$port_map" | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+    fi
+
+    running=$(printf '%s' "$running" | jq -c \
+      --arg pid "$pid" --arg u "$u" --arg n "$sname" --arg c "$cmd" \
+      --arg exe "$real_exe" --arg cfg "$conf" --arg ports "$p_ports" --argjson degwd "$is_degwd" \
+      '. + [{pid:$pid, user:$u, name:$n, exe:$exe, cmd:$c, config:$cfg, ports:$ports, is_degwd:$degwd}]')
+  done <<< "$p_out"
+
+  local total_bins total_run
+  total_bins=$(printf '%s' "$binaries" | jq 'length')
+  total_run=$(printf '%s' "$running" | jq 'length')
+
+  jq -cn --argjson bins "$binaries" --argjson run "$running" \
+    --argjson t_bins "$total_bins" --argjson t_run "$total_run" \
+    --argjson d_run "$degwd_count" --argjson o_run "$third_count" \
+    '{
+      binaries: $bins,
+      running: $run,
+      summary: {
+        total_installed: $t_bins,
+        total_running: $t_run,
+        degwd_running: $d_run,
+        third_party_running: $o_run,
+        has_third_party: ($o_run > 0)
+      }
+    }'
+}
+
+show_proxy_detection() {
+  local raw
+  raw=$(detect_proxy_servers_json 2>/dev/null || true)
+  [[ -z $raw ]] && { warn "检测服务端环境失败"; return 1; }
+  echo
+  echo -e "${CYAN}=====================================================${cRES}"
+  echo -e "${WHITE}       当前服务器代理服务端与环境自动检测报告       ${cRES}"
+  echo -e "${CYAN}=====================================================${cRES}"
+  echo
+  echo -e "${WHITE}[已安装服务端核心 / 工具]${cRES}"
+  local bcount; bcount=$(echo "$raw" | jq '.binaries | length')
+  if [[ $bcount -eq 0 ]]; then
+    echo -e "  ${GREY}暂未检测到标准代理核心二进制${cRES}"
+  else
+    local i bname bpath bver bcustom
+    for ((i=0; i<bcount; i++)); do
+      bname=$(echo "$raw" | jq -r ".binaries[$i].name")
+      bpath=$(echo "$raw" | jq -r ".binaries[$i].path")
+      bver=$(echo "$raw" | jq -r ".binaries[$i].version")
+      bcustom=$(echo "$raw" | jq -r ".binaries[$i].custom_path // false")
+      if [[ "$bcustom" == "true" ]]; then
+        printf "  ${GREEN}✓${cRES} ${WHITE}%-14s${cRES} : ${YELLOW}%s${cRES} (%s) [自定义/运行中]\n" "$bname" "$bver" "$bpath"
+      else
+        printf "  ${GREEN}✓${cRES} ${WHITE}%-14s${cRES} : ${GREEN}%s${cRES} (%s)\n" "$bname" "$bver" "$bpath"
+      fi
+    done
+  fi
+  echo
+  echo -e "${WHITE}[运行中的代理进程与监听端口]${cRES}"
+  local pcount; pcount=$(echo "$raw" | jq '.running | length')
+  if [[ $pcount -eq 0 ]]; then
+    echo -e "  ${GREY}当前无运行中的代理服务进程${cRES}"
+  else
+    local j pid user name exe cfg ports is_degwd tag
+    for ((j=0; j<pcount; j++)); do
+      pid=$(echo "$raw" | jq -r ".running[$j].pid")
+      user=$(echo "$raw" | jq -r ".running[$j].user")
+      name=$(echo "$raw" | jq -r ".running[$j].name")
+      cfg=$(echo "$raw" | jq -r ".running[$j].config // empty")
+      ports=$(echo "$raw" | jq -r ".running[$j].ports // empty")
+      is_degwd=$(echo "$raw" | jq -r ".running[$j].is_degwd")
+      if [[ "$is_degwd" == "true" ]]; then
+        tag="${GREEN}[本系统托管]${cRES}"
+      else
+        tag="${YELLOW}[⚠️ 第三方/已有脚本]${cRES}"
+      fi
+      echo -e "  ${WHITE}$((j+1)).${cRES} $tag ${WHITE}${name}${cRES} (PID: ${CYAN}${pid}${cRES}, 用户: ${user})"
+      [[ -n $ports ]] && echo -e "     监听端口: ${PURPLE}${ports}${cRES}"
+      [[ -n $cfg ]] && echo -e "     配置文件: ${cfg}"
+    done
+  fi
+  echo
+  local t_bins t_run d_run o_run
+  t_bins=$(echo "$raw" | jq -r '.summary.total_installed // 0')
+  t_run=$(echo "$raw" | jq -r '.summary.total_running // 0')
+  d_run=$(echo "$raw" | jq -r '.summary.degwd_running // 0')
+  o_run=$(echo "$raw" | jq -r '.summary.third_party_running // 0')
+  echo -e "${WHITE}[检测统计]${cRES} 已检出核心: ${GREEN}${t_bins}${cRES} 个 | 运行中进程: ${GREEN}${t_run}${cRES} 个 (系统托管: ${d_run}, 外部已有: ${o_run})"
+  if (( o_run > 0 )); then
+    echo -e "  ${YELLOW}⚠️ 提示: 检测到服务器上正在运行外部已有代理进程并占用了端口。${cRES}"
+    echo -e "     配置本系统协议时请避开以上已被占用的端口，以防冲突启动失败。"
+  fi
+  echo -e "${CYAN}=====================================================${cRES}"
+  echo
+}
+
 # =============================================================== CLI (面板) ====
 # 全部子命令输出单行 JSON, 供 panel.py 调用; 不打印任何交互提示
-#   --cli status                 运行状态 + 协议元数据 + 当前配置
+#   --cli status                 运行状态 + 协议元数据 + 当前配置 + 代理环境检测
+#   --cli detect                 输出服务器代理环境与进程检测 JSON
 #   --cli protos "id1 id2 ..."   设置启用协议并立即生效
 #   --cli links                  输出全部分享链接 (JSON 数组)
 #   --cli regen                  重新生成密钥/path/subtoken 并生效
@@ -3264,6 +3480,8 @@ cli_status() {
   # 一份现成的结构化数据, 没有任何理由不顺手带上。
   local links; links=$(cli_links 2>/dev/null | jq -c '.links // []' 2>/dev/null)
   [[ -z $links ]] && links='[]'
+  local penv; penv=$(detect_proxy_servers_json 2>/dev/null || true)
+  [[ -z $penv ]] && penv='{"binaries":[],"running":[],"summary":{}}'
   jq -cn \
     --arg version "$VERSION" \
     --arg domain "$(conf_get '.domain')" \
@@ -3285,11 +3503,12 @@ cli_status() {
     --argjson protolist "$(proto_table_json)" \
     --argjson links "$links" \
     --argjson cfg "$(cli_cfg_json)" \
+    --argjson proxy_env "$penv" \
     '{version:$version, installed:$installed, domain:$domain, port:$port, uuid:$uuid,
       path:$path, subtoken:$subtoken, suburl:$suburl, panel_path:$panel_path, panel_port:$panel_port,
       protos:$protos, protolist:$protolist, links:$links, cfg:$cfg, warp:$warp,
       sub_on:$sub_on, svc:{xray:$xray, nginx:$nginx, singbox:$singbox},
-      reality_ready:$reality_ready}'
+      reality_ready:$reality_ready, proxy_env:$proxy_env}'
 }
 
 # 协议元数据 -> JSON 数组 (面板据此渲染勾选框)
@@ -3495,6 +3714,7 @@ cli_dispatch() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     status)  cli_status ;;
+    detect)  detect_proxy_servers_json ;;
     protos)  cli_protos "${1:-}" ;;
     links)   cli_links ;;
     regen)   cli_regen ;;
@@ -3513,6 +3733,7 @@ case "${1:-}" in
   --install)       installGWD; exit 0 ;;
   --install-cli)   cli_install_legacy; exit 0 ;;
   --version)       echo "$VERSION"; exit 0 ;;
+  --detect|-d)     show_proxy_detection; exit 0 ;;
   --panel-info)    show_panel_info; exit 0 ;;
   --panel-port)    shift; change_panel_port "${1:-}"; exit 0 ;;
   --panel)         panel_menu; exit 0 ;;
