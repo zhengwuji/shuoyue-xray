@@ -10,7 +10,10 @@ RED='\E[1;31m'; GREEN='\E[1;32m'; YELLOW='\E[1;33m'; CYAN='\E[1;36m'; WHITE='\E[
 REPO="zhengwuji/shuoyue-xray"
 BRANCH="main"
 RAW="https://raw.githubusercontent.com/$REPO/$BRANCH"
-BASE=/opt/de_GWD
+# BASE / 命令落点都可用环境变量覆盖: 与 server / client / client-openwrt / panel.py
+# 的 DEGWD_BASE 保持一致(便于把整套装到自定义路径, 也便于端到端测试时隔离)。
+BASE="${DEGWD_BASE:-/opt/de_GWD}"
+BINDIR_OVERRIDE="${DEGWD_BINDIR:-}"
 
 ok()   { echo -e "${WHITE}[ ${GREEN}✓${WHITE} ]${cRES} $*"; }
 warn() { echo -e "${WHITE}[ ${YELLOW}!${WHITE} ]${cRES} $*"; }
@@ -37,6 +40,10 @@ fi
 BINDIR=""
 pick_bindir() {
   local d
+  if [[ -n $BINDIR_OVERRIDE ]]; then
+    [[ -d $BINDIR_OVERRIDE && -w $BINDIR_OVERRIDE ]] || return 1
+    BINDIR=$BINDIR_OVERRIDE; return 0
+  fi
   for d in /usr/local/bin /usr/bin; do
     [[ -d $d && -w $d ]] && { BINDIR=$d; return 0; }
   done
