@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.6"
+VERSION="v1.3.7"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 

@@ -8,7 +8,7 @@
 #  基于原版 jacyl4/de_GWD (EPL-2.0) 的功能规格重写,全部组件改用官方上游。
 #  LAN 设备将网关与 DNS 指向本机即可生效。仅供学习与研究。
 # =============================================================================
-VERSION="v1.3.6"
+VERSION="v1.3.7"
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
 # 交互式脚本: 不启用 -e(需保留人工交互分支), 但未定义变量与管道错误必须暴露
@@ -194,14 +194,22 @@ fetch_release() {
 
 # ============================================================ 系统基线 =========
 apt_baseline() {
-  cat <<'EOF' >/etc/apt/apt.conf.d/01deGWD
-APT::Get::Assume-Yes "true";
-APT::Install-Recommends "false";
-APT::Install-Suggests "false";
+  # 原实现写持久化 /etc/apt/apt.conf.d/01deGWD 的 APT::Get::Assume-Yes "true":
+  # 该文件对全系统生效, 会让管理员此后所有 apt 操作(含 autoremove)被静默确认。
+  # 改为只在必要处显式加 -y, 并对可能换内核/删包的 full-upgrade 询问(默认 N)。
+  cat <<'EOF' >/etc/apt/apt.conf.d/71debconf
+Dpkg::Options { "--force-confdef"; "--force-confold"; };
 EOF
   echo "debconf debconf/frontend select Noninteractive" | debconf-set-selections
   apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade || warn "系统升级未完全成功(继续安装)"
+  # full-upgrade 可能替换内核/删除软件包, 必须询问
+  local up
+  read -rsp "是否执行系统全面升级(apt full-upgrade)? [y/N]: " -n1 up; echo
+  if [[ "$up" =~ ^[Yy] ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade || warn "系统升级未完全成功(继续安装)"
+  else
+    warn "已跳过系统全面升级"
+  fi
   DEBIAN_FRONTEND=noninteractive apt-get -y -qq autoremove --purge >/dev/null 2>&1 || true
 }
 
@@ -2704,7 +2712,10 @@ EOF
   command -v nmcli >/dev/null 2>&1 && systemctl reload NetworkManager >/dev/null 2>&1
   systemctl enable --now systemd-resolved >/dev/null 2>&1
 
-  # 6. 备份目录与日志保留, 运行数据可选清理
+  # 6. 移除本方案写入的 apt 配置(01deGWD 是旧版遗留, 会静默确认全系统 apt 操作)
+  rm -f /etc/apt/apt.conf.d/01deGWD /etc/apt/apt.conf.d/71debconf
+
+  # 7. 备份目录与日志保留, 运行数据可选清理
   local clean; clean=$(ask "同时删除 $BASE (含 conf.json/节点)? [y/N]: ")
   if [[ $clean == "y" || $clean == "Y" ]]; then
     rm -rf "$BASE"
