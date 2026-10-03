@@ -25,6 +25,8 @@ CLI 契约（由主脚本 server 提供，本文件只消费）::
 """
 
 import argparse
+import base64
+import glob
 import gzip
 import hmac
 import http.cookies
@@ -33,11 +35,13 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 
 # --------------------------------------------------------------------- 常量 ---
 # 基础目录不写死，便于本地调试；部署时保持默认 /opt/de_GWD
@@ -146,6 +150,172 @@ def _clip(text, limit=CLIP):
 def _strip_ansi(text):
     """去掉 ANSI 颜色码。"""
     return ANSI_RE.sub("", text or "")
+
+
+# -------------------------------------------------------- 外部代理链接提取 ---
+def _get_wan_ip():
+    """获取本机出口公网 IP，用于逆向构造第三方代理分享链接。"""
+    try:
+        req = urllib.request.Request(
+            "https://api.ipify.org", headers={"User-Agent": "curl/7.88.1"}
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            ip = resp.read().decode("utf-8").strip()
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                return ip
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "get", "1.1.1.1"], text=True, stderr=subprocess.DEVNULL
+        )
+        m = re.search(r"src\s+([0-9.]+)", out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+def extract_third_party_links(conf_path="", exe_path="", pid=None):
+    """提取检测到的第三方代理服务端原始 v2rayN 节点分享链接。
+
+    策略：
+    1. 优先在进程运行目录、配置文件所在目录检索已导出的节点文本文件（如 jhsub.txt / sub.txt / links.txt 等）；
+    2. 若未找到文本链接文件，则解析其 JSON 配置文件（如 xr.json / config.json），
+       逆向提取 Reality / SS / Trojan / VMess 等入站配置并计算 X25519 公钥还原标准 v2rayN 链接。
+    """
+    links = []
+    seen = set()
+
+    def add_link(l):
+        l = l.strip()
+        if l and l not in seen and re.match(r"^[a-zA-Z0-9]+://", l):
+            seen.add(l)
+            links.append(l)
+
+    # 1. 搜集候选目录
+    candidate_dirs = []
+    if conf_path and os.path.exists(conf_path):
+        candidate_dirs.append(os.path.dirname(os.path.abspath(conf_path)))
+    if exe_path and os.path.exists(exe_path):
+        candidate_dirs.append(os.path.dirname(os.path.abspath(exe_path)))
+    if pid:
+        try:
+            cwd = os.readlink("/proc/%s/cwd" % pid)
+            if os.path.isdir(cwd):
+                candidate_dirs.append(cwd)
+        except Exception:
+            pass
+
+    # 常见外部代理常用部署目录
+    candidate_dirs.extend(["/root/agsbx", "/root", "/etc/xray", "/etc/v2ray", "/etc/sing-box"])
+
+    unique_dirs = []
+    for d in candidate_dirs:
+        if d and os.path.isdir(d) and d not in unique_dirs:
+            unique_dirs.append(d)
+
+    # 2. 检索已知文本链接文件
+    known_filenames = [
+        "jhsub.txt", "sub.txt", "links.txt", "link.txt", "v2ray.txt", "nodes.txt",
+        "subscribe.txt", "sub_list.txt", "url.txt", "urls.txt", "xray.txt"
+    ]
+    for d in unique_dirs:
+        for fname in known_filenames:
+            fpath = os.path.join(d, fname)
+            if os.path.isfile(fpath) and os.path.getsize(fpath) < 2 * 1024 * 1024:
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as fp:
+                        for line in fp:
+                            line = line.strip()
+                            if re.match(r"^(vless|vmess|trojan|ss|hy2|hysteria2|tuic)://", line, re.I):
+                                add_link(line)
+                except Exception:
+                    pass
+
+        if not links:
+            for fpath in glob.glob(os.path.join(d, "*.txt")):
+                if os.path.getsize(fpath) < 1024 * 1024:
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as fp:
+                            for line in fp:
+                                line = line.strip()
+                                if re.match(r"^(vless|vmess|trojan|ss|hy2|hysteria2|tuic)://", line, re.I):
+                                    add_link(line)
+                    except Exception:
+                        pass
+        if links:
+            break
+
+    # 3. 若无文本文件，尝试从配置文件逆向还原
+    if not links and conf_path and os.path.isfile(conf_path):
+        try:
+            with open(conf_path, "r", encoding="utf-8", errors="ignore") as fp:
+                cdata = json.load(fp)
+            wan_ip = _get_wan_ip()
+            inbounds = cdata.get("inbounds", [])
+            if isinstance(cdata.get("inbound"), dict):
+                inbounds.append(cdata["inbound"])
+
+            for inb in inbounds:
+                proto = (inb.get("protocol") or inb.get("type") or "").lower()
+                port = inb.get("port") or inb.get("listen_port")
+                tag = inb.get("tag") or proto
+                stream = inb.get("streamSettings") or inb.get("tls") or {}
+                sec = stream.get("security", "")
+
+                if proto == "vless" and (sec == "reality" or "reality" in inb):
+                    r_settings = stream.get("realitySettings") or inb.get("reality", {})
+                    priv_key = r_settings.get("privateKey", "")
+                    pbk = ""
+                    if priv_key:
+                        candidates = [exe_path, "xray", "/usr/local/bin/xray", "/usr/bin/xray", "/root/agsbx/xray"]
+                        for xc in candidates:
+                            if xc and (os.path.exists(xc) or shutil.which(xc)):
+                                try:
+                                    out = subprocess.check_output(
+                                        [xc, "x25519", "-i", priv_key], text=True, stderr=subprocess.DEVNULL
+                                    )
+                                    m = re.search(r"(?:Public key|PublicKey|Password \(PublicKey\)):\s*([^\s]+)", out, re.I)
+                                    if m:
+                                        pbk = m.group(1).strip()
+                                        break
+                                except Exception:
+                                    pass
+
+                    clients = inb.get("settings", {}).get("clients", [])
+                    uuid_str = clients[0].get("id", "") if clients else ""
+                    flow = clients[0].get("flow", "") if clients else ""
+                    snis = r_settings.get("serverNames", [""])
+                    sni = snis[0] if snis else ""
+                    sids = r_settings.get("shortIds", [""])
+                    sid = sids[0] if sids else ""
+                    net = stream.get("network", "tcp")
+                    if uuid_str and port and pbk:
+                        flow_str = ("&flow=%s" % flow) if flow else ""
+                        link = ("vless://%s@%s:%s?security=reality&encryption=none&pbk=%s&headerType=none"
+                                "&fp=chrome&type=%s%s&sni=%s&sid=%s#%s" %
+                                (uuid_str, wan_ip, port, pbk, net, flow_str, sni, sid, tag))
+                        add_link(link)
+                elif proto in ("shadowsocks", "ss"):
+                    settings = inb.get("settings", inb)
+                    method = settings.get("method", "")
+                    pwd = settings.get("password", "")
+                    if method and pwd and port:
+                        b64_cred = base64.b64encode(("%s:%s" % (method, pwd)).encode()).decode()
+                        link = "ss://%s@%s:%s#%s" % (b64_cred, wan_ip, port, tag)
+                        add_link(link)
+                elif proto == "trojan":
+                    clients = inb.get("settings", {}).get("clients", [])
+                    pwd = clients[0].get("password", "") if clients else inb.get("password", "")
+                    if pwd and port:
+                        link = "trojan://%s@%s:%s#%s" % (pwd, wan_ip, port, tag)
+                        add_link(link)
+        except Exception:
+            pass
+
+    return links
 
 
 # -------------------------------------------------------------- conf.json IO ---
@@ -517,6 +687,17 @@ transition:opacity .2s;z-index:9;max-width:90vw}
 .phead .p-title{font-weight:600;font-size:13px}
 .ports-tag{font-family:ui-monospace,Consolas,monospace;background:#162436;color:#58a6ff;border:1px solid #388bfd44;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600}
 .cmd-box{background:#0d1117;border:1px solid var(--bd);border-radius:6px;padding:6px 8px;margin-top:6px;font-family:ui-monospace,Consolas,monospace;font-size:11px;word-break:break-all;color:#8b949e}
+.tp-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.tp-links-box{margin-top:8px;padding:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px}
+.tp-link-row{display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:11px}
+.tp-link-row:last-child{margin-bottom:0}
+.tp-link-input{flex:1;background:#161b22;border:1px solid #30363d;color:#c9d1d9;padding:4px 8px;border-radius:4px;font-family:ui-monospace,Consolas,monospace;font-size:11px}
+.mini-btn{padding:3px 8px;font-size:11px;border-radius:4px;cursor:pointer;border:1px solid var(--bd);background:var(--panel2);color:var(--fg)}
+.mini-btn:hover{border-color:var(--acc);color:var(--acc)}
+.mini-btn.stop{border-color:rgba(210,153,34,.5);color:#e3b341}
+.mini-btn.stop:hover{background:rgba(210,153,34,.15)}
+.mini-btn.uninstall{border-color:rgba(248,81,73,.5);color:#f85149}
+.mini-btn.uninstall:hover{background:rgba(248,81,73,.15)}
 </style>
 </head>
 <body>
@@ -900,6 +1081,25 @@ function renderDetection(env) {
       pHost.innerHTML = '<div class="dim">当前无运行中的代理服务进程。</div>';
     } else {
       pHost.innerHTML = procs.map(function (p, idx) {
+        var linksHtml = '';
+        if (!p.is_degwd && Array.isArray(p.links) && p.links.length > 0) {
+          linksHtml = '<div class="tp-links-box">' +
+            '<div style="font-weight:600;color:#58a6ff;margin-bottom:6px">📋 提取到的原 v2rayN 节点链接 (' + p.links.length + ' 个)：</div>' +
+            p.links.map(function (lk) {
+              return '<div class="tp-link-row">' +
+                '<input type="text" readonly class="tp-link-input" value="' + esc(lk) + '">' +
+                '<button type="button" class="mini-btn copy-tp-link" data-link="' + esc(lk) + '">复制</button>' +
+              '</div>';
+            }).join('') +
+          '</div>';
+        }
+        var actHtml = '';
+        if (!p.is_degwd) {
+          actHtml = '<div class="tp-actions">' +
+            '<button type="button" class="mini-btn stop" data-kill-action="stop" data-pid="' + esc(p.pid) + '" data-name="' + esc(p.name) + '" data-exe="' + esc(p.exe || '') + '" data-config="' + esc(p.config || '') + '">🛑 一键停止进程 (释放端口)</button>' +
+            '<button type="button" class="mini-btn uninstall" data-kill-action="uninstall" data-pid="' + esc(p.pid) + '" data-name="' + esc(p.name) + '" data-exe="' + esc(p.exe || '') + '" data-config="' + esc(p.config || '') + '">🗑️ 一键彻底卸载清理</button>' +
+          '</div>';
+        }
         return '<div class="proc-card ' + (p.is_degwd ? '' : 'third-party') + '">' +
           '<div class="phead">' +
             '<span class="p-title">#' + (idx + 1) + ' ' + esc(p.name) + '</span>' +
@@ -910,6 +1110,8 @@ function renderDetection(env) {
           '</div>' +
           (p.config ? '<div style="margin:2px 0"><span class="dim">配置文件: </span><code>' + esc(p.config) + '</code></div>' : '') +
           '<div class="cmd-box">' + esc(p.cmd || p.exe || '') + '</div>' +
+          linksHtml +
+          actHtml +
           '</div>';
       }).join("");
     }
@@ -1167,6 +1369,38 @@ $("#btn-genuuid").addEventListener("click", function () {
     "-" + hex.slice(16, 20) + "-" + hex.slice(20);
   toast("已生成新 UUID（记得点「保存全局配置」）");
 });
+
+var dProcs = $("#detect-procs");
+if (dProcs) {
+  dProcs.addEventListener("click", function (e) {
+    var copyBtn = e.target.closest(".copy-tp-link");
+    if (copyBtn) {
+      var lk = copyBtn.getAttribute("data-link");
+      if (lk) { copyText(lk, copyBtn); }
+      return;
+    }
+    var actBtn = e.target.closest("[data-kill-action]");
+    if (actBtn) {
+      var action = actBtn.getAttribute("data-kill-action");
+      var pid = actBtn.getAttribute("data-pid");
+      var name = actBtn.getAttribute("data-name") || "外部代理服务";
+      var exe = actBtn.getAttribute("data-exe") || "";
+      var cfg = actBtn.getAttribute("data-config") || "";
+      var tip = action === "uninstall" ?
+        "【警告】确定要彻底卸载外部代理组件「" + name + "」(PID: " + pid + ") 吗？\n将停止运行并安全清理其配置文件，释放占用端口。" :
+        "确定要停止外部代理进程「" + name + "」(PID: " + pid + ") 并立即释放其占用的端口吗？";
+      if (!confirm(tip)) { return; }
+      busy(actBtn, api("/api/kill_third_party", "POST", {
+        action: action, pid: pid, name: name, exe: exe, config: cfg
+      }), action === "uninstall" ? "正在卸载…" : "正在停止…").then(function (r) {
+        if (r && r.ok) {
+          toast(r.data && r.data.message ? r.data.message : "操作成功");
+          loadStatus();
+        }
+      });
+    }
+  });
+}
 
 /* --------------------------------------------------------------- 初始化 */
 renderProtos();
@@ -1440,7 +1674,7 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 status = self._send_error_json(403, "CSRF 校验失败: %s" % reason)
                 return
             if path not in ("/api/protos", "/api/cfg", "/api/regen", "/api/reset",
-                            "/api/warp", "/api/sub"):
+                            "/api/warp", "/api/sub", "/api/kill_third_party"):
                 self._drain_body()
                 status = self._send_error_json(404, "路径不存在")
                 return
@@ -1458,6 +1692,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 status = self._handle_switch(body, "sub")
             elif path == "/api/regen":
                 status = self._handle_simple(["regen"])
+            elif path == "/api/kill_third_party":
+                status = self._handle_kill_third_party(body)
             else:
                 status = self._handle_simple(["reset"])
         except Exception as exc:
@@ -1605,6 +1841,26 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             return self._finish_cli(run_cli(["warp", action]))
         return self._finish_cli(run_cli(["sub", action]))
 
+    def _handle_kill_third_party(self, body):
+        """POST /api/kill_third_party —— 一键停止或卸载外部第三方代理进程。"""
+        if not isinstance(body, dict):
+            return self._send_error_json(400, "请求体必须是 JSON 对象")
+        action = str(body.get("action") or "stop").strip().lower()
+        if action not in ("stop", "uninstall"):
+            return self._send_error_json(400, "无效的操作类型: %s" % action)
+        pid = body.get("pid")
+        if not pid or not str(pid).isdigit():
+            return self._send_error_json(400, "无效的 PID")
+
+        payload = json.dumps({
+            "action": action,
+            "pid": int(pid),
+            "name": str(body.get("name") or ""),
+            "exe": str(body.get("exe") or ""),
+            "config": str(body.get("config") or ""),
+        })
+        return self._finish_cli(run_cli(["kill_tp", payload]))
+
 
 # ------------------------------------------------------------------- 启动 ---
 def serve(bind, port, token, path):
@@ -1668,9 +1924,19 @@ def main(argv=None):
                         help="打印 PANEL_TOKEN/PANEL_PATH/PANEL_BIND/PANEL_PORT 后退出")
     parser.add_argument("--check", action="store_true",
                         help="自检：读取 conf.json 并调用一次 --cli status")
+    parser.add_argument("--extract-links", nargs="*", default=None,
+                        help="提取第三方代理的原始 v2rayN 分享链接")
     parser.add_argument("--bind", default=None, help="监听地址（默认 0.0.0.0）")
     parser.add_argument("--port", type=int, default=None, help="监听端口（默认 3000）")
     args = parser.parse_args(argv)
+
+    if args.extract_links is not None:
+        conf_p = args.extract_links[0] if len(args.extract_links) > 0 else ""
+        exe_p = args.extract_links[1] if len(args.extract_links) > 1 else ""
+        pid_val = args.extract_links[2] if len(args.extract_links) > 2 else None
+        links = extract_third_party_links(conf_p, exe_p, pid_val)
+        print(json.dumps(links, ensure_ascii=False))
+        return 0
 
     try:
         token, path, default_port = ensure_panel_secrets()

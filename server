@@ -131,7 +131,7 @@ proto_field() {   # $1=id $2=字段序号(1..6)
 }
 proto_name()         { proto_field "$1" 2; }
 proto_kernel()       { proto_field "$1" 3; }
-proto_port()         { proto_field "$1" 4; }
+proto_port()         { local def; def=$(proto_field "$1" 4); effective_proto_port "$1" "$def"; }
 proto_needs_domain() { proto_field "$1" 5; }
 proto_desc()         { proto_field "$1" 6; }
 proto_valid()        { [[ -n $(proto_name "$1") ]]; }
@@ -285,6 +285,98 @@ conf_raw() {   # $1=路径 $2=单个 JSON 值
   printf '%s' "$compact" > "$cf"; chmod 600 "$cf"
   conf_write "$1 = \$c[0]" --slurpfile c "$cf"
   local rc=$?; rm -f "$cf"; return $rc
+}
+
+# ---------------------------------------------------- 端口冲突检测与智能避让 ---
+# 判断指定端口是否已被外部/第三方程序占用 (排除本系统自用组件进程)
+is_port_occupied_by_third_party() {
+  local p="$1"
+  [[ -z $p || ! "$p" =~ ^[0-9]+$ ]] && return 1
+  command -v ss >/dev/null 2>&1 || return 1
+  local line
+  line=$(ss -tulpn -H "( sport = :$p )" 2>/dev/null || true)
+  [[ -z $line ]] && return 1
+
+  # 排除属于 de_GWD 自身服务的特征
+  if echo "$line" | grep -qE '/opt/de_GWD|degwd-panel|xray.*de_GWD'; then
+    return 1
+  fi
+  local pid
+  pid=$(echo "$line" | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2 || true)
+  if [[ -n $pid && -d "/proc/$pid" ]]; then
+    local exe cgroup
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    cgroup=$(cat "/proc/$pid/cgroup" 2>/dev/null || true)
+    if [[ "$exe" == *"/opt/de_GWD"* || "$cgroup" == *"degwd-"* ]]; then
+      return 1
+    fi
+    if [[ "$cgroup" == *"xray.service"* || "$cgroup" == *"sing-box.service"* || "$cgroup" == *"nginx.service"* ]]; then
+      if [[ "$exe" == *"/usr/local/bin/xray"* || "$exe" == *"/usr/local/bin/sing-box"* || "$exe" == *"/usr/sbin/nginx"* ]]; then
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+# 寻找下一个空闲且不冲突的可用端口 (从 base+10000 开始扫描)
+find_next_free_port() {
+  local base_port="$1"
+  local candidate=$(( base_port + 10000 ))
+  (( candidate > 60000 )) && candidate=20000
+  local max_try=200 i=0
+  while (( i < max_try )); do
+    local used=""
+    if command -v ss >/dev/null 2>&1; then
+      used=$(ss -tulpn -H "( sport = :$candidate )" 2>/dev/null || true)
+    fi
+    if [[ -z $used && $RESERVED_PORTS != *" $candidate "* ]]; then
+      echo "$candidate"
+      return 0
+    fi
+    ((candidate++))
+    ((i++))
+  done
+  echo "$base_port"
+}
+
+# 动态获取协议的实际可用端口 (第三方冲突时自动智能避让)
+effective_proto_port() {
+  local id="$1"
+  local def="$2"
+  case "$id" in
+    vmess|vless|trojan|wsenc|trojanws)
+      conf_get '.port // 443'
+      return 0
+      ;;
+  esac
+
+  if [[ "$id" == "reality" ]]; then
+    local rp
+    rp=$(conf_get '.reality.port')
+    if [[ -n $rp && "$rp" != "null" && "$rp" != "8443" ]]; then
+      def="$rp"
+    fi
+  fi
+
+  local saved
+  saved=$(conf_get ".proto_ports[\"$id\"]")
+  if [[ -n $saved && "$saved" != "null" && "$saved" =~ ^[0-9]+$ ]]; then
+    if ! is_port_occupied_by_third_party "$saved"; then
+      echo "$saved"
+      return 0
+    fi
+  fi
+
+  if is_port_occupied_by_third_party "$def"; then
+    local new_port
+    new_port=$(find_next_free_port "$def")
+    conf_raw ".proto_ports[\"$id\"]" "$new_port"
+    echo "$new_port"
+    return 0
+  fi
+
+  echo "$def"
 }
 
 # ------------------------------------------------ GitHub release downloader ---
@@ -1520,22 +1612,24 @@ xray_inbound_trojan_ws() {
     sniffing: { enabled: true, destOverride: ["http","tls"] } }'
 }
 xray_inbound_trojan_tcp() {
-  local cert key; read -r cert key _ <<< "$(tls_cert_pair)"
-  jq -n --arg id "$(conf_get '.uuids[0]')" --arg c "$cert" --arg k "$key" '{
-    listen: "0.0.0.0", port: 8442, protocol: "trojan",
+  local cert key port; read -r cert key _ <<< "$(tls_cert_pair)"
+  port=$(proto_port trojantcp)
+  jq -n --arg id "$(conf_get '.uuids[0]')" --arg c "$cert" --arg k "$key" --argjson port "$port" '{
+    listen: "0.0.0.0", port: $port, protocol: "trojan",
     settings: { clients: [{ password: $id }] },
     streamSettings: { network: "tcp", security: "tls",
       tlsSettings: { certificates: [{ certificateFile: $c, keyFile: $k }] } },
     sniffing: { enabled: true, destOverride: ["http","tls"] } }'
 }
 xray_inbound_ss() {
-  jq -n --arg pw "$(ss2022_key)" '{
-    listen: "0.0.0.0", port: 8388, protocol: "shadowsocks",
+  local port; port=$(proto_port ss)
+  jq -n --arg pw "$(ss2022_key)" --argjson port "$port" '{
+    listen: "0.0.0.0", port: $port, protocol: "shadowsocks",
     settings: { method: "2022-blake3-aes-128-gcm", password: $pw, network: "tcp,udp" } }'
 }
 xray_inbound_reality() {   # VLESS + Reality (免域名)
   local port priv uuids
-  port=$(conf_get '.reality.port'); priv=$(conf_get '.reality.private')
+  port=$(proto_port reality); priv=$(conf_get '.reality.private')
   uuids=$(conf_get '.uuids[]')
   local clients="[]"
   clients=$(echo "$uuids" | while read -r u; do
@@ -1587,8 +1681,9 @@ xray_inbound_trojan_ws2() {
 
 # SOCKS5(用户名密码)
 xray_inbound_socks5() {
-  jq -n --arg u "$(conf_get '.uuids[0]' | cut -c1-8)" --arg p "$(conf_get '.uuids[0]')" '{
-    listen: "0.0.0.0", port: 1080, protocol: "socks",
+  local port; port=$(proto_port socks5)
+  jq -n --arg u "$(conf_get '.uuids[0]' | cut -c1-8)" --arg p "$(conf_get '.uuids[0]')" --argjson port "$port" '{
+    listen: "0.0.0.0", port: $port, protocol: "socks",
     settings: { auth: "password", accounts: [{ user: $u, pass: $p }], udp: true },
     sniffing: { enabled: true, destOverride: ["http","tls","quic"] } }'
 }
@@ -1780,13 +1875,15 @@ singbox_gen_config() {
   local inb="[]"
   if proto_on hy2; then
     inb=$(jq -n --argjson a "$inb" --arg c "$cert" --arg k "$key" --arg pw "$(conf_get '.uuids[0]')" \
-      '$a + [{type:"hysteria2", tag:"hy2-in", listen:"::", listen_port:8444,
+      --argjson p "$(proto_port hy2)" \
+      '$a + [{type:"hysteria2", tag:"hy2-in", listen:"::", listen_port:$p,
               users:[{name:"u1", password:$pw}],
               tls:{enabled:true, certificate_path:$c, key_path:$k}}]')
   fi
   if proto_on tuic; then
     inb=$(jq -n --argjson a "$inb" --arg c "$cert" --arg k "$key" --arg id "$(conf_get '.uuids[0]')" \
-      '$a + [{type:"tuic", tag:"tuic-in", listen:"::", listen_port:8445,
+      --argjson p "$(proto_port tuic)" \
+      '$a + [{type:"tuic", tag:"tuic-in", listen:"::", listen_port:$p,
               users:[{name:"u1", uuid:$id, password:$id}],
               congestion_control:"bbr", zero_rtt_handshake:false,
               tls:{enabled:true, alpn:["h3"], certificate_path:$c, key_path:$k}}]')
@@ -1794,23 +1891,24 @@ singbox_gen_config() {
   if proto_on anytls; then
     # 注意: anytls 只认 users[] , 顶层 password 字段会被 sing-box 拒绝
     inb=$(jq -n --argjson a "$inb" --arg c "$cert" --arg k "$key" --arg pw "$(conf_get '.uuids[0]')" \
-      '$a + [{type:"anytls", tag:"atls-in", listen:"::", listen_port:8446,
+      --argjson p "$(proto_port anytls)" \
+      '$a + [{type:"anytls", tag:"atls-in", listen:"::", listen_port:$p,
               users:[{name:"u1", password:$pw}],
               tls:{enabled:true, certificate_path:$c, key_path:$k}}]')
   fi
   if proto_on naive; then
     # naive inbound: users 字段名是 username (不是 name); 不限定 network, 让 h2/h3 都可用
     inb=$(jq -n --argjson a "$inb" --arg c "$cert" --arg k "$key" --arg u "$(uuid6 "$(conf_get '.uuids[0]')")" \
-                --arg pw "$(conf_get '.uuids[0]')" \
-      '$a + [{type:"naive", tag:"naive-in", listen:"::", listen_port:8447,
+                --arg pw "$(conf_get '.uuids[0]')" --argjson p "$(proto_port naive)" \
+      '$a + [{type:"naive", tag:"naive-in", listen:"::", listen_port:$p,
               users:[{username:$u, password:$pw}],
               quic_congestion_control:"bbr",
               tls:{enabled:true, alpn:["h2","http/1.1"], certificate_path:$c, key_path:$k}}]')
   fi
   if proto_on sssb; then
     # SS2022 口令必须是 16 字节 base64, 不能拿 UUID 顶替(否则 sing-box 启动即报错)
-    inb=$(jq -n --argjson a "$inb" --arg pw "$(ss2022_key)" \
-      '$a + [{type:"shadowsocks", tag:"sssb-in", listen:"::", listen_port:8452,
+    inb=$(jq -n --argjson a "$inb" --arg pw "$(ss2022_key)" --argjson p "$(proto_port sssb)" \
+      '$a + [{type:"shadowsocks", tag:"sssb-in", listen:"::", listen_port:$p,
               method:"2022-blake3-aes-128-gcm", password:$pw}]')
   fi
   if proto_on anyreality; then
@@ -1820,7 +1918,8 @@ singbox_gen_config() {
       rsid=$(conf_get '.reality.shortid'); rdst=$(conf_get '.reality.dest'); rsni=$(conf_get '.reality.sni')
       inb=$(jq -n --argjson a "$inb" --arg priv "$rpriv" --arg dest "$rdst" \
                   --arg sni "$rsni" --arg sid "$rsid" --arg id "$(conf_get '.uuids[0]')" \
-        '$a + [{type:"vless", tag:"anyreality-in", listen:"::", listen_port:8451,
+                  --argjson p "$(proto_port anyreality)" \
+        '$a + [{type:"vless", tag:"anyreality-in", listen:"::", listen_port:$p,
                 users:[{name:"u1", uuid:$id, flow:"xtls-rprx-vision"}],
                 tls:{enabled:true, server_name:$sni,
                      reality:{enabled:true, handshake:{server:$dest, server_port:443},
@@ -1899,7 +1998,7 @@ gen_links() {
     emit_link trojanws "trojan://$uuid0@$host:$port?security=tls&sni=$host&type=ws&host=$host&path=/tw-$u6#trojan-ws2"
   fi
   if proto_on trojantcp; then
-    emit_link trojantcp "trojan://$uuid0@$host:8442?security=tls&sni=$host&type=tcp#trojan-tcp"
+    emit_link trojantcp "trojan://$uuid0@$host:$(proto_port trojantcp)?security=tls&sni=$host&type=tcp#trojan-tcp"
   fi
   # ---- VLESS + WebSocket + VLESS 加密 -------------------------------------
   if proto_on wsenc; then
@@ -1910,14 +2009,14 @@ gen_links() {
   if proto_on ss; then
     local sk; sk=$(ss2022_key)
     local sup; sup=$(printf %s "2022-blake3-aes-128-gcm:$sk" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-    emit_link ss "ss://$sup@$host:8388#shadowsocks-2022"
+    emit_link ss "ss://$sup@$host:$(proto_port ss)#shadowsocks-2022"
   fi
   if proto_on socks5; then
-    emit_link socks5 "socks://$(printf %s "$(socks5_user):$uuid0" | base64 -w0 | tr '+/' '-_' | tr -d '=')@$host:1080#socks5"
+    emit_link socks5 "socks://$(printf %s "$(socks5_user):$uuid0" | base64 -w0 | tr '+/' '-_' | tr -d '=')@$host:$(proto_port socks5)#socks5"
   fi
   if proto_on reality && [[ -n $(conf_get '.reality.public') ]]; then
     local rp pbk sni sid
-    rp=$(conf_get '.reality.port'); pbk=$(conf_get '.reality.public')
+    rp=$(proto_port reality); pbk=$(conf_get '.reality.public')
     sni=$(conf_get '.reality.sni'); sid=$(conf_get '.reality.shortid')
     emit_link reality "vless://$uuid0@$host:$rp?security=reality&encryption=none&pbk=$pbk&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=$sni&sid=$sid#reality"
   fi
@@ -1944,21 +2043,21 @@ gen_links() {
   fi
   # ---- sing-box 系 --------------------------------------------------------
   if proto_on hy2; then
-    emit_link hy2 "hysteria2://$uuid0@$host:8444?sni=$host&insecure=$insc#hysteria2"
+    emit_link hy2 "hysteria2://$uuid0@$host:$(proto_port hy2)?sni=$host&insecure=$insc#hysteria2"
   fi
   if proto_on tuic; then
-    emit_link tuic "tuic://$uuid0:$uuid0@$host:8445?congestion_control=bbr&alpn=h3&sni=$host&allow_insecure=$insc#tuic"
+    emit_link tuic "tuic://$uuid0:$uuid0@$host:$(proto_port tuic)?congestion_control=bbr&alpn=h3&sni=$host&allow_insecure=$insc#tuic"
   fi
   if proto_on anytls; then
-    emit_link anytls "anytls://$uuid0@$host:8446?sni=$host&insecure=$insc#anytls"
+    emit_link anytls "anytls://$uuid0@$host:$(proto_port anytls)?sni=$host&insecure=$insc#anytls"
   fi
   if proto_on naive; then
-    emit_link naive "naive://$(urlenc "$(uuid6 "$uuid0"):$uuid0")@$host:8447?sni=$host&insecure=$insc#naive"
+    emit_link naive "naive://$(urlenc "$(uuid6 "$uuid0"):$uuid0")@$host:$(proto_port naive)?sni=$host&insecure=$insc#naive"
   fi
   if proto_on sssb; then
     local sk2; sk2=$(ss2022_key)
     local sup2; sup2=$(printf %s "2022-blake3-aes-128-gcm:$sk2" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-    emit_link sssb "ss://$sup2@$host:8452#ss2022-sb"
+    emit_link sssb "ss://$sup2@$host:$(proto_port sssb)#ss2022-sb"
   fi
   if proto_on anyreality && [[ -n $(conf_get '.reality.public') ]]; then
     local ap pbk3 sni3 sid3
@@ -3363,10 +3462,27 @@ detect_proxy_servers_json() {
       p_ports=$(awk -v p="$pid" '$1==p {print $2}' <<< "$port_map" | tr '\n' ',' | sed 's/,$//; s/,/, /g')
     fi
 
+    local links='[]'
+    if [[ "$is_degwd" != "true" ]]; then
+      local py_cmd=""
+      if [[ -f "$PANEL_PY" ]]; then
+        py_cmd="$PANEL_PY"
+      elif [[ -f "$(dirname "$0")/panel.py" ]]; then
+        py_cmd="$(dirname "$0")/panel.py"
+      elif [[ -f "$BASE/panel.py" ]]; then
+        py_cmd="$BASE/panel.py"
+      fi
+      if [[ -n $py_cmd ]] && command -v python3 >/dev/null 2>&1; then
+        links=$(python3 "$py_cmd" --extract-links "$conf" "$real_exe" "$pid" 2>/dev/null || echo '[]')
+        [[ -z $links || "$links" != \[*\] ]] && links='[]'
+      fi
+    fi
+
     running=$(printf '%s' "$running" | jq -c \
       --arg pid "$pid" --arg u "$u" --arg n "$sname" --arg c "$cmd" \
       --arg exe "$real_exe" --arg cfg "$conf" --arg ports "$p_ports" --argjson degwd "$is_degwd" \
-      '. + [{pid:$pid, user:$u, name:$n, exe:$exe, cmd:$c, config:$cfg, ports:$ports, is_degwd:$degwd}]')
+      --argjson links "$links" \
+      '. + [{pid:$pid, user:$u, name:$n, exe:$exe, cmd:$c, config:$cfg, ports:$ports, is_degwd:$degwd, links:$links}]')
   done <<< "$p_out"
 
   local total_bins total_run
@@ -3438,6 +3554,18 @@ show_proxy_detection() {
       echo -e "  ${WHITE}$((j+1)).${cRES} $tag ${WHITE}${name}${cRES} (PID: ${CYAN}${pid}${cRES}, 用户: ${user})"
       [[ -n $ports ]] && echo -e "     监听端口: ${PURPLE}${ports}${cRES}"
       [[ -n $cfg ]] && echo -e "     配置文件: ${cfg}"
+      if [[ "$is_degwd" != "true" ]]; then
+        local lcount; lcount=$(echo "$raw" | jq ".running[$j].links | length // 0")
+        if (( lcount > 0 )); then
+          echo -e "     ${CYAN}提取到的原 v2rayN 链接:${cRES}"
+          local k lk
+          for ((k=0; k<lcount; k++)); do
+            lk=$(echo "$raw" | jq -r ".running[$j].links[$k]")
+            echo -e "       ${GREEN}●${cRES} ${WHITE}${lk}${cRES}"
+          done
+        fi
+        echo -e "     ${YELLOW}👉 释放端口或卸载: 运行 bash server --kill-tp stop ${pid} (或 uninstall) / 亦可在 Web 面板一键操作${cRES}"
+      fi
     done
   fi
   echo
@@ -3449,10 +3577,122 @@ show_proxy_detection() {
   echo -e "${WHITE}[检测统计]${cRES} 已检出核心: ${GREEN}${t_bins}${cRES} 个 | 运行中进程: ${GREEN}${t_run}${cRES} 个 (系统托管: ${d_run}, 外部已有: ${o_run})"
   if (( o_run > 0 )); then
     echo -e "  ${YELLOW}⚠️ 提示: 检测到服务器上正在运行外部已有代理进程并占用了端口。${cRES}"
-    echo -e "     配置本系统协议时请避开以上已被占用的端口，以防冲突启动失败。"
+    echo -e "     配置本系统协议时系统会自动检测避开冲突端口，亦可点击一键停止/卸载以释放原端口。"
   fi
   echo -e "${CYAN}=====================================================${cRES}"
   echo
+}
+
+# ------------------------------------------------ 外部第三方代理一键停止 / 卸载 ---
+stop_or_uninstall_third_party() {
+  local action="${1:-stop}"
+  local target_pid="${2:-}"
+  local target_name="${3:-}"
+  local target_exe="${4:-}"
+  local target_conf="${5:-}"
+
+  # 如果是 JSON 格式传参 (如 cli_kill_tp 转发)
+  if [[ "$action" =~ ^\{.*\}$ ]]; then
+    local json="$action"
+    action=$(echo "$json" | jq -r '.action // "stop"')
+    target_pid=$(echo "$json" | jq -r '.pid // ""')
+    target_name=$(echo "$json" | jq -r '.name // ""')
+    target_exe=$(echo "$json" | jq -r '.exe // ""')
+    target_conf=$(echo "$json" | jq -r '.config // ""')
+  fi
+
+  [[ -z $target_pid || ! "$target_pid" =~ ^[0-9]+$ ]] && {
+    cli_json '{"ok":false,"error":"无效的 PID"}'
+    return 1
+  }
+
+  # 安全防御保护：绝对禁止停止或误删系统核心服务、面板自身
+  if [[ "$target_exe" == *"/opt/de_GWD"* || ("$target_exe" == *"python"* && "$target_conf" == *"panel.py"*) ]]; then
+    cli_json '{"ok":false,"error":"不能终止系统自身的面板管理进程"}'
+    return 1
+  fi
+  if [[ "$target_pid" -eq 1 || "$target_exe" == *"/sbin/init"* || "$target_exe" == *"sshd"* ]]; then
+    cli_json '{"ok":false,"error":"受系统保护的关键系统服务不可终止"}'
+    return 1
+  fi
+
+  # 1. 查找是否存在 systemd 单元管理此进程
+  local svc_found=""
+  if [[ -f "/proc/$target_pid/cgroup" ]]; then
+    svc_found=$(grep -oE '[a-zA-Z0-9@_-]+\.service' "/proc/$target_pid/cgroup" | head -n1 || true)
+  fi
+  if [[ -z $svc_found && -n $target_exe ]]; then
+    local bname; bname=$(basename "$target_exe")
+    svc_found=$(grep -l -E "ExecStart=.*$bname" /etc/systemd/system/*.service 2>/dev/null | head -n1 | xargs -r basename 2>/dev/null || true)
+  fi
+
+  # 2. 若存在 systemd 单元，执行 stop（若卸载则 disable 并清理 unit）
+  if [[ -n $svc_found ]]; then
+    systemctl stop "$svc_found" >/dev/null 2>&1 || true
+    if [[ "$action" == "uninstall" ]]; then
+      systemctl disable "$svc_found" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/$svc_found" "/etc/systemd/system/multi-user.target.wants/$svc_found" 2>/dev/null || true
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 3. 确保进程退出并释放端口
+  if [[ -d "/proc/$target_pid" ]]; then
+    kill -15 "$target_pid" >/dev/null 2>&1 || true
+    sleep 0.3
+    if [[ -d "/proc/$target_pid" ]]; then
+      kill -9 "$target_pid" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 4. 彻底卸载时的文件安全清理 (严格防误删)
+  local cleaned_files='[]'
+  if [[ "$action" == "uninstall" ]]; then
+    local pdir=""
+    if [[ -n $target_conf && -f $target_conf ]]; then
+      pdir=$(dirname "$target_conf")
+    elif [[ -n $target_exe && -f $target_exe ]]; then
+      pdir=$(dirname "$target_exe")
+    fi
+
+    if [[ -n $pdir && -d $pdir ]]; then
+      pdir=$(readlink -f "$pdir" 2>/dev/null || echo "$pdir")
+      case "$pdir" in
+        /|/root|/root/|/usr|/usr/bin|/usr/local|/usr/local/bin|/etc|/var|/opt|/tmp|/home)
+          # 顶级或系统目录：绝不删除整目录！仅删除特定二进制与配置
+          if [[ -n $target_exe && -f $target_exe && "$target_exe" != *"/opt/de_GWD"* ]]; then
+            rm -f "$target_exe" 2>/dev/null || true
+            cleaned_files=$(printf '%s' "$cleaned_files" | jq -c --arg f "$target_exe" '. + [$f]')
+          fi
+          if [[ -n $target_conf && -f $target_conf && "$target_conf" != *"/opt/de_GWD"* ]]; then
+            rm -f "$target_conf" 2>/dev/null || true
+            cleaned_files=$(printf '%s' "$cleaned_files" | jq -c --arg f "$target_conf" '. + [$f]')
+          fi
+          ;;
+        *)
+          # 专属自定义子目录 (如 /root/agsbx, /etc/xray 等)
+          if [[ "$pdir" =~ ^/(root|opt|etc|var|usr/local)/[a-zA-Z0-9._-]+$ && "$pdir" != *"/opt/de_GWD"* ]]; then
+            rm -rf "$pdir" 2>/dev/null || true
+            cleaned_files=$(printf '%s' "$cleaned_files" | jq -c --arg f "$pdir" '. + [$f]')
+          fi
+          ;;
+      esac
+    fi
+  fi
+
+  local msg
+  if [[ "$action" == "uninstall" ]]; then
+    msg="已停止服务并彻底清理相关文件 (PID: $target_pid)"
+  else
+    msg="已停止外部进程并释放其占用的端口 (PID: $target_pid)"
+  fi
+  jq -cn --arg act "$action" --argjson pid "$target_pid" --arg msg "$msg" \
+         --arg svc "$svc_found" --argjson files "$cleaned_files" \
+    '{ok:true, action:$act, pid:$pid, service:$svc, cleaned:$files, message:$msg}'
+}
+
+cli_kill_tp() {
+  stop_or_uninstall_third_party "$1"
 }
 
 # =============================================================== CLI (面板) ====
@@ -3513,11 +3753,12 @@ cli_status() {
 
 # 协议元数据 -> JSON 数组 (面板据此渲染勾选框)
 proto_table_json() {
-  local id name kern port dom desc out='[]'
+  local id name kern port dom desc out='[]' actport
   while IFS='|' read -r id name kern port dom desc; do
     [[ -z $id ]] && continue
+    actport=$(proto_port "$id")
     out=$(printf '%s' "$out" | jq -c --arg id "$id" --arg n "$name" --arg k "$kern" \
-      --argjson p "$port" --argjson d "$dom" --arg ds "$desc" \
+      --argjson p "$actport" --argjson d "$dom" --arg ds "$desc" \
       '. + [{id:$id,name:$n,kernel:$k,port:$p,needs_domain:($d==1),desc:$ds}]')
   done <<< "$PROTO_TABLE"
   printf '%s\n' "$out"
@@ -3723,6 +3964,7 @@ cli_dispatch() {
     warp)    conf_init; case "${1:-}" in on) warp_enable || { cli_json '{"ok":false,"error":"warp enable failed"}'; return 1; };; off) warp_disable;; *) cli_json '{"ok":false,"error":"warp on|off"}'; return 1;; esac; cli_json '{"ok":true}' ;;
     sub)     conf_init; sub_toggle "${1:-on}" >/dev/null 2>&1; cli_json "{\"ok\":true,\"sub_on\":$(conf_get '.sub_on' | grep -q false && echo false || echo true)}" ;;
     suburl)  conf_init; local h; h=$(conf_get '.domain'); [[ -z $h ]] && h=$(wan_ip); printf 'https://%s/sub/%s\n' "$h" "$(conf_get '.subtoken')" ;;
+    kill_tp) cli_kill_tp "${1:-}" ;;
     *)       cli_json '{"ok":false,"error":"unknown subcommand"}' ; return 1 ;;
   esac
 }
@@ -3734,10 +3976,13 @@ case "${1:-}" in
   --install-cli)   cli_install_legacy; exit 0 ;;
   --version)       echo "$VERSION"; exit 0 ;;
   --detect|-d)     show_proxy_detection; exit 0 ;;
+  --kill-tp)       shift; stop_or_uninstall_third_party "$@"; exit $? ;;
   --panel-info)    show_panel_info; exit 0 ;;
   --panel-port)    shift; change_panel_port "${1:-}"; exit 0 ;;
   --panel)         panel_menu; exit 0 ;;
   --panel-install) shift; install_panel; exit 0 ;;
   --cli)           shift; NONINTERACTIVE=1; cli_dispatch "$@"; exit $? ;;
 esac
-start_menu
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && is_tty; then
+  start_menu
+fi
