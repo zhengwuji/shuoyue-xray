@@ -78,7 +78,7 @@ urlenc() {
 }
 
 # 端口合法性: 1-65535 且不是本方案自用/系统保留端口
-RESERVED_PORTS=" 53 80 443 1080 3000 8388 8442 8443 8444 8445 8446 8447 8448 8449 8450 8451 8452 9853 9890 9891 9892 9893 9894 9895 9896 51820 "
+RESERVED_PORTS=" 53 80 443 1080 3000 8388 8442 8443 8444 8445 8446 8447 8448 8449 8450 8451 8452 9853 9890 9891 9892 9893 9894 9895 9896 9899 51820 "
 port_valid() {
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ ]] || return 1
@@ -599,7 +599,7 @@ net.core.wmem_max = 8388608
 net.core.optmem_max = 524288
 net.mptcp.enabled = 1
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.ip_local_reserved_ports = 53,1080,3000,8388,8442-8452,9853,9890-9894
+net.ipv4.ip_local_reserved_ports = 53,1080,3000,8388,8442-8452,9853,9890-9896,9899
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.all.rp_filter = 0
@@ -1799,14 +1799,125 @@ xray_gen_config() {
   if proto_on xhttpenc; then
     inbounds=$(echo "$inbounds" | jq --argjson i "$(xray_inbound_xhttp_enc)" '. + [$i]')
   fi
-  local outbounds='[
-    {"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"tcpFastOpen":true,"tcpNoDelay":true}}},
-    {"tag":"blocked","protocol":"blackhole","settings":{"response":{"type":"http"}}}
-  ]'
+  # 内部回环管理与测试端口 (127.0.0.1:9899)，供本机连通性与解锁测试
+  local mgmt_in='{"tag":"local-mgmt-in","listen":"127.0.0.1","port":9899,"protocol":"socks","settings":{"auth":"noauth","udp":true}}'
+  inbounds=$(echo "$inbounds" | jq --argjson m "$mgmt_in" '. + [$m]')
+
+  local warp_mode; warp_mode=$(conf_get '.warp.mode // "direct"')
+  local warp_on; warp_on=$(conf_get '.warp.enable // false')
+  [[ "$warp_on" != "true" ]] && warp_mode="direct"
+
+  local outbounds rules
+  local direct_out='{"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"tcpFastOpen":true,"tcpNoDelay":true}}}'
+  local blocked_out='{"tag":"blocked","protocol":"blackhole","settings":{"response":{"type":"http"}}}'
+
+  if [[ "$warp_mode" == "direct" ]]; then
+    outbounds=$(jq -cn --argjson d "$direct_out" --argjson b "$blocked_out" '[$d, $b]')
+    rules='[]'
+  else
+    local priv v4 v6 reserved peer_pub endpoint
+    priv=$(conf_get '.warp.private_key')
+    v4=$(conf_get '.warp.v4 // "172.16.0.2"')
+    v6=$(conf_get '.warp.v6 // ""')
+    reserved=$(conf_get '.warp.reserved // [0,0,0]')
+    peer_pub=$(conf_get '.warp.peer_pub // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
+    endpoint=$(conf_get '.warp.endpoint // "engage.cloudflareclient.com:2408"')
+
+    local addrs="[\"$v4/32\"]"
+    if [[ -n $v6 ]]; then
+      addrs=$(jq -cn --arg v4 "$v4/32" --arg v6 "$v6/128" '[$v4, $v6]')
+    fi
+
+    local warp_out
+    warp_out=$(jq -cn --arg priv "$priv" --argjson addrs "$addrs" --arg pp "$peer_pub" \
+                      --arg ep "$endpoint" --argjson res "$reserved" '{
+      tag: "warp",
+      protocol: "wireguard",
+      settings: {
+        secretKey: $priv,
+        address: $addrs,
+        peers: [{ publicKey: $pp, endpoint: $ep, keepAlive: 15 }],
+        reserved: $res
+      }
+    }')
+
+    # 各分流层级域名表 (严格覆盖 Gemini / Google / OpenAI / 流媒体)
+    local google_domains='[
+      "domain:gemini.google.com",
+      "domain:aistudio.google.com",
+      "domain:generativelanguage.googleapis.com",
+      "domain:bard.google.com",
+      "domain:google.com",
+      "domain:google.com.hk",
+      "domain:googleusercontent.com",
+      "domain:googleapis.com",
+      "domain:gstatic.com",
+      "domain:googlevideo.com",
+      "domain:youtube.com",
+      "domain:ytimg.com",
+      "domain:youtu.be",
+      "domain:android.com",
+      "domain:googleplay.com",
+      "domain:app-measurement.com",
+      "domain:g.co",
+      "domain:goo.gl",
+      "geosite:google",
+      "geosite:youtube"
+    ]'
+
+    local ai_domains
+    ai_domains=$(printf '%s' "$google_domains" | jq -c '. + [
+      "domain:chatgpt.com",
+      "domain:openai.com",
+      "domain:oaistatic.com",
+      "domain:oaiusercontent.com",
+      "domain:anthropic.com",
+      "domain:claude.ai",
+      "domain:perplexity.ai",
+      "geosite:openai"
+    ]')
+
+    local media_domains
+    media_domains=$(printf '%s' "$ai_domains" | jq -c '. + [
+      "domain:netflix.com",
+      "domain:nflxvideo.net",
+      "domain:nflxext.com",
+      "domain:disneyplus.com",
+      "geosite:netflix",
+      "geosite:disney"
+    ]')
+
+    case "$warp_mode" in
+      warp_all)
+        # 全局 WARP：warp 出口为默认首选，局域网与国内网站直连
+        outbounds=$(jq -cn --argjson w "$warp_out" --argjson d "$direct_out" --argjson b "$blocked_out" '[$w, $d, $b]')
+        rules='[
+          {"type":"field","outboundTag":"direct","ip":["geoip:private"]},
+          {"type":"field","outboundTag":"direct","domain":["geosite:cn"]}
+        ]'
+        ;;
+      warp_google)
+        # 仅解锁 Gemini & Google，其余原生直连
+        outbounds=$(jq -cn --argjson d "$direct_out" --argjson w "$warp_out" --argjson b "$blocked_out" '[$d, $w, $b]')
+        rules=$(jq -cn --argjson doms "$google_domains" '[{"type":"field","outboundTag":"warp","domain":$doms}]')
+        ;;
+      warp_ai)
+        # 解锁全套 AI (Gemini + OpenAI + Claude)，其余原生直连
+        outbounds=$(jq -cn --argjson d "$direct_out" --argjson w "$warp_out" --argjson b "$blocked_out" '[$d, $w, $b]')
+        rules=$(jq -cn --argjson doms "$ai_domains" '[{"type":"field","outboundTag":"warp","domain":$doms}]')
+        ;;
+      warp_media_ai)
+        # 解锁 AI 与流媒体，其余原生直连
+        outbounds=$(jq -cn --argjson d "$direct_out" --argjson w "$warp_out" --argjson b "$blocked_out" '[$d, $w, $b]')
+        rules=$(jq -cn --argjson doms "$media_domains" '[{"type":"field","outboundTag":"warp","domain":$doms}]')
+        ;;
+    esac
+  fi
+
   local cfg_tmp; cfg_tmp=$(mktemp "$XRAYDIR/config.json.XXXXXX") || die "无法创建临时配置文件"
-  if ! jq -n --argjson inb "$inbounds" --argjson outb "$outbounds" '{
+  if ! jq -n --argjson inb "$inbounds" --argjson outb "$outbounds" --argjson rls "$rules" '{
     log: { access: "none", error: "/var/log/xray-error.log", loglevel: "warning" },
-    routing: { rules: [] },
+    routing: { domainStrategy: "IPIfNonMatch", rules: $rls },
     inbounds: $inb,
     outbounds: $outb
   }' > "$cfg_tmp" || ! jq -e . "$cfg_tmp" >/dev/null 2>&1; then
@@ -1926,13 +2037,78 @@ singbox_gen_config() {
                               private_key:$priv, short_id:[$sid]}}}]')
     fi
   fi
+  local warp_mode; warp_mode=$(conf_get '.warp.mode // "direct"')
+  local warp_on; warp_on=$(conf_get '.warp.enable // false')
+  [[ "$warp_on" != "true" ]] && warp_mode="direct"
+
+  local outbounds route_final="direct" route_rules="[]"
+  local direct_sb='{"type":"direct","tag":"direct"}'
+
+  if [[ "$warp_mode" == "direct" ]]; then
+    outbounds="[$direct_sb]"
+  else
+    local priv v4 v6 reserved peer_pub endpoint
+    priv=$(conf_get '.warp.private_key')
+    v4=$(conf_get '.warp.v4 // "172.16.0.2"')
+    v6=$(conf_get '.warp.v6 // ""')
+    reserved=$(conf_get '.warp.reserved // [0,0,0]')
+    peer_pub=$(conf_get '.warp.peer_pub // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
+    endpoint=$(conf_get '.warp.endpoint // "engage.cloudflareclient.com:2408"')
+    local ep_host="${endpoint%%:*}"
+    local ep_port="${endpoint##*:}"
+
+    local addrs="[\"$v4/32\"]"
+    if [[ -n $v6 ]]; then
+      addrs=$(jq -cn --arg v4 "$v4/32" --arg v6 "$v6/128" '[$v4, $v6]')
+    fi
+
+    local warp_sb
+    warp_sb=$(jq -cn --arg priv "$priv" --argjson addrs "$addrs" --arg pp "$peer_pub" \
+                     --arg host "$ep_host" --argjson port "${ep_port:-2408}" --argjson res "$reserved" '{
+      type: "wireguard",
+      tag: "warp-out",
+      server: $host,
+      server_port: $port,
+      local_address: $addrs,
+      private_key: $priv,
+      peer_public_key: $pp,
+      reserved: $res
+    }')
+    outbounds=$(jq -cn --argjson d "$direct_sb" --argjson w "$warp_sb" '[$d, $w]')
+
+    local sb_google_suffixes='["gemini.google.com","aistudio.google.com","generativelanguage.googleapis.com","bard.google.com","google.com","google.com.hk","googleusercontent.com","googleapis.com","gstatic.com","googlevideo.com","youtube.com","ytimg.com","youtu.be","android.com","googleplay.com","app-measurement.com","g.co","goo.gl"]'
+    local sb_ai_suffixes
+    sb_ai_suffixes=$(echo "$sb_google_suffixes" | jq -c '. + ["chatgpt.com","openai.com","oaistatic.com","oaiusercontent.com","anthropic.com","claude.ai","perplexity.ai"]')
+    local sb_media_suffixes
+    sb_media_suffixes=$(echo "$sb_ai_suffixes" | jq -c '. + ["netflix.com","nflxvideo.net","nflxext.com","disneyplus.com"]')
+
+    case "$warp_mode" in
+      warp_all)
+        route_final="warp-out"
+        route_rules='[
+          {"geoip":["private"],"outbound":"direct"},
+          {"geosite":["cn"],"outbound":"direct"}
+        ]'
+        ;;
+      warp_google)
+        route_rules=$(jq -cn --argjson s "$sb_google_suffixes" '[{"domain_suffix":$s,"domain_keyword":["google","youtube"],"outbound":"warp-out"}]')
+        ;;
+      warp_ai)
+        route_rules=$(jq -cn --argjson s "$sb_ai_suffixes" '[{"domain_suffix":$s,"domain_keyword":["google","youtube","openai","chatgpt"],"outbound":"warp-out"}]')
+        ;;
+      warp_media_ai)
+        route_rules=$(jq -cn --argjson s "$sb_media_suffixes" '[{"domain_suffix":$s,"domain_keyword":["google","youtube","openai","chatgpt","netflix"],"outbound":"warp-out"}]')
+        ;;
+    esac
+  fi
+
   local cfg_tmp
   cfg_tmp=$(mktemp "$BASE/singbox/config.json.XXXXXX") || die "无法创建 sing-box 临时配置"
-  if ! jq -n --argjson inb "$inb" '{
+  if ! jq -n --argjson inb "$inb" --argjson outb "$outbounds" --arg fin "$route_final" --argjson rls "$route_rules" '{
     log: { level: "warn", timestamp: true },
     inbounds: $inb,
-    outbounds: [{ type: "direct", tag: "direct" }],
-    route: { final: "direct" }
+    outbounds: $outb,
+    route: { rules: $rls, final: $fin }
   }' > "$cfg_tmp" || ! jq -e . "$cfg_tmp" >/dev/null 2>&1; then
     rm -f "$cfg_tmp"
     warn "sing-box 配置生成失败, 已保留旧配置 $BASE/singbox/config.json"
@@ -2446,76 +2622,458 @@ printNode() {
   echo -e "${CYAN}===================================================================${cRES}"
 }
 
-# ------------------------------------------------------------------- WARP ----
-warp_enable() {   # 非交互: 启用 WARP 出站
-  [[ $VIRT_TYPE == "container" ]] && { err "容器环境不支持 WARP"; return 1; }
-  local nic laddr; nic=$(detect_nic); laddr=$(local_ip)
-  [[ -z $laddr ]] && { err "未检测到本机 IPv4"; return 1; }
-  apt-get install -y -qq wireguard-tools >/dev/null 2>&1
-  # 内核 >= 5.6 才有 wireguard
-  # 原写法 sort -rV | head -n1 把 uname -r 与 5.6 混排后比较, 对 5.10.0-8-amd64 这类
-  # 带后缀的版本号会误判; 改用 sort -V -C: 输入 "5.6\n<uname -r>" 已排序 <=> 5.6 <= uname -r
-  if ! printf '%s\n%s\n' 5.6 "$(uname -r)" | sort -V -C 2>/dev/null; then
-    err "内核 $(uname -r) < 5.6, 请先升级内核"; return 1
-  fi
-  log "下载 wgcf..."
-  fetch_release "ViRb3/wgcf" "^wgcf_.*_linux_${ARCH}$" /usr/local/bin/wgcf || { err "wgcf 下载失败"; return 1; }
-  chmod 755 /usr/local/bin/wgcf
-  (cd /tmp && echo | wgcf register >/dev/null 2>&1 && wgcf generate >/dev/null 2>&1)
-  [[ ! -f /tmp/wgcf-profile.conf ]] && { err "wgcf 注册失败"; return 1; }
-  local spk cpk
-  cpk=$(awk '/PrivateKey/{print$3}' /tmp/wgcf-profile.conf)
-  spk=$(awk '/PublicKey/{print$3}' /tmp/wgcf-profile.conf)
-  rm -f /tmp/wgcf-account.toml /tmp/wgcf-profile.conf
-  mkdir -p /etc/wireguard
-  local laddr6
-  laddr6=$(ip -6 addr show scope global 2>/dev/null | grep -oE 'inet6 [0-9a-fA-F:]+' | head -n1 | awk '{print$2}')
-  local postup="ip rule add from $laddr lookup main; ip rule add ipproto udp dport 53 lookup main;"
-  local postdown="ip rule del from $laddr lookup main; ip rule del ipproto udp dport 53 lookup main;"
-  if [[ -n $laddr6 ]]; then
-    postup="$postup ip -6 rule add from $laddr6 lookup main;"
-    postdown="$postdown ip -6 rule del from $laddr6 lookup main;"
-  fi
-  cat <<EOF >/etc/wireguard/wgcf.conf
-[Interface]
-PrivateKey = $cpk
-Address = 172.16.0.2/24
-DNS = 1.1.1.1
-MTU = 1420
-PostUp = $postup
-PostDown = $postdown
+# ----------------------------------------------------------- Cloudflare WARP & Cloudflared ----
+warp_ensure_account() {
+  local force="${1:-0}"
+  local priv v4
+  priv=$(conf_get '.warp.private_key')
+  v4=$(conf_get '.warp.v4')
 
-[Peer]
-PublicKey = $spk
-EndPoint = engage.cloudflareclient.com:2408
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 15
-EOF
-  chmod 600 /etc/wireguard/wgcf.conf
-  systemctl enable wg-quick@wgcf >/dev/null 2>&1
-  systemctl restart wg-quick@wgcf >/dev/null 2>&1
-  sleep 3
-  conf_set '.warp' "true"
-  # 修正原版: 先记录前 IP 再对比,判断更稳
-  local after; after=$(wan_ip); local before; before=$laddr
-  if [[ -n $after && "$after" != "$before" ]]; then
-    ok "WARP 已启用, 出口 IP: $after"; return 0
+  if [[ "$force" == "0" && -n "$priv" && -n "$v4" ]]; then
+    return 0
   fi
-  warn "WARP 启动但出口未变化, 检查 wgcf (wg show wgcf)"
+
+  log "正在生成并向 Cloudflare 注册 WARP 账号与密钥..."
+  local reg_json
+  reg_json=$(python3 -c '
+import urllib.request, json, subprocess, base64, sys
+
+try:
+    res = subprocess.run(["xray", "wg"], capture_output=True, text=True)
+    lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+    priv = [l.split(":")[-1].strip() for l in lines if "Private" in l or "key" in l.lower()][0]
+    pub = [l.split(":")[-1].strip() for l in lines if "Public" in l][0]
+except Exception:
+    try:
+        from cryptography.hazmat.primitives.asymmetric import x25519
+        from cryptography.hazmat.primitives import serialization
+        key = x25519.X25519PrivateKey.generate()
+        priv = base64.b64encode(key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())).decode()
+        pub = base64.b64encode(key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+    except Exception:
+        sys.exit(1)
+
+req = urllib.request.Request(
+    "https://api.cloudflareclient.com/v0a2158/reg",
+    data=json.dumps({"key": pub, "install_id": "", "fcm_token": "", "tos": "2020-01-22T00:00:00.000Z", "model": "Linux", "serial_number": "", "locale": "zh_CN"}).encode("utf-8"),
+    headers={"Content-Type": "application/json; charset=UTF-8", "User-Agent": "okhttp/3.12.1"}
+)
+try:
+    with urllib.request.urlopen(req, timeout=12) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    v4 = data["config"]["interface"]["addresses"]["v4"]
+    v6 = data["config"]["interface"]["addresses"]["v6"]
+    peer_pub = data["config"]["peers"][0]["public_key"]
+    cid = data["config"].get("client_id", "")
+    try:
+        reserved = list(base64.b64decode(cid)) if cid else [0, 0, 0]
+    except Exception:
+        reserved = [0, 0, 0]
+    out = {
+        "private_key": priv,
+        "public_key": pub,
+        "v4": v4,
+        "v6": v6,
+        "reserved": reserved,
+        "peer_pub": peer_pub,
+        "endpoint": "engage.cloudflareclient.com:2408"
+    }
+    print(json.dumps(out))
+except Exception:
+    sys.exit(2)
+' 2>/dev/null || true)
+
+  if [[ -z $reg_json || ! "$reg_json" =~ "private_key" ]]; then
+    # 若直接 API 注册未成功，尝试通过 wgcf 备用注册
+    if command -v wgcf >/dev/null 2>&1 || fetch_release "ViRb3/wgcf" "^wgcf_.*_linux_${ARCH}$" /usr/local/bin/wgcf; then
+      chmod 755 /usr/local/bin/wgcf 2>/dev/null || true
+      (cd /tmp && echo | wgcf register >/dev/null 2>&1 && wgcf generate >/dev/null 2>&1)
+      if [[ -f /tmp/wgcf-profile.conf ]]; then
+        local spk cpk
+        cpk=$(awk '/PrivateKey/{print$3}' /tmp/wgcf-profile.conf)
+        spk=$(awk '/PublicKey/{print$3}' /tmp/wgcf-profile.conf)
+        v4=$(awk '/Address/{print$3}' /tmp/wgcf-profile.conf | cut -d/ -f1 | head -n1)
+        local v6; v6=$(awk '/Address/{print$3}' /tmp/wgcf-profile.conf | grep -E ':' | cut -d/ -f1 | head -n1)
+        rm -f /tmp/wgcf-account.toml /tmp/wgcf-profile.conf
+        reg_json=$(jq -cn --arg priv "$cpk" --arg pub "" --arg v4 "${v4:-172.16.0.2}" --arg v6 "$v6" \
+                          --arg pp "$spk" --arg ep "engage.cloudflareclient.com:2408" \
+                          '{private_key:$priv, public_key:$pub, v4:$v4, v6:$v6, reserved:[0,0,0], peer_pub:$pp, endpoint:$ep}')
+      fi
+    fi
+  fi
+
+  [[ -z $reg_json || ! "$reg_json" =~ "private_key" ]] && {
+    err "Cloudflare WARP 账号注册失败，请检查机器公网网络连接"
+    return 1
+  }
+
+  local cur_mode cur_en
+  cur_mode=$(conf_get '.warp.mode // "warp_google"')
+  cur_en=$(conf_get '.warp.enable // true')
+  conf_raw '.warp' "$(echo "$reg_json" | jq -c --arg m "$cur_mode" --argjson en "$cur_en" '. + {enable:$en, mode:$m}')"
+  ok "Cloudflare WARP 账号就绪 (IPv4: $(conf_get '.warp.v4'))"
   return 0
 }
 
-warp_disable() {   # 非交互: 删除 WARP 出站
-  systemctl disable wg-quick@wgcf >/dev/null 2>&1
-  systemctl stop wg-quick@wgcf >/dev/null 2>&1
-  rm -f /etc/wireguard/wgcf.conf
-  conf_set '.warp' "false"
-  ok "WARP 已删除"
+warp_status_json() {
+  local en mode endpoint v4 has_acc=false
+  en=$([[ $(conf_get '.warp.enable') == "true" ]] && echo true || echo false)
+  mode=$(conf_get '.warp.mode // "direct"')
+  endpoint=$(conf_get '.warp.endpoint // "engage.cloudflareclient.com:2408"')
+  v4=$(conf_get '.warp.v4 // ""')
+  [[ -n $(conf_get '.warp.private_key') ]] && has_acc=true
+
+  jq -cn --argjson en "$en" --arg m "$mode" --arg ep "$endpoint" --arg v4 "$v4" --argjson acc "$has_acc" \
+    '{enabled:$en, mode:$m, endpoint:$ep, v4:$v4, has_account:$acc}'
 }
 
-changeWGCF() {
-  [[ $VIRT_TYPE == "container" ]] && die "容器环境不支持 WARP"
-  read -rsp "[1] 启用 Cloudflare WARP 出站  [2] 删除: " -n1 a; echo
+warp_apply() {
+  xray_gen_config
+  if sb_proto_on; then
+    singbox_gen_config || true
+  fi
+  svc_ok xray && svc_restart xray
+  svc_ok sing-box && svc_restart sing-box
+  return 0
+}
+
+warp_set_mode() {
+  local mode="${1:-warp_google}"
+  case "$mode" in
+    direct)
+      conf_set '.warp.enable' "false"
+      conf_set '.warp.mode' "direct"
+      ;;
+    warp_google|warp_ai|warp_media_ai|warp_all)
+      warp_ensure_account 0 || {
+        cli_json '{"ok":false,"error":"注册 Cloudflare WARP 账号失败"}'
+        return 1
+      }
+      conf_set '.warp.enable' "true"
+      conf_set '.warp.mode' "$mode"
+      ;;
+    *)
+      cli_json '{"ok":false,"error":"无效的出口代理模式"}'
+      return 1
+      ;;
+  esac
+
+  warp_apply
+
+  local desc=""
+  case "$mode" in
+    direct) desc="已切换为原生 IP 直连（关闭 WARP 出口代理）" ;;
+    warp_google) desc="已启用 WARP 出口：仅解锁 Gemini & 谷歌全家桶（其余原生直连）" ;;
+    warp_ai) desc="已启用 WARP 出口：解锁全套 AI (Gemini/OpenAI/Claude)" ;;
+    warp_media_ai) desc="已启用 WARP 出口：解锁 AI 与主流流媒体" ;;
+    warp_all) desc="已启用 WARP 全局出站：全部流量走 Cloudflare 出口" ;;
+  esac
+
+  cli_json "$(jq -cn --arg m "$mode" --arg msg "$desc" '{ok:true, mode:$m, message:$msg}')"
+}
+
+warp_test_unlock() {
+  local test_port=9899
+  local proxy_opt=""
+  if ss -tln 2>/dev/null | grep -qE ":$test_port\s"; then
+    proxy_opt="socks5://127.0.0.1:$test_port"
+  fi
+
+  python3 -c '
+import subprocess, json, sys
+
+proxy_str = "'"${proxy_opt}"'"
+proxy = ["-x", proxy_str] if proxy_str else []
+
+def test_url(url, timeout=6):
+    cmd = ["curl", "-sI", "--max-time", str(timeout)] + proxy + [url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        first = r.stdout.splitlines()[0] if r.stdout else ""
+        ok = bool("200" in first or "301" in first or "302" in first or "304" in first)
+        return {"ok": ok, "status": first or "超时无响应"}
+    except Exception as e:
+        return {"ok": False, "status": str(e)}
+
+def test_cf_trace():
+    cmd = ["curl", "-s", "--max-time", "6"] + proxy + ["https://cloudflare.com/cdn-cgi/trace"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        d = {}
+        for line in r.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                d[k.strip()] = v.strip()
+        return d
+    except Exception:
+        return {}
+
+cf = test_cf_trace()
+gemini = test_url("https://gemini.google.com")
+google = test_url("https://www.google.com")
+chatgpt = test_url("https://chatgpt.com")
+youtube = test_url("https://www.youtube.com")
+
+res = {
+    "ok": True,
+    "warp_on": cf.get("warp") == "on",
+    "warp_ip": cf.get("ip", ""),
+    "warp_loc": cf.get("loc", ""),
+    "gemini": gemini,
+    "google": google,
+    "chatgpt": chatgpt,
+    "youtube": youtube,
+}
+print(json.dumps(res, ensure_ascii=False))
+' 2>/dev/null || echo '{"ok":false,"error":"测试执行失败"}'
+}
+
+warp_test_interactive() {
+  echo -e "${CYAN}=== 正在执行 Gemini / 谷歌 / AI 解锁与连通性测试 ===${cRES}"
+  echo "正在探测路由与目标服务响应，请稍候..."
+  local res
+  res=$(warp_test_unlock 2>/dev/null)
+  if [[ -z $res || $(echo "$res" | jq -r '.ok // false') != "true" ]]; then
+    warn "测试未完成或返回异常: $res"
+    return 1
+  fi
+
+  local wip wloc won g_ok g_stat goog_ok goog_stat ai_ok ai_stat yt_ok yt_stat
+  wip=$(echo "$res" | jq -r '.warp_ip // "未知"')
+  wloc=$(echo "$res" | jq -r '.warp_loc // "未知"')
+  won=$(echo "$res" | jq -r '.warp_on // false')
+  g_ok=$(echo "$res" | jq -r '.gemini.ok // false')
+  g_stat=$(echo "$res" | jq -r '.gemini.status // "无响应"')
+  goog_ok=$(echo "$res" | jq -r '.google.ok // false')
+  goog_stat=$(echo "$res" | jq -r '.google.status // "无响应"')
+  ai_ok=$(echo "$res" | jq -r '.chatgpt.ok // false')
+  ai_stat=$(echo "$res" | jq -r '.chatgpt.status // "无响应"')
+  yt_ok=$(echo "$res" | jq -r '.youtube.ok // false')
+  yt_stat=$(echo "$res" | jq -r '.youtube.status // "无响应"')
+
+  echo
+  echo -e "  Cloudflare WARP 出口: ${WHITE}${wip}${cRES} [地区: ${CYAN}${wloc}${cRES}] (状态: $([[ "$won" == "true" ]] && echo -e "${GREEN}WARP ON${cRES}" || echo -e "${YELLOW}直连${cRES}"))"
+  echo -e "  ● Gemini (gemini.google.com): $([[ "$g_ok" == "true" ]] && echo -e "${GREEN}✓ 已解锁${cRES} ($g_stat)" || echo -e "${RED}✕ 未解锁${cRES} ($g_stat)")"
+  echo -e "  ● Google 搜索 (google.com):   $([[ "$goog_ok" == "true" ]] && echo -e "${GREEN}✓ 畅通${cRES} ($goog_stat)" || echo -e "${RED}✕ 异常${cRES} ($goog_stat)")"
+  echo -e "  ● YouTube (youtube.com):      $([[ "$yt_ok" == "true" ]] && echo -e "${GREEN}✓ 畅通${cRES} ($yt_stat)" || echo -e "${RED}✕ 异常${cRES} ($yt_stat)")"
+  echo -e "  ● ChatGPT (chatgpt.com):      $([[ "$ai_ok" == "true" ]] && echo -e "${GREEN}✓ 已解锁${cRES} ($ai_stat)" || echo -e "${YELLOW}⚠️ $ai_stat${cRES}")"
+  echo
+}
+
+# ----------------------------------------------------- Cloudflare Tunnel (cloudflared) ---
+install_cloudflared() {
+  ok "正在下载并安装官方 cloudflared 二进制..."
+  local cf_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
+  local tmp_bin
+  tmp_bin=$(mktemp /tmp/cloudflared.XXXXXX) || { err "无法创建临时文件"; return 1; }
+  if curl -fsSL --connect-timeout 10 --max-time 120 "$cf_url" -o "$tmp_bin"; then
+    chmod 755 "$tmp_bin"
+    if "$tmp_bin" --version >/dev/null 2>&1; then
+      mv -f "$tmp_bin" /usr/local/bin/cloudflared
+      ok "cloudflared 安装成功: $(/usr/local/bin/cloudflared --version 2>/dev/null | head -n1)"
+      return 0
+    fi
+  fi
+  rm -f "$tmp_bin"
+  err "cloudflared 下载或校验失败"
+  return 1
+}
+
+cloudflared_status_json() {
+  local inst=false ver="" running=false has_token=false
+  if [[ -x /usr/local/bin/cloudflared ]]; then
+    inst=true
+    ver=$(/usr/local/bin/cloudflared --version 2>/dev/null | awk '{print$3}' || echo "")
+  fi
+  if svc_ok cloudflared; then
+    running=true
+  fi
+  local tok; tok=$(conf_get '.cloudflared.token // ""')
+  [[ -n $tok ]] && has_token=true
+
+  jq -cn --argjson inst "$inst" --arg ver "$ver" --argjson run "$running" --argjson tok "$has_token" \
+    '{installed:$inst, version:$ver, running:$run, token_configured:$tok}'
+}
+
+cloudflared_set_token() {
+  local tok="${1:-}"
+  [[ -z $tok ]] && { cli_json '{"ok":false,"error":"Token 不能为空"}'; return 1; }
+
+  if [[ ! -x /usr/local/bin/cloudflared ]]; then
+    install_cloudflared || { cli_json '{"ok":false,"error":"cloudflared 安装失败"}'; return 1; }
+  fi
+
+  conf_set '.cloudflared.token' "$tok"
+  conf_set '.cloudflared.enable' "true"
+
+  cat <<EOF >/etc/systemd/system/cloudflared.service
+[Unit]
+Description=Cloudflare Tunnel (cloudflared)
+After=network.target
+
+[Service]
+TimeoutStartSec=0
+Type=notify
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run --token $tok
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable cloudflared >/dev/null 2>&1
+  systemctl restart cloudflared >/dev/null 2>&1
+  sleep 2
+  if svc_ok cloudflared; then
+    cli_json '{"ok":true,"message":"Cloudflare Tunnel 已成功启动并保持运行"}'
+  else
+    cli_json '{"ok":false,"error":"Cloudflare Tunnel 启动失败，请检查 Token"}'
+  fi
+}
+
+cloudflared_stop_service() {
+  systemctl stop cloudflared >/dev/null 2>&1 || true
+  systemctl disable cloudflared >/dev/null 2>&1 || true
+  conf_set '.cloudflared.enable' "false"
+  cli_json '{"ok":true,"message":"Cloudflare Tunnel 服务已停止"}'
+}
+
+cloudflared_start_service() {
+  local tok; tok=$(conf_get '.cloudflared.token // ""')
+  [[ -z $tok ]] && { cli_json '{"ok":false,"error":"尚未配置 Tunnel Token"}'; return 1; }
+  systemctl daemon-reload
+  systemctl enable cloudflared >/dev/null 2>&1
+  systemctl restart cloudflared >/dev/null 2>&1
+  sleep 1
+  if svc_ok cloudflared; then
+    cli_json '{"ok":true,"message":"Cloudflare Tunnel 已启动"}'
+  else
+    cli_json '{"ok":false,"error":"启动失败"}'
+  fi
+}
+
+cloudflared_quick_tunnel() {
+  local p="${1:-}"
+  [[ -z $p ]] && p=$(panel_port)
+  if [[ ! -x /usr/local/bin/cloudflared ]]; then
+    install_cloudflared || { cli_json '{"ok":false,"error":"cloudflared 安装失败"}'; return 1; }
+  fi
+  pkill -f 'cloudflared.*tunnel.*--url' >/dev/null 2>&1 || true
+  nohup /usr/local/bin/cloudflared tunnel --url "http://127.0.0.1:$p" > /tmp/cf-quick.log 2>&1 &
+  sleep 4
+  local qurl
+  qurl=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf-quick.log | head -n1 || true)
+  if [[ -n $qurl ]]; then
+    cli_json "$(jq -cn --arg url "$qurl" '{ok:true, url:$url, message:("临时快速隧道已就绪: " + $url)}')"
+  else
+    cli_json '{"ok":false,"error":"快速隧道启动超时，请稍后重试"}'
+  fi
+}
+
+cloudflared_menu() {
+  while :; do
+    local st_run st_inst
+    st_run=$(svc_ok cloudflared && echo -e "${GREEN}运行中${cRES}" || echo -e "${GREY}未运行${cRES}")
+    st_inst=$([[ -x /usr/local/bin/cloudflared ]] && echo -e "${GREEN}已安装${cRES}" || echo -e "${YELLOW}未安装${cRES}")
+    echo
+    echo -e "${CYAN}--- Cloudflare Tunnel (cloudflared) 隧道管理 ---${cRES}"
+    echo -e "  组件安装: ${st_inst}   运行状态: ${st_run}"
+    local cur_tok; cur_tok=$(conf_get '.cloudflared.token // ""')
+    [[ -n $cur_tok ]] && echo -e "  已配置 Token: ${WHITE}${cur_tok:0:15}...${cRES}"
+    echo
+    echo "  [1] 安装 / 更新 cloudflared 官方二进制"
+    echo "  [2] 配置 Cloudflare Tunnel Token 并启动服务"
+    echo "  [3] 停止 Cloudflare Tunnel 服务"
+    echo "  [4] 启动临时快速隧道 (Quick Tunnel, trycloudflare.com)"
+    echo "  [q] 返回上级"
+    echo
+    read -rsp "请选择 [1-4, q]: " -n1 c; echo
+    case "$c" in
+      1) install_cloudflared ;;
+      2)
+        local t
+        t=$(ask "请输入 Cloudflare Tunnel Token (eyJhIj...): ")
+        if [[ -n $t ]]; then
+          cloudflared_set_token "$t"
+        fi
+        ;;
+      3) cloudflared_stop_service ;;
+      4)
+        local p
+        p=$(ask "请输入要穿透的本地端口 (回车默认 Web 面板端口 $(panel_port)): ")
+        p=${p:-$(panel_port)}
+        cloudflared_quick_tunnel "$p"
+        ;;
+      q|Q) break ;;
+    esac
+  done
+}
+
+cloudflare_menu() {
+  conf_init
+  while :; do
+    local w_mode w_en cf_run
+    w_mode=$(conf_get '.warp.mode // "direct"')
+    w_en=$(conf_get '.warp.enable // false')
+    [[ "$w_en" != "true" ]] && w_mode="direct"
+    local mode_desc="[直连 - 关闭 WARP]"
+    case "$w_mode" in
+      warp_google)   mode_desc="[⚡ 仅解锁 Gemini & 谷歌全家桶 (推荐)]" ;;
+      warp_ai)       mode_desc="[🤖 解锁全套 AI (Gemini + OpenAI + Claude)]" ;;
+      warp_media_ai) mode_desc="[🎬 解锁 AI 与流媒体 (Gemini + Netflix + Disney+)]" ;;
+      warp_all)      mode_desc="[🌍 全局 WARP 出口 (所有流量走 WARP)]" ;;
+      *)             mode_desc="[🌐 原生直连]" ;;
+    esac
+    cf_run=$(svc_ok cloudflared && echo -e "${GREEN}运行中${cRES}" || echo -e "${GREY}未运行${cRES}")
+    echo
+    echo -e "${CYAN}=====================================================${cRES}"
+    echo -e "${WHITE}  Cloudflare & 出口代理设置 (WARP / 解锁 Gemini / Cloudflared)${cRES}"
+    echo -e "${CYAN}=====================================================${cRES}"
+    echo -e "  当前出口代理模式: ${GREEN}${mode_desc}${cRES}"
+    echo -e "  Cloudflared 隧道: ${cf_run}"
+    echo
+    echo "  [1] 切换出口代理模式 (直连 / 仅解锁Gemini谷歌 / 解锁AI / 解锁流媒体 / 全局WARP)"
+    echo "  [2] 🧪 一键测试 Gemini / 谷歌 / ChatGPT 解锁连通性"
+    echo "  [3] 🔄 重新注册生成 WARP 账号与干净密钥"
+    echo "  [4] 🚇 Cloudflare Tunnel (cloudflared) 穿透隧道设置"
+    echo "  [5] ⚡ 启动临时快速隧道 (Quick Tunnel, trycloudflare.com 穿透测试)"
+    echo "  [6] 开启/关闭系统级 WireGuard 接口 (wg-quick@wgcf)"
+    echo "  [q] 返回上级菜单"
+    echo
+    read -rsp "请选择 [1-6, q]: " -n1 c; echo
+    case "$c" in
+      1)
+        echo "请选择出口代理模式:"
+        echo "  1. 🌐 原生 IP 直连 (关闭 WARP 出口代理)"
+        echo "  2. ⚡ 仅解锁 Gemini & 谷歌全家桶 (推荐: Google/Gemini 走 WARP, 其他原生直连)"
+        echo "  3. 🤖 解锁全套 AI (Gemini + OpenAI/ChatGPT + Claude + Perplexity)"
+        echo "  4. 🎬 解锁 AI 与流媒体 (Gemini + Google + OpenAI + Netflix + Disney+)"
+        echo "  5. 🌍 全局 WARP 出站 (全部流量走 Cloudflare WARP 出口)"
+        read -rsp "选择模式 [1-5]: " -n1 sm; echo
+        case "$sm" in
+          1) warp_set_mode "direct" ;;
+          2) warp_set_mode "warp_google" ;;
+          3) warp_set_mode "warp_ai" ;;
+          4) warp_set_mode "warp_media_ai" ;;
+          5) warp_set_mode "warp_all" ;;
+          *) warn "已取消" ;;
+        esac
+        ;;
+      2) warp_test_interactive ;;
+      3) warp_ensure_account 1 && warp_apply && ok "WARP 账号已重新生成并生效" ;;
+      4) cloudflared_menu ;;
+      5) cloudflared_quick_tunnel ;;
+      6) changeWGCF_legacy ;;
+      q|Q) break ;;
+    esac
+  done
+}
+
+# 兼容旧版系统 WireGuard 接口启停
+changeWGCF_legacy() {
+  [[ $VIRT_TYPE == "container" ]] && { warn "容器环境不支持内核级 wgcf"; return 1; }
+  read -rsp "[1] 启用系统级 wg-quick@wgcf 网卡  [2] 删除: " -n1 a; echo
   if [[ $a == "1" ]]; then
     warp_enable || die "WARP 启用失败"
     /etc/rc_online.local 2>/dev/null
@@ -2523,6 +3081,18 @@ changeWGCF() {
     warp_disable
     /etc/rc_online.local 2>/dev/null
   fi
+}
+
+changeWGCF() {
+  cloudflare_menu
+}
+
+warp_enable() {
+  warp_set_mode "warp_google"
+}
+
+warp_disable() {
+  warp_set_mode "direct"
 }
 
 # ------------------------------------------------- HAProxy TCP 端口转发(多组) --
@@ -2780,7 +3350,7 @@ config_menu() {
   echo "  [2] 协议开关(任意数量协议随时启停)"
   echo "  [3] Reality 密钥(重生成/开关)"
   echo "  [4] 修改 WS path(仅 vmess)"
-  echo "  [5] Cloudflare WARP 出站"
+  echo "  [5] Cloudflare & 出口代理设置 (WARP 出口 / 解锁 Gemini 谷歌 / Cloudflared 隧道)"
   echo "  [6] HAProxy TCP 端口转发"
   echo "  [7] 安装/重装 Web 面板"
   echo "  [q] 返回"
@@ -2801,7 +3371,15 @@ status_panel() {
   echo -e "  Nginx    : $(svc_ok nginx && echo -e "${GREEN}✓${cRES}" || echo -e "${RED}✕${cRES}")   Xray: $(svc_ok xray && echo -e "${GREEN}✓${cRES}" || echo -e "${RED}✕${cRES}")   DoH: $(svc_ok doh-server && echo -e "${GREEN}✓${cRES}" || echo -e "${RED}✕${cRES}")   unbound: $(svc_ok unbound && echo -e "${GREEN}✓${cRES}" || echo -e "${RED}✕${cRES}")"
   echo -e "  协议: $(conf_get '.protos // {}' | jq -r 'to_entries | map(select(.value==true) | .key) | join(",")' 2>/dev/null)   版本: $VERSION   $VIRT_TYPE"
   [[ -f $SSLDIR/de_GWD.cer ]] && echo -e "  证书到期: $(openssl x509 -enddate -noout -in $SSLDIR/de_GWD.cer 2>/dev/null | cut -d= -f2)"
-  svc_ok wg-quick@wgcf && echo -e "${PURPLE}  [Enabled] Cloudflare WARP${cRES}"
+  local _wm _wen
+  _wm=$(conf_get '.warp.mode // "direct"')
+  _wen=$(conf_get '.warp.enable // false')
+  if [[ "$_wen" == "true" && "$_wm" != "direct" ]]; then
+    echo -e "${PURPLE}  [Enabled] Cloudflare WARP 出口代理 (分流模式: $_wm)${cRES}"
+  elif svc_ok wg-quick@wgcf; then
+    echo -e "${PURPLE}  [Enabled] Cloudflare WARP (系统网卡)${cRES}"
+  fi
+  svc_ok cloudflared && echo -e "${PURPLE}  [Enabled] Cloudflare Tunnel (cloudflared 运行中)${cRES}"
   svc_ok haproxy && echo -e "${PURPLE}  [Enabled] HAProxy TCP Port Forward${cRES}"
   svc_ok degwd-panel && echo -e "${PURPLE}  [Enabled] Web 控制面板 (端口: $(panel_port))${cRES}"
   local d_raw; d_raw=$(detect_proxy_servers_json 2>/dev/null || true)
@@ -3722,6 +4300,9 @@ cli_status() {
   [[ -z $links ]] && links='[]'
   local penv; penv=$(detect_proxy_servers_json 2>/dev/null || true)
   [[ -z $penv ]] && penv='{"binaries":[],"running":[],"summary":{}}'
+  local warp_info cf_info
+  warp_info=$(warp_status_json 2>/dev/null || echo '{"enabled":false,"mode":"direct"}')
+  cf_info=$(cloudflared_status_json 2>/dev/null || echo '{"installed":false,"running":false}')
   jq -cn \
     --arg version "$VERSION" \
     --arg domain "$(conf_get '.domain')" \
@@ -3738,7 +4319,8 @@ cli_status() {
     --argjson nginx "$(svc_ok nginx && echo true || echo false)" \
     --argjson singbox "$(svc_ok sing-box && echo true || echo false)" \
     --argjson reality_ready "$([[ -n $(conf_get '.reality.public') ]] && echo true || echo false)" \
-    --argjson warp "$([[ $(conf_get '.warp') == "true" ]] && echo true || echo false)" \
+    --argjson warp "$warp_info" \
+    --argjson cloudflared "$cf_info" \
     --argjson sub_on "$([[ $(conf_get '.sub_on') == "false" ]] && echo false || echo true)" \
     --argjson protolist "$(proto_table_json)" \
     --argjson links "$links" \
@@ -3747,7 +4329,7 @@ cli_status() {
     '{version:$version, installed:$installed, domain:$domain, port:$port, uuid:$uuid,
       path:$path, subtoken:$subtoken, suburl:$suburl, panel_path:$panel_path, panel_port:$panel_port,
       protos:$protos, protolist:$protolist, links:$links, cfg:$cfg, warp:$warp,
-      sub_on:$sub_on, svc:{xray:$xray, nginx:$nginx, singbox:$singbox},
+      cloudflared:$cloudflared, sub_on:$sub_on, svc:{xray:$xray, nginx:$nginx, singbox:$singbox},
       reality_ready:$reality_ready, proxy_env:$proxy_env}'
 }
 
@@ -3961,7 +4543,32 @@ cli_dispatch() {
     regen)   cli_regen ;;
     reset)   cli_reset ;;
     cfg)     cli_cfg "${1:-}" ;;
-    warp)    conf_init; case "${1:-}" in on) warp_enable || { cli_json '{"ok":false,"error":"warp enable failed"}'; return 1; };; off) warp_disable;; *) cli_json '{"ok":false,"error":"warp on|off"}'; return 1;; esac; cli_json '{"ok":true}' ;;
+    warp)
+      conf_init
+      local w_act="${1:-}"; shift || true
+      case "$w_act" in
+        mode|set) warp_set_mode "${1:-warp_google}" ;;
+        on)       warp_set_mode "${1:-warp_google}" ;;
+        off)      warp_set_mode "direct" ;;
+        test)     warp_test_unlock ;;
+        regen)    warp_ensure_account 1 && warp_apply && cli_json '{"ok":true,"message":"WARP 账号已重置并生效"}' || cli_json '{"ok":false,"error":"WARP 账号重置失败"}' ;;
+        status)   cli_json "$(warp_status_json 2>/dev/null || echo '{"ok":true}')" ;;
+        *)        cli_json '{"ok":false,"error":"warp on|off|mode <m>|test|regen|status"}' ; return 1 ;;
+      esac
+      ;;
+    cf_tunnel)
+      conf_init
+      local cf_act="${1:-}"; shift || true
+      case "$cf_act" in
+        status)   cloudflared_status_json ;;
+        install)  install_cloudflared && cli_json '{"ok":true,"message":"cloudflared 安装成功"}' || cli_json '{"ok":false,"error":"安装失败"}' ;;
+        token|set_token) cloudflared_set_token "${1:-}" ;;
+        stop)     cloudflared_stop_service ;;
+        start)    cloudflared_start_service ;;
+        quick)    cloudflared_quick_tunnel "${1:-}" ;;
+        *)        cli_json '{"ok":false,"error":"cf_tunnel status|install|token <tok>|stop|start|quick"}' ; return 1 ;;
+      esac
+      ;;
     sub)     conf_init; sub_toggle "${1:-on}" >/dev/null 2>&1; cli_json "{\"ok\":true,\"sub_on\":$(conf_get '.sub_on' | grep -q false && echo false || echo true)}" ;;
     suburl)  conf_init; local h; h=$(conf_get '.domain'); [[ -z $h ]] && h=$(wan_ip); printf 'https://%s/sub/%s\n' "$h" "$(conf_get '.subtoken')" ;;
     kill_tp) cli_kill_tp "${1:-}" ;;
@@ -3977,6 +4584,10 @@ case "${1:-}" in
   --version)       echo "$VERSION"; exit 0 ;;
   --detect|-d)     show_proxy_detection; exit 0 ;;
   --kill-tp)       shift; stop_or_uninstall_third_party "$@"; exit $? ;;
+  --warp)          cloudflare_menu; exit 0 ;;
+  --warp-mode)     shift; warp_set_mode "${1:-warp_google}"; exit $? ;;
+  --warp-test)     warp_test_interactive; exit 0 ;;
+  --cloudflared)   cloudflared_menu; exit 0 ;;
   --panel-info)    show_panel_info; exit 0 ;;
   --panel-port)    shift; change_panel_port "${1:-}"; exit 0 ;;
   --panel)         panel_menu; exit 0 ;;

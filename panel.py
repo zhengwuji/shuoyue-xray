@@ -698,6 +698,11 @@ transition:opacity .2s;z-index:9;max-width:90vw}
 .mini-btn.stop:hover{background:rgba(210,153,34,.15)}
 .mini-btn.uninstall{border-color:rgba(248,81,73,.5);color:#f85149}
 .mini-btn.uninstall:hover{background:rgba(248,81,73,.15)}
+.test-card{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px}
+.test-card.ok{border-color:rgba(46,160,67,.4)}
+.test-card.fail{border-color:rgba(248,81,73,.4)}
+.test-status.ok{color:#3fb950;font-weight:600;font-size:11px}
+.test-status.fail{color:#f85149;font-weight:600;font-size:11px}
 </style>
 </head>
 <body>
@@ -797,19 +802,72 @@ transition:opacity .2s;z-index:9;max-width:90vw}
     </div>
   </section>
 
-  <section>
-    <h2>出口 / 订阅开关</h2>
+  <section id="sec-cloudflare">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+      <h2 style="margin:0">🌐 Cloudflare &amp; 出口代理设置 (解锁 Gemini / 谷歌全家桶)</h2>
+      <div style="display:flex;gap:6px;align-items:center">
+        <span id="sw-warp-mode" class="tag">模式: 未知</span>
+        <span id="sw-warp-ip" class="tag dim">出口: 未知</span>
+      </div>
+    </div>
+
+    <div class="note" style="margin-bottom:12px">
+      💡 <b>出口代理原理</b>：通过 Cloudflare WARP 出口为代理流量提供干净解锁 IP。支持<b>智能分流</b>（仅将 Gemini / Google / OpenAI 等需要解锁的流量路由至 WARP 出口，国内与普通流量保持 VPS 原生直连，兼顾极速与解锁）。
+    </div>
+
     <div class="form">
-      <div class="field">
-        <label for="f-warp">Cloudflare WARP 出站（出口 IP 走 WARP） <span id="sw-warp" class="tag warn">未知</span></label>
-        <select id="f-warp">
-          <option value="">保持不变</option>
-          <option value="on">启用</option>
-          <option value="off">关闭并删除</option>
+      <div class="field" style="grid-column: 1 / -1">
+        <label for="f-warp-mode">选择出口代理模式</label>
+        <select id="f-warp-mode" style="font-weight:600">
+          <option value="direct">🌐 原生 IP 直连（关闭 WARP 出口代理）</option>
+          <option value="warp_google" selected>⚡ 仅解锁 Gemini &amp; 谷歌全家桶（推荐：Google/Gemini 走 WARP，其余原生直连）</option>
+          <option value="warp_ai">🤖 解锁全套 AI（Gemini + OpenAI/ChatGPT + Claude + Perplexity，其余直连）</option>
+          <option value="warp_media_ai">🎬 解锁 AI 与流媒体（Gemini + Google + OpenAI + Netflix + Disney+）</option>
+          <option value="warp_all">🌍 全局 WARP 出站（全部流量经由 Cloudflare WARP 出口）</option>
         </select>
       </div>
+    </div>
+
+    <div class="toolbar" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button class="primary" id="btn-save-warp">应用出口代理模式</button>
+      <button class="mini-btn" id="btn-test-warp">🧪 一键测试 Gemini / 谷歌 / AI 解锁</button>
+      <button class="mini-btn" id="btn-regen-warp">🔄 刷新 WARP 账号与干净密钥</button>
+    </div>
+
+    <div id="warp-test-result" style="display:none;margin-top:12px;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:6px;font-size:12px">
+      <div style="font-weight:600;margin-bottom:8px;color:#58a6ff">🧪 解锁连通性测试报告：</div>
+      <div id="warp-test-details" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px"></div>
+    </div>
+
+    <details style="margin-top:16px;background:var(--panel2);border:1px solid var(--bd);border-radius:6px;padding:10px 14px">
+      <summary style="cursor:pointer;font-weight:600;color:var(--fg);display:flex;align-items:center;justify-content:space-between">
+        <span>🚇 Cloudflare Tunnel (cloudflared 穿透隧道设置)</span>
+        <span id="sw-cf-tunnel" class="tag dim">未安装</span>
+      </summary>
+      <div style="margin-top:10px;font-size:12px;color:var(--dim)">
+        无需公网 IP 与开放端口，通过 Cloudflare Zero Trust 隧道将 Web 控制面板或代理服务穿透发布，自带 Cloudflare CDN 加速与 WAF 防护。
+      </div>
+      <div class="form" style="margin-top:10px">
+        <div class="field" style="grid-column: 1 / -1">
+          <label for="f-cf-token">Cloudflare Tunnel Token (从 Cloudflare Zero Trust 复制)</label>
+          <input type="password" id="f-cf-token" placeholder="eyJhIjoi... (留空保持不变)">
+        </div>
+      </div>
+      <div class="toolbar" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="mini-btn" id="btn-cf-start">🚀 启动隧道服务</button>
+        <button class="mini-btn stop" id="btn-cf-stop">🛑 停止隧道服务</button>
+        <button class="mini-btn" id="btn-cf-quick">⚡ 临时快速隧道 (trycloudflare.com)</button>
+        <button class="mini-btn" id="btn-cf-install">📥 一键安装/更新 cloudflared</button>
+      </div>
+      <div id="cf-tunnel-msg" style="margin-top:8px;font-size:11px;font-family:monospace;color:#8b949e"></div>
+    </details>
+  </section>
+
+  <section>
+    <h2>订阅服务开关</h2>
+    <div class="form">
       <div class="field">
-        <label for="f-subon">订阅服务（/sub/&lt;token&gt; 可访问） <span id="sw-sub" class="tag">未知</span></label>
+        <label for="f-subon">订阅服务开关（/sub/&lt;token&gt; 可访问） <span id="sw-sub" class="tag">未知</span></label>
         <select id="f-subon">
           <option value="">保持不变</option>
           <option value="on">启用</option>
@@ -818,8 +876,7 @@ transition:opacity .2s;z-index:9;max-width:90vw}
       </div>
     </div>
     <div class="toolbar" style="margin-top:12px">
-      <button class="primary" id="btn-switch">应用开关</button>
-      <span class="dim">WARP 首次启用需下载 wgcf 并注册，耗时较长（可能 1-2 分钟）</span>
+      <button class="primary" id="btn-sub-switch">应用订阅开关</button>
     </div>
   </section>
 
@@ -1008,11 +1065,64 @@ function applyStatus(d) {
   if (cfg.prefix) { $("#f-prefix").value = cfg.prefix; }
   if (cfg.reality_sni) { $("#f-rsni").value = cfg.reality_sni; }
   if (cfg.reality_dest) { $("#f-rdest").value = cfg.reality_dest; }
-  if (cfg.reality_port) { $("#f-rport").value = String(cfg.reality_port); }
-  $("#sw-warp").textContent = d.warp ? "已启用" : "未启用";
-  $("#sw-warp").className = "tag " + (d.warp ? "" : "warn");
-  $("#sw-sub").textContent = d.sub_on === false ? "已关闭" : "已启用";
-  $("#sw-sub").className = "tag " + (d.sub_on === false ? "warn" : "");
+  var warpObj = (typeof d.warp === "object" && d.warp !== null) ? d.warp : { enabled: !(!d.warp), mode: (d.warp ? "warp_google" : "direct"), v4: "" };
+  var isWarpOn = !(!warpObj.enabled);
+  var warpMode = warpObj.mode || (isWarpOn ? "warp_google" : "direct");
+  var modeSel = $("#f-warp-mode");
+  if (modeSel) { modeSel.value = isWarpOn ? warpMode : "direct"; }
+
+  var modeTag = $("#sw-warp-mode");
+  if (modeTag) {
+    var modeNames = {
+      direct: "原生直连",
+      warp_google: "⚡ 仅解锁 Gemini & 谷歌",
+      warp_ai: "🤖 解锁全套 AI",
+      warp_media_ai: "🎬 解锁 AI 与流媒体",
+      warp_all: "🌍 全局 WARP"
+    };
+    modeTag.textContent = modeNames[warpMode] || warpMode;
+    modeTag.className = "tag " + (isWarpOn ? "ok" : "warn");
+  }
+
+  var ipTag = $("#sw-warp-ip");
+  if (ipTag) {
+    if (isWarpOn && warpObj.v4) {
+      ipTag.textContent = "WARP: " + warpObj.v4;
+      ipTag.className = "tag";
+    } else if (isWarpOn) {
+      ipTag.textContent = "WARP 出口生效中";
+      ipTag.className = "tag ok";
+    } else {
+      ipTag.textContent = "未启用 WARP 出站";
+      ipTag.className = "tag dim";
+    }
+  }
+
+  var cfObj = d.cloudflared || {};
+  var cfTag = $("#sw-cf-tunnel");
+  if (cfTag) {
+    if (cfObj.running) {
+      cfTag.textContent = "运行中";
+      cfTag.className = "tag ok";
+    } else if (cfObj.installed) {
+      cfTag.textContent = "已安装 (未运行)";
+      cfTag.className = "tag";
+    } else {
+      cfTag.textContent = "未安装";
+      cfTag.className = "tag dim";
+    }
+  }
+
+  var swWarp = $("#sw-warp");
+  if (swWarp) {
+    swWarp.textContent = isWarpOn ? "已启用" : "未启用";
+    swWarp.className = "tag " + (isWarpOn ? "" : "warn");
+  }
+  var swSub = $("#sw-sub");
+  if (swSub) {
+    swSub.textContent = d.sub_on === false ? "已关闭" : "已启用";
+    swSub.className = "tag " + (d.sub_on === false ? "warn" : "");
+  }
   setSub(d.suburl);
   if (Array.isArray(d.links)) { renderLinks(d.links); }
   if (d.proxy_env) { renderDetection(d.proxy_env); }
@@ -1326,19 +1436,132 @@ $("#btn-links").addEventListener("click", function () {
     }
   });
 });
-$("#btn-switch").addEventListener("click", function () {
-  var self = this;
-  var warp = $("#f-warp").value;
-  var sub = $("#f-subon").value;
-  if (!warp && !sub) { toast("请至少选择一项开关"); return; }
-  var jobs = [];
-  if (warp) { jobs.push(api("/api/warp", "POST", { action: warp })); }
-  if (sub) { jobs.push(api("/api/sub", "POST", { action: sub })); }
-  busy(self, Promise.all(jobs), "应用开关").then(function (list) {
-    var okAll = list.every(function (r) { return r && r.ok; });
-    if (okAll) { loadStatus(); }
+var btnSaveWarp = $("#btn-save-warp");
+if (btnSaveWarp) {
+  btnSaveWarp.addEventListener("click", function () {
+    var mode = $("#f-warp-mode").value;
+    busy(this, api("/api/warp", "POST", { action: "set_mode", mode: mode }), "应用出口代理模式").then(function (r) {
+      if (r && r.ok) {
+        toast(r.data && r.data.message ? r.data.message : "出口代理配置已更新生效");
+        loadStatus();
+      }
+    });
   });
-});
+}
+
+var btnTestWarp = $("#btn-test-warp");
+if (btnTestWarp) {
+  btnTestWarp.addEventListener("click", function () {
+    var box = $("#warp-test-result");
+    var details = $("#warp-test-details");
+    if (box) { box.style.display = "block"; }
+    if (details) { details.innerHTML = '<div style="color:var(--dim)">正在测试 Gemini / 谷歌 / AI 连通性，请稍候（约需 3-5 秒）…</div>'; }
+    busy(this, api("/api/warp/test"), "测试解锁中…").then(function (r) {
+      if (r && r.ok && r.data) {
+        var d = r.data;
+        var items = [
+          { name: "Gemini AI", res: d.gemini, target: "gemini.google.com" },
+          { name: "Google 搜索/服务", res: d.google, target: "google.com" },
+          { name: "YouTube", res: d.youtube, target: "youtube.com" },
+          { name: "ChatGPT / OpenAI", res: d.chatgpt, target: "chatgpt.com" }
+        ];
+        var cards = items.map(function (it) {
+          var pass = it.res && it.res.ok;
+          return '<div class="test-card ' + (pass ? "ok" : "fail") + '">' +
+            '<div><div style="font-weight:600">' + esc(it.name) + '</div><div class="dim" style="font-size:11px">' + esc(it.target) + '</div></div>' +
+            '<div class="test-status ' + (pass ? "ok" : "fail") + '">' + (pass ? "✅ 已解锁" : "⚠️ " + esc(it.res ? it.res.status : "未解锁")) + '</div>' +
+          '</div>';
+        }).join("");
+
+        var traceCard = '<div class="test-card ok" style="grid-column: 1 / -1">' +
+          '<div><div style="font-weight:600">Cloudflare 出口 IP &amp; 地区</div><div class="dim" style="font-size:11px">WARP 状态: ' + (d.warp_on ? "已开启 (WARP ON)" : "未开启 (直连)") + '</div></div>' +
+          '<div style="font-family:monospace;font-weight:600;color:#58a6ff">' + esc(d.warp_ip || "原生 IP") + (d.warp_loc ? " [" + esc(d.warp_loc) + "]" : "") + '</div>' +
+        '</div>';
+
+        if (details) { details.innerHTML = cards + traceCard; }
+        toast("解锁连通性测试完成");
+      }
+    });
+  });
+}
+
+var btnRegenWarp = $("#btn-regen-warp");
+if (btnRegenWarp) {
+  btnRegenWarp.addEventListener("click", function () {
+    if (!confirm("确定要重新向 Cloudflare 注册并获取全新的 WARP 账号与密钥吗？")) { return; }
+    busy(this, api("/api/warp", "POST", { action: "regen" }), "正在注册新账号…").then(function (r) {
+      if (r && r.ok) {
+        toast("WARP 账号已刷新并重载服务");
+        loadStatus();
+      }
+    });
+  });
+}
+
+var btnSubSw = $("#btn-sub-switch");
+if (btnSubSw) {
+  btnSubSw.addEventListener("click", function () {
+    var sub = $("#f-subon").value;
+    if (!sub) { toast("请选择订阅服务开关状态"); return; }
+    busy(this, api("/api/sub", "POST", { action: sub }), "保存订阅设置").then(function (r) {
+      if (r && r.ok) {
+        toast("订阅服务设置已更新");
+        loadStatus();
+      }
+    });
+  });
+}
+
+var btnCfStart = $("#btn-cf-start");
+if (btnCfStart) {
+  btnCfStart.addEventListener("click", function () {
+    var tok = ($("#f-cf-token").value || "").trim();
+    if (!tok) { toast("请输入 Cloudflare Tunnel Token"); return; }
+    busy(this, api("/api/cloudflared", "POST", { action: "set_token", token: tok }), "启动隧道中…").then(function (r) {
+      if (r && r.ok) {
+        toast("Cloudflare Tunnel 已成功启动");
+        loadStatus();
+      }
+    });
+  });
+}
+var btnCfStop = $("#btn-cf-stop");
+if (btnCfStop) {
+  btnCfStop.addEventListener("click", function () {
+    busy(this, api("/api/cloudflared", "POST", { action: "stop" }), "停止隧道中…").then(function (r) {
+      if (r && r.ok) {
+        toast("Cloudflare Tunnel 已停止");
+        loadStatus();
+      }
+    });
+  });
+}
+var btnCfInstall = $("#btn-cf-install");
+if (btnCfInstall) {
+  btnCfInstall.addEventListener("click", function () {
+    busy(this, api("/api/cloudflared", "POST", { action: "install" }), "下载安装中…").then(function (r) {
+      if (r && r.ok) {
+        toast("cloudflared 安装成功");
+        loadStatus();
+      }
+    });
+  });
+}
+var btnCfQuick = $("#btn-cf-quick");
+if (btnCfQuick) {
+  btnCfQuick.addEventListener("click", function () {
+    var msg = $("#cf-tunnel-msg");
+    if (msg) { msg.textContent = "正在启动临时快速隧道并申请域名，请稍候（约需 5 秒）…"; }
+    busy(this, api("/api/cloudflared", "POST", { action: "quick" }), "创建快速隧道…").then(function (r) {
+      if (r && r.ok && r.data && r.data.url) {
+        if (msg) {
+          msg.innerHTML = '✅ 临时访问地址: <a href="' + esc(r.data.url) + '" target="_blank" style="color:#58a6ff;text-decoration:underline">' + esc(r.data.url) + '</a> (外网直接免端口免证书访问)';
+        }
+        toast("快速隧道已就绪");
+      }
+    });
+  });
+}
 
 $("#btn-cfg").addEventListener("click", function () {
   var payload = {};
@@ -1650,6 +1873,10 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 status = self._handle_detect()
             elif path == "/api/links":
                 status = self._handle_links()
+            elif path == "/api/warp/test":
+                status = self._finish_cli(run_cli(["warp", "test"]))
+            elif path == "/api/cloudflared":
+                status = self._finish_cli(run_cli(["cf_tunnel", "status"]))
             else:
                 status = self._send_error_json(404, "路径不存在")
         except Exception as exc:  # 任何异常都不能让进程崩溃
@@ -1674,7 +1901,7 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 status = self._send_error_json(403, "CSRF 校验失败: %s" % reason)
                 return
             if path not in ("/api/protos", "/api/cfg", "/api/regen", "/api/reset",
-                            "/api/warp", "/api/sub", "/api/kill_third_party"):
+                            "/api/warp", "/api/sub", "/api/kill_third_party", "/api/cloudflared"):
                 self._drain_body()
                 status = self._send_error_json(404, "路径不存在")
                 return
@@ -1687,7 +1914,9 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/cfg":
                 status = self._handle_cfg(body)
             elif path == "/api/warp":
-                status = self._handle_switch(body, "warp")
+                status = self._handle_warp(body)
+            elif path == "/api/cloudflared":
+                status = self._handle_cloudflared(body)
             elif path == "/api/sub":
                 status = self._handle_switch(body, "sub")
             elif path == "/api/regen":
@@ -1830,15 +2059,55 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
         """POST /api/regen 与 /api/reset 的共用处理。"""
         return self._finish_cli(run_cli(args))
 
+    def _handle_warp(self, body):
+        """POST /api/warp —— 出口代理模式、刷新账号或启停。"""
+        if not isinstance(body, dict):
+            return self._send_error_json(400, "请求体必须是 JSON 对象")
+        action = str(body.get("action") or "set_mode").strip().lower()
+        mode = str(body.get("mode") or "").strip()
+        if action in ("set_mode", "mode"):
+            return self._finish_cli(run_cli(["warp", "set", mode or "warp_google"]))
+        elif action == "on":
+            return self._finish_cli(run_cli(["warp", "on", mode or "warp_google"]))
+        elif action == "off":
+            return self._finish_cli(run_cli(["warp", "off"]))
+        elif action == "regen":
+            return self._finish_cli(run_cli(["warp", "regen"]))
+        elif action == "test":
+            return self._finish_cli(run_cli(["warp", "test"]))
+        return self._send_error_json(400, "未知动作: %s" % action)
+
+    def _handle_cloudflared(self, body):
+        """POST /api/cloudflared —— 管理 cloudflared 穿透隧道。"""
+        if not isinstance(body, dict):
+            return self._send_error_json(400, "请求体必须是 JSON 对象")
+        action = str(body.get("action") or "").strip().lower()
+        if action == "install":
+            return self._finish_cli(run_cli(["cf_tunnel", "install"]))
+        elif action in ("set_token", "token"):
+            tok = str(body.get("token") or "").strip()
+            if not tok:
+                return self._send_error_json(400, "Token 不能为空")
+            return self._finish_cli(run_cli(["cf_tunnel", "token", tok]))
+        elif action == "stop":
+            return self._finish_cli(run_cli(["cf_tunnel", "stop"]))
+        elif action == "start":
+            return self._finish_cli(run_cli(["cf_tunnel", "start"]))
+        elif action == "quick":
+            port = str(body.get("port") or "").strip()
+            args = ["cf_tunnel", "quick"]
+            if port and port.isdigit():
+                args.append(port)
+            return self._finish_cli(run_cli(args))
+        return self._send_error_json(400, "未知动作: %s" % action)
+
     def _handle_switch(self, body, kind):
-        """POST /api/warp 与 /api/sub —— 只接受 on / off 两种动作。"""
+        """POST /api/sub —— 订阅服务开关。"""
         action = body.get("action")
         if isinstance(action, str):
             action = action.strip().lower()
         if action not in ("on", "off"):
             return self._send_error_json(400, "action 必须是 on 或 off")
-        if kind == "warp":
-            return self._finish_cli(run_cli(["warp", action]))
         return self._finish_cli(run_cli(["sub", action]))
 
     def _handle_kill_third_party(self, body):
