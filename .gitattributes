@@ -1,0 +1,7 @@
+* text=auto
+date eol=lf
+install.sh eol=lf
+server eol=lf
+client eol=lf
+LICENSE.md eol=lf
+README.md eol=lf

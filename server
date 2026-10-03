@@ -1,0 +1,1923 @@
+#!/bin/bash
+# =============================================================================
+#  朔月 Shuoyue — Debian 多协议旁路网关 & DNS (Server)
+#  原 de_GWD 重制版: nginx + DoH + Xray(vmess/vless/trojan + WS/TLS + Reality)
+#                + sing-box(Hysteria2/TUIC/AnyTLS) + Shadowsocks
+#                + 订阅服务(/sub) + BBR/CAKE 流量整形 + nftables flowtable
+#                + WARP 出站 + HAProxy 转发, 分享链接兼容 v2rayN 7.25.4
+#  基于原版 jacyl4/de_GWD (EPL-2.0) 的功能规格重写,全部组件改用官方上游。
+#  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
+#  仅供学习与研究。
+# =============================================================================
+VERSION="v1.2.0"
+# 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
+REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
+
+export DEBIAN_FRONTEND=noninteractive
+RED='\E[1;31m'; GREEN='\E[1;32m'; YELLOW='\E[1;33m'; BLUE='\E[1;34m'
+PURPLE='\E[1;35m'; CYAN='\E[1;36m'; WHITE='\E[1;37m'; GREY='\E[1;30m'; cRES='\E[0m'
+
+BASE=/opt/de_GWD
+CONF=$BASE/conf.json
+XRAYDIR=$BASE/xray
+SSLDIR=/var/www/ssl
+WEBDIR=/var/www/html
+XTLSUSER=www-data
+ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+[[ "$ARCH" == "x86_64" ]] && ARCH=amd64
+[[ "$ARCH" == "aarch64" ]] && ARCH=arm64
+virt=$(systemd-detect-virt 2>/dev/null || echo none)
+case "$virt" in
+  openvz|lxc|lxc-libvirt|systemd-nspawn|docker|podman|proot|pouch) VIRT_TYPE="container" ;;
+  *) VIRT_TYPE="vm" ;;
+esac
+
+[[ $(id -u) -ne 0 ]] && echo -e "${RED}请以 root 运行${cRES}" && exit 1
+
+# ---------------------------------------------------------------- helpers ---
+ok()   { echo -e "${WHITE}[ ${GREEN}✓${WHITE} ]${cRES} $*"; }
+warn() { echo -e "${WHITE}[ ${YELLOW}!${WHITE} ]${cRES} $*"; }
+err()  { echo -e "${WHITE}[ ${RED}✕${WHITE} ]${cRES} $*"; }
+die()  { err "$*"; exit 1; }
+
+ask()  { local v; read -rp "$1" v; echo "$v"; }
+ask_secret() { local v; read -rsp "$1" v; echo; echo "$v"; }
+
+# 物理网卡(继承原版判据: realpath 落在 /sys/devices 下且非 virtual/ifb)
+detect_nic() {
+  find /sys/class/net ! -type d 2>/dev/null | xargs --max-args=1 realpath 2>/dev/null \
+    | grep 'device' | grep -v 'virtual' | grep -v 'ifb' | awk -F'/' '{print$NF}' | head -n1
+}
+local_ip() {
+  local nic; nic=$(detect_nic); [[ -z $nic ]] && return
+  ip -4 a show "$nic" 2>/dev/null | grep -Po 'inet \K\d{1,3}(\.\d{1,3}){3}' | head -n1
+}
+wan_ip() { curl -4fsS --max-time 8 whatismyip.akamai.com 2>/dev/null || curl -4fsS --max-time 8 ifconfig.me 2>/dev/null; }
+
+svc_ok() { systemctl is-active "$1" >/dev/null 2>&1; }
+# 重启服务;容器/受限环境不支持 Nice= 时自动去除后重试(继承原版兜底模式)
+svc_restart() {
+  local s="$1"
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl restart "$s" >/dev/null 2>&1
+  if ! svc_ok "$s"; then
+    local u="/etc/systemd/system/$s.service"
+    [[ -f $u && $(grep -c '^Nice=' "$u" 2>/dev/null || echo 0) -gt 0 ]] || return 1
+    sed -i '/^Nice=/d' "$u"; systemctl daemon-reload
+    systemctl restart "$s" >/dev/null 2>&1
+  fi
+  svc_ok "$s"
+}
+
+# ------------------------------------------------------- conf.json storage ---
+conf_init() {
+  mkdir -p "$BASE" "$BASE/.repo" "$XRAYDIR"
+  [[ -f $CONF ]] && return
+  echo '{}' > "$CONF"; chmod 600 "$CONF"
+}
+conf_get() { [[ -f $CONF ]] && jq -r "$1 // empty" "$CONF" 2>/dev/null; }
+# 字符串写入: conf_set .domain "a.com"
+conf_set() {
+  # 值先经 jq -Rs 压成单行 JSON 字符串, 规避多行 argv 在部分平台的问题
+  jq --argjson v "$(printf '%s' "$2" | jq -Rs .)" "$1 = \$v" "$CONF" > "${CONF}.tmp" \
+    && mv -f "${CONF}.tmp" "$CONF" && chmod 600 "$CONF"
+}
+# 原始 JSON 写入: conf_raw '.relay' '[{...}]'
+conf_raw() {
+  # 值先压缩校验为单行 JSON
+  local compact; compact=$(printf '%s' "$2" | jq -c . 2>/dev/null) || return 1
+  jq "$1 = $compact" "$CONF" > "${CONF}.tmp" \
+    && mv -f "${CONF}.tmp" "$CONF" && chmod 600 "$CONF"
+}
+
+# ------------------------------------------------ GitHub release downloader ---
+# 用法: fetch_release <owner/repo> <asset_regex> <dest_file>
+# 通过 GitHub API 解析 latest release 资产;若仓库提供 checksums.txt 则校验 sha256
+fetch_release() {
+  local repo="$1" pattern="$2" dest="$3"
+  local api json url name
+  api="https://api.github.com/repos/$repo/releases/latest"
+  json=$(curl -fsSL --max-time 30 "$api" 2>/dev/null) || return 1
+  url=$(echo "$json" | jq -r --arg re "$pattern" \
+        '[.assets[] | select(.name | test($re))][0].browser_download_url // empty')
+  [[ -z $url ]] && return 1
+  name="${url##*/}"
+  curl -fsSL --max-time 300 -o "/tmp/$name" "$url" || return 1
+
+  local sums sumurl
+  sumurl=$(echo "$json" | jq -r '.assets[] | select(.name=="checksums.txt" or .name=="sha256sums.txt") | .browser_download_url' | head -n1)
+  if [[ -n $sumurl ]]; then
+    sums=$(curl -fsSL --max-time 30 "$sumurl" 2>/dev/null)
+    local want; want=$(echo "$sums" | awk -v n="$name" '$2==n || index($0,n){print$1}' | head -n1)
+    if [[ -n $want ]]; then
+      local got; got=$(sha256sum "/tmp/$name" | awk '{print$1}')
+      [[ "$got" != "$want" ]] && { rm -f "/tmp/$name"; return 1; }
+    fi
+  fi
+  mv -f "/tmp/$name" "$dest"
+  return 0
+}
+
+# ====================================================== 系统基线 (preInstall) ==
+swap_on() {
+  [[ $(systemctl is-active swap.target 2>/dev/null) == "active" ]] && return
+  systemctl unmask swap.target >/dev/null 2>&1; systemctl start swap.target >/dev/null 2>&1
+  [[ $(free -m | awk 'NR==3{print$2}') != "0" ]] && return
+  if [[ $(df -T / | awk '{print$2}' | tail -n1) == "btrfs" ]]; then
+    btrfs subvolume create /swap 2>/dev/null
+    btrfs filesystem mkswapfile --size 1g --uuid clear /swap/swapfile 2>/dev/null && swapon /swap/swapfile
+    grep -q '/swap/swapfile' /etc/fstab || echo "/swap/swapfile none swap defaults 0 0" >>/etc/fstab
+  else
+    fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
+    chmod 600 /swapfile; mkswap -U clear /swapfile >/dev/null; swapon /swapfile
+    grep -q '/swapfile' /etc/fstab || echo "/swapfile none swap defaults 0 0" >>/etc/fstab
+  fi
+  echo "RESUME=" >/etc/initramfs-tools/conf.d/resume 2>/dev/null
+}
+
+tcpTime() {
+  cat <<'EOF' > $BASE/tcpTime
+d=$(wget -qSO- --max-redirect=0 whatismyip.akamai.com 2>&1 | grep '^  Date:' | cut -d' ' -f5-8)
+[[ -z $d ]] && d=$(curl -sI --max-time 8 cloudflare.com | grep -i '^date:' | cut -d' ' -f2-)
+[[ -n $d ]] && date -s "$d" >/dev/null 2>&1 && hwclock -w
+EOF
+  sed -i "s|\$BASE|$BASE|g" "$BASE/tcpTime" 2>/dev/null
+  chmod +x "$BASE/tcpTime"
+}
+
+limits_conf() {
+  sed -i '/ulimit -SHn/d;/HISTCONTROL=/d;/alias reboot=/d' /etc/profile
+  cat <<'EOF' >>/etc/profile
+ulimit -SHn 1000000
+HISTCONTROL=ignoredups
+alias reboot="systemctl reboot"
+EOF
+  grep -q 'pam_limits.so' /etc/pam.d/common-session || echo -e "session required\tpam_limits.so" >>/etc/pam.d/common-session
+  cat <<'EOF' >/etc/security/limits.conf
+root     soft  nofile  1000000
+root     hard  nofile  1000000
+root     soft  nproc   1000000
+root     hard  nproc   1000000
+www-data soft  nofile  1000000
+www-data hard  nofile  1000000
+www-data soft  nproc   1000000
+www-data hard  nproc   1000000
+*        soft  nofile  1000000
+*        hard  nofile  1000000
+EOF
+  sed -i '/DefaultLimitCORE/d;/DefaultLimitNOFILE/d;/DefaultLimitNPROC/d' /etc/systemd/system.conf
+  cat <<'EOF' >>/etc/systemd/system.conf
+DefaultLimitCORE=1000000
+DefaultLimitNOFILE=1000000
+DefaultLimitNPROC=1000000
+EOF
+  systemctl daemon-reload
+}
+
+pkg_dep() {
+  local need="" p
+  for p in sudo wget curl git jq bc qrencode socat cron ca-certificates \
+           gnupg unzip dnsutils net-tools nftables chrony ethtool screen \
+           libmimalloc2.0 resolvconf unbound; do
+    dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
+  done
+  # irqbalance 多核有益
+  [[ $(nproc --all) -gt 1 ]] && ! dpkg -s irqbalance >/dev/null 2>&1 && need="$need irqbalance"
+  if [[ -n $need ]]; then
+    apt-get update -qq
+    if ! apt-get install -y -qq $need; then
+      # 旧发行版可能缺个别包: 逐个尝试, 缺的跳过不中断
+      local failed="" p2
+      warn "批量安装失败, 逐个尝试(旧系统可能缺少个别包)..."
+      for p2 in $need; do
+        apt-get install -y -qq "$p2" >/dev/null 2>&1 || failed="$failed $p2"
+      done
+      [[ -n $failed ]] && warn "以下包不可用已跳过:${failed}"
+    fi
+  fi
+  for p in ipset haveged systemd-timesyncd os-prober subversion; do
+    dpkg -s "$p" >/dev/null 2>&1 && apt-get remove --purge -y "$p" >/dev/null 2>&1
+  done
+}
+
+chrony_conf() {
+  cat <<'EOF' >/etc/chrony/chrony.conf
+server time.cloudflare.com iburst
+server time1.google.com iburst
+server ntp.aliyun.com iburst
+driftfile /var/lib/chrony/chrony.drift
+maxupdateskew 100.0
+rtcsync
+makestep 1 3
+leapsectz right/UTC
+EOF
+  systemctl enable chrony >/dev/null 2>&1; systemctl restart chrony >/dev/null 2>&1
+}
+
+apt_baseline() {
+  cat <<'EOF' >/etc/apt/apt.conf.d/01deGWD
+APT::Get::Assume-Yes "true";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+EOF
+  cat <<'EOF' >/etc/apt/apt.conf.d/71debconf
+Dpkg::Options { "--force-confdef"; "--force-confold"; };
+EOF
+  swap_on
+  # 无 NTP 环境先用 HTTP Date 头校时,否则 TLS 握手可能失败
+  tcpTime; [[ $VIRT_TYPE != "container" ]] && "$BASE/tcpTime"
+  echo "debconf debconf/frontend select Noninteractive" | debconf-set-selections
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade || warn "系统升级未完全成功(继续安装)"
+  DEBIAN_FRONTEND=noninteractive apt-get -y -qq autoremove --purge >/dev/null 2>&1 || true
+}
+
+sysctl_conf() {
+  [[ $VIRT_TYPE == "container" ]] && return 0
+  modprobe nf_conntrack ifb sch_cake 2>/dev/null
+  grep -q nf_conntrack /etc/modules-load.d/modules.conf 2>/dev/null || \
+    printf 'nf_conntrack\nifb\nsch_cake\n' >>/etc/modules-load.d/modules.conf
+  # 继承原版调优;修正: syncookies 开启(原版为 0 有 SYN Flood 风险)
+  cat <<'EOF' >/etc/sysctl.conf
+kernel.sysrq = 438
+vm.overcommit_memory = 1
+vm.swappiness = 5
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+fs.file-max = 1000000
+net.unix.max_dgram_qlen = 1024
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_buckets = 65536
+net.netfilter.nf_conntrack_tcp_loose = 1
+net.netfilter.nf_conntrack_tcp_be_liberal = 1
+net.netfilter.nf_conntrack_tcp_max_retrans = 3
+net.netfilter.nf_conntrack_tcp_timeout_established = 3600
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 15
+net.netfilter.nf_conntrack_udp_timeout = 15
+net.netfilter.nf_conntrack_udp_timeout_stream = 45
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = 65536
+net.core.rmem_default = 524288
+net.core.wmem_default = 524288
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+net.core.optmem_max = 524288
+net.mptcp.enabled = 1
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_local_reserved_ports = 53,9853,9890,9891,9892,8388,8442,8443,8444,8445,8446
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.all.route_localnet = 1
+net.ipv4.udp_mem = 4096 32768 524288
+net.ipv4.udp_rmem_min = 131072
+net.ipv4.udp_wmem_min = 131072
+net.ipv4.tcp_mem = 16384 131072 1048576
+net.ipv4.tcp_rmem = 4096 524288 8388608
+net.ipv4.tcp_wmem = 4096 524288 8388608
+net.ipv4.tcp_max_tw_buckets = 131072
+net.ipv4.tcp_max_orphans = 131072
+net.ipv4.tcp_max_syn_backlog = 32768
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_limit_output_bytes = 1048576
+net.ipv4.tcp_adv_win_scale = 2
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_ecn = 0
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_fastopen_blackhole_timeout_sec = 0
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_autocorking = 0
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = cake
+EOF
+  sysctl -p >/dev/null 2>&1
+}
+
+# =============================================== 流量整形 (CAKE + ifb, 继承原版) ==
+shaping_conf() {
+  # 容器内 tc/ifb 不可用
+  [[ $VIRT_TYPE == "container" ]] && return 0
+  cat <<'EOF' >/etc/rc_online.local
+#!/bin/bash
+# CAKE 双向整形(不限速,纯 AQM 抗 bufferbloat): lo 50us / 虚拟 200us / 物理 besteffort
+THP=/sys/kernel/mm/transparent_hugepage/enabled
+[[ -f $THP ]] && echo madvise > "$THP" 2>/dev/null
+
+nic_phys() {
+  find /sys/class/net ! -type d 2>/dev/null | xargs --max-args=1 realpath 2>/dev/null \
+    | grep 'device' | grep -v 'virtual' | grep -v 'ifb' | awk -F'/' '{print$NF}'
+}
+del_ifb() {  # 清理同名残留 ifb
+  local d
+  for d in $(find /sys/class/net ! -type d 2>/dev/null | xargs --max-args=1 realpath 2>/dev/null \
+      | grep 'ifb' | awk -F'/' '{print$NF}'); do
+    ip link set "$d" down 2>/dev/null; ip link delete "$d" 2>/dev/null
+  done
+}
+
+# 本地路由初始窗口
+for r in $(ip route show table local | grep -Ev 'linkdown|broadcast' | awk '{print$1}'); do
+  ip route change "$r" mtu 1500 initcwnd 32 initrwnd 32 fastopen_no_cookie 1 congctl lock cubic 2>/dev/null
+done
+ip route change local 127.0.0.0/8 dev lo table local mtu 65520 initcwnd 32 initrwnd 32 fastopen_no_cookie 1 congctl lock cubic 2>/dev/null
+for r in $(ip route | grep -E ' dev [a-z0-9@]+ ' | awk '{print$1" via "$3" dev "$5}' 2>/dev/null); do :; done
+defr=$(ip route show default | head -n1)
+[[ -n $defr ]] && ip route change $defr fastopen_no_cookie 1 2>/dev/null
+
+ip link set lo qlen 10000 mtu 65520
+del_ifb
+
+# ---- lo: 本机 nginx<->xray 回环也纳入 AQM
+tc qdisc del dev lo root 2>/dev/null
+tc qdisc add dev lo root cake unlimited rtt 50us diffserv4 dual-srchost nonat nowash no-split-gso ack-filter-aggressive raw egress
+tc qdisc del dev lo ingress 2>/dev/null
+tc qdisc add dev lo handle ffff: ingress 2>/dev/null
+if ! ip link show ifb4lo >/dev/null 2>&1; then ip link add name ifb4lo type ifb; fi
+ip link set ifb4lo qlen 10000 mtu 65520; ip link set ifb4lo up
+tc qdisc del dev ifb4lo root 2>/dev/null
+tc qdisc add dev ifb4lo root cake unlimited rtt 50us diffserv4 dual-dsthost nonat nowash no-split-gso no-ack-filter raw ingress
+tc filter del dev lo ingress 2>/dev/null
+tc filter add dev lo parent ffff: matchall action mirred egress redirect dev ifb4lo 2>/dev/null
+
+# ---- 虚拟网卡(排除 docker/ifb/lo/wg)
+for line in $(find /sys/class/net ! -type d 2>/dev/null | xargs --max-args=1 realpath 2>/dev/null \
+    | grep 'virtual' | grep -v 'ifb' | awk -F'/' '{print$NF}' | grep -v '^lo$' | grep -v '^docker0$'); do
+  tc qdisc del dev "$line" root 2>/dev/null
+  tc qdisc add dev "$line" root cake unlimited rtt 200us diffserv4 dual-srchost nonat nowash no-split-gso ack-filter raw overhead 18 mpu 64 egress
+  tc qdisc del dev "$line" ingress 2>/dev/null
+  tc qdisc add dev "$line" handle ffff: ingress 2>/dev/null
+  ifb="ifb4$(echo "$line" | cut -c1-11)"
+  if ! ip link show "$ifb" >/dev/null 2>&1; then ip link add name "$ifb" type ifb; fi
+  ip link set "$ifb" up
+  tc qdisc del dev "$ifb" root 2>/dev/null
+  tc qdisc add dev "$ifb" root cake unlimited rtt 200us diffserv4 dual-dsthost nonat nowash no-split-gso no-ack-filter raw overhead 18 mpu 64 ingress
+  tc filter del dev "$line" ingress 2>/dev/null
+  tc filter add dev "$line" parent ffff: matchall action mirred egress redirect dev "$ifb" 2>/dev/null
+done
+
+# ---- 物理网卡
+for line in $(nic_phys); do
+  tc qdisc del dev "$line" root 2>/dev/null
+  tc qdisc add dev "$line" root cake unlimited besteffort dual-srchost nonat nowash no-split-gso ack-filter ethernet egress
+  tc qdisc del dev "$line" ingress 2>/dev/null
+  tc qdisc add dev "$line" handle ffff: ingress 2>/dev/null
+  ifb="ifb4$(echo "$line" | cut -c1-11)"
+  if ! ip link show "$ifb" >/dev/null 2>&1; then ip link add name "$ifb" type ifb; fi
+  ip link set "$ifb" up
+  tc qdisc del dev "$ifb" root 2>/dev/null
+  tc qdisc add dev "$ifb" root cake unlimited diffserv4 dual-dsthost nonat nowash no-split-gso no-ack-filter ethernet ingress
+  tc filter del dev "$line" ingress 2>/dev/null
+  tc filter add dev "$line" parent ffff: matchall action mirred egress redirect dev "$ifb" 2>/dev/null
+  ethtool -s "$line" duplex full 2>/dev/null
+  # CAKE 逐包整形需要关闭网卡 offload
+  ethtool -K "$line" rx on tx on sg off gro off gso off tx-gso-partial off lro off tso off ufo off 2>/dev/null
+done
+
+ip tcp_metrics flush >/dev/null 2>&1
+ip route flush cache >/dev/null 2>&1
+EOF
+  chmod +x /etc/rc_online.local
+
+  mkdir -p /etc/systemd/system/networking.service.d
+  cat <<'EOF' >/etc/systemd/system/networking.service.d/override.conf
+[Service]
+ExecStartPost=/etc/rc_online.local
+EOF
+}
+
+# ================================================================ nftables ====
+nftables_conf() {
+  [[ $VIRT_TYPE == "container" ]] && return 0
+  mkdir -p "$BASE/nftables"
+  # flowtable 设备集启动时动态生成
+  cat <<'EOF' >"$BASE/nftables/flowtable_eth.sh"
+#!/bin/bash
+interface_FT=$(find /sys/class/net ! -type d 2>/dev/null | xargs --max-args=1 realpath 2>/dev/null \
+  | grep 'device' | awk -F'/' '{print$NF}' | xargs -n1 2>/dev/null | grep -v '^lo$' | grep -v '^ifb4' | tr '\n' ',')
+[[ -z $interface_FT ]] && interface_FT="lo,"
+echo "define flowtable_eth = { ${interface_FT%,} };" > /opt/de_GWD/nftables/flowtable.eth
+EOF
+  chmod +x "$BASE/nftables/flowtable_eth.sh"
+
+  cat <<'EOF' >"$BASE/nftables/default.nft"
+include "/opt/de_GWD/nftables/flowtable.eth"
+
+table inet bypassflow {
+    flowtable Acceleration {
+        hook ingress priority -300; devices = $flowtable_eth;
+    }
+    chain bypasschain {
+        type filter hook forward priority -300; policy accept;
+        ip daddr 172.16.0.0/24 flow offload @Acceleration   # WARP 子网
+        ip saddr 172.16.0.0/24 flow offload @Acceleration
+        ip daddr 172.17.0.0/16 flow offload @Acceleration   # docker 子网
+        ip saddr 172.17.0.0/16 flow offload @Acceleration
+    }
+}
+
+table inet filter {
+    chain INPUT {
+        type filter hook input priority 0; policy accept;
+        iifname "lo" accept
+        iifname "wgcf" accept
+        iifname "docker0" accept
+        iifname "ifb4lo" accept
+        iifname "ifb4wgcf" accept
+        ct state established,related accept
+        tcp flags != syn ct state new drop
+        tcp flags & (fin|syn) == (fin|syn) drop
+        tcp flags & (syn|rst) == (syn|rst) drop
+        tcp flags & (fin|syn|rst|psh|ack|urg) == 0 drop
+        tcp flags & (fin|psh|urg) == (fin|psh|urg) drop
+        ct state invalid counter drop
+        meta l4proto { tcp, udp } th dport 4711 drop
+    }
+    chain FORWARD {
+        type filter hook forward priority 0; policy accept;
+        iifname "wgcf" accept
+        oifname "wgcf" accept
+        counter jump DOCKER-USER
+        counter jump DOCKER-ISOLATION-STAGE-1
+        oifname "docker0" ct state related,established counter accept
+        oifname "docker0" counter jump DOCKER
+        iifname "docker0" oifname != "docker0" counter accept
+        iifname "docker0" oifname "docker0" counter accept
+    }
+    chain OUTPUT { type filter hook output priority 0; policy accept; }
+    chain DOCKER { }
+    chain DOCKER-USER { counter accept }
+    chain DOCKER-ISOLATION-STAGE-1 { iifname "docker0" oifname != "docker0" counter jump DOCKER-ISOLATION-STAGE-2; counter return }
+    chain DOCKER-ISOLATION-STAGE-2 { oifname "docker0" counter drop; counter return }
+}
+
+table inet router {
+    chain DOCKER { }
+    chain PREROUTING {
+        type nat hook prerouting priority dstnat; policy accept;
+        tcp flags & (syn|rst) == syn counter tcp option maxseg size set 1460
+    }
+    chain POSTROUTING {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname != "docker0" ip saddr 172.17.0.0/16 counter masquerade
+    }
+}
+EOF
+
+  cat <<'EOF' >/etc/systemd/system/nftables.service
+[Unit]
+Description=de_GWD nftables + CAKE shaping
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardInput=null
+ProtectSystem=full
+ProtectHome=true
+ExecStart=/etc/rc_online.local
+ExecStart=/opt/de_GWD/nftables/flowtable_eth.sh
+ExecStart=/usr/sbin/nft -f /opt/de_GWD/nftables/default.nft
+ExecStop=/usr/sbin/nft flush ruleset
+
+[Install]
+WantedBy=sysinit.target
+EOF
+  systemctl enable nftables >/dev/null 2>&1
+}
+
+# ============================================================ 组件安装: Xray ==
+install_xray() {
+  ok "安装 Xray-core (官方源)..."
+  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  [[ ! -x /usr/local/bin/xray ]] && die "Xray 安装失败"
+  mkdir -p "$XRAYDIR"
+  # dat 资产放官方位置,服务里用环境变量指向
+  mkdir -p /usr/local/share/xray
+  # 自有 systemd 单元(带 hardening,继承原版)
+  cat <<EOF >/etc/systemd/system/xray.service
+[Unit]
+Description=de_GWD Xray Service
+After=network.target nss-lookup.target
+
+[Service]
+User=$XTLSUSER
+ExecStart=/usr/local/bin/xray run -confdir $XRAYDIR
+Restart=on-failure
+RestartPreventExitStatus=23
+Environment=XRAY_LOCATION_ASSET=/usr/local/share/xray
+LimitNOFILE=10000000
+LimitNPROC=10000000
+LimitCORE=10000000
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  [[ $VIRT_TYPE != "container" ]] && cat <<EOF >>/etc/systemd/system/xray.service
+Nice=-8
+EOF
+  if [[ $XTLSUSER != "root" ]]; then
+    chown -R $XTLSUSER:$XTLSUSER "$XRAYDIR" 2>/dev/null
+    chmod 750 "$XRAYDIR"; chmod 640 "$XRAYDIR"/config.json 2>/dev/null
+    # reality 私钥等只读给运行用户
+  fi
+}
+
+# ================================================================= nginx =====
+install_nginx() {
+  ok "安装 nginx..."
+  # Debian 与 Ubuntu 官方源自适应; 源不可用时回退发行版包
+  local distro suite
+  distro=$(. /etc/os-release 2>/dev/null; echo "${ID:-debian}")
+  suite=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
+  rm -f /etc/apt/sources.list.d/nginx.list
+  if [[ -n $suite ]]; then
+    local base="https://nginx.org/packages/debian"
+    [[ $distro == "ubuntu" ]] && base="https://nginx.org/packages/ubuntu"
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://nginx.org/keys/nginx_signing.key -o /etc/apt/keyrings/nginx-archive-keyring.asc 2>/dev/null
+    if [[ -s /etc/apt/keyrings/nginx-archive-keyring.asc ]]; then
+      echo "deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.asc] $base $suite nginx" >/etc/apt/sources.list.d/nginx.list
+      apt-get update -qq 2>/dev/null
+    fi
+  fi
+  if ! apt-cache policy nginx 2>/dev/null | grep -q 'nginx.org'; then
+    rm -f /etc/apt/sources.list.d/nginx.list
+    apt-get update -qq 2>/dev/null
+  fi
+  apt-get install -y -qq nginx 2>/dev/null || apt-get install -y -qq nginx-core 2>/dev/null || true
+  systemctl stop nginx >/dev/null 2>&1
+  command -v nginx >/dev/null || die "nginx 安装失败"
+  mkdir -p /etc/nginx/conf.d /etc/nginx/stream.d "$WEBDIR" "$SSLDIR" /var/log/nginx
+  if [[ ! -f $SSLDIR/dhparam.pem ]]; then
+    ok "生成 dhparam (2048)..."
+    openssl dhparam -out "$SSLDIR/dhparam.pem" 2048 >/dev/null 2>&1
+  fi
+  systemctl enable nginx >/dev/null 2>&1
+}
+
+nginx_main_conf() {
+  # www-data 在 Debian/Ubuntu 基础系统始终存在, 发行版包与 nginx.org 包通用
+  cat <<EOF >/etc/nginx/nginx.conf
+user www-data;
+worker_processes auto;
+worker_rlimit_nofile 1000000;
+error_log /var/log/nginx/error.log warn;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 65535;
+    multi_accept on;
+    use epoll;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    server_tokens off;
+
+    log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+                    '\$status \$body_bytes_sent "\$http_referer" '
+                    '"\$http_user_agent" "\$http_x_forwarded_for"';
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 120s;
+    keepalive_requests 10000;
+    types_hash_max_size 2048;
+    client_max_body_size 512m;
+    client_body_buffer_size 128k;
+    reset_timedout_connection on;
+    server_names_hash_bucket_size 128;
+
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 256;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/xml+rss text/javascript;
+
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+}
+
+ssl_params_conf() {
+  # TLS 参数片段(修正原版: 关闭 0-RTT 防 0-RTT 重放)
+  cat <<'EOF' >/etc/nginx/conf.d/.ssl_certs
+ssl_certificate     /var/www/ssl/de_GWD.cer;
+ssl_certificate_key /var/www/ssl/de_GWD.key;
+ssl_dhparam         /var/www/ssl/dhparam.pem;
+ssl_protocols       TLSv1.3 TLSv1.2;
+ssl_prefer_server_ciphers on;
+ssl_ecdh_curve      X25519:secp384r1;
+ssl_conf_command Options KTLS;
+ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+ssl_session_tickets off;
+ssl_session_cache   shared:SSL:10m;
+ssl_session_timeout 6h;
+ssl_buffer_size     4k;
+ssl_stapling off;
+ssl_stapling_verify off;
+EOF
+  cat <<'EOF' >/etc/nginx/conf.d/.HSTS
+add_header X-Download-Options "noopen" always;
+add_header X-Permitted-Cross-Domain-Policies "none" always;
+add_header X-Robots-Tag "none" always;
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-Frame-Options "SAMEORIGIN" always;
+EOF
+}
+
+# 伪装站(轻量自绘,不再依赖原版 74 文件模板)
+decoy_site() {
+  [[ -f $WEBDIR/index.html ]] && return
+  cat <<'EOF' >"$WEBDIR/index.html"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Personal Notes</title>
+<style>
+body{margin:0;font-family:Georgia,serif;background:#faf8f5;color:#333;line-height:1.7}
+header{background:#2c3e50;color:#ecf0f1;padding:60px 20px;text-align:center}
+h1{margin:0;font-weight:400;letter-spacing:1px}
+main{max-width:720px;margin:40px auto;padding:0 20px}
+article{background:#fff;border:1px solid #e5e0da;border-radius:6px;padding:28px 32px;margin-bottom:28px}
+h2{margin-top:0;font-weight:400;color:#2c3e50}
+.meta{color:#999;font-size:.85em}
+footer{text-align:center;color:#aaa;padding:30px;font-size:.85em}
+</style>
+</head>
+<body>
+<header><h1>Personal Notes</h1><p>Things I keep forgetting</p></header>
+<main>
+<article><h2>Setting up a home server</h2><p class="meta">2026-08-14</p>
+<p>Finally moved the media library off the old laptop. Notes on the fan curve, idle temperatures and which SSD cage turned out to be a mistake.</p></article>
+<article><h2>Sourdough, attempt #12</h2><p class="meta">2026-07-02</p>
+<p>The starter survived the vacation. Higher hydration this time (78%) and a longer cold proof - the crumb is finally open.</p></article>
+<article><h2>Reading list updates</h2><p class="meta">2026-05-20</p>
+<p>Halfway through the second book on logistics networks. Also collected a few essays about packet radio history.</p></article>
+</main>
+<footer>© 2026 · powered by curiosity</footer>
+</body>
+</html>
+EOF
+  # 100MB 测速文件(供客户端 speedtest)
+  [[ -f $WEBDIR/spt ]] || dd if=/dev/zero of="$WEBDIR/spt" bs=1k count=102400 status=none
+  chmod 644 "$WEBDIR/index.html" "$WEBDIR/spt"
+}
+
+# 生成 /etc/nginx/conf.d/default.conf (标记块幂等重建,保留用户自定义段)
+# 生成 /etc/nginx/conf.d/default.conf (标记块幂等重建,保留用户自定义段)
+# 按 .protos 启用情况生成 vmess/vless/trojan 的 WS 反代 location
+nginx_web_conf() {
+  local domain port u6 vmpath custom=""
+  domain=$(conf_get '.domain'); port=$(conf_get '.port')
+  u6=$(uuid6 "$(conf_get '.uuids[0]')")
+  vmpath=$(conf_get '.path')
+
+  # 保留用户自定义段(最后一段 V2_END 之后的原始内容)
+  if [[ -f /etc/nginx/conf.d/default.conf ]] && grep -q '# V2_END' /etc/nginx/conf.d/default.conf; then
+    custom=$(sed -n '/# V2_END/,$p' /etc/nginx/conf.d/default.conf | tail -n +2 | sed '$ d')
+  fi
+
+  local quic_enabled=0 altsvc=""
+  if nginx -V 2>&1 | grep -q 'with-http_v3_module'; then
+    quic_enabled=1
+    altsvc='add_header Alt-Svc "h3=\":'"$port"'\";ma=86400" always;'
+  fi
+  # nginx >= 1.25 用 http2 on 指令, 旧版(如 Debian 1.22)用 listen http2
+  local h2line="    http2 on;"
+  local ngver; ngver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+  if [[ -z $ngver || $(printf '%s\n1.25.0\n' "$ngver" | sort -V | head -n1) != "1.25.0" ]]; then
+    h2line=""
+  fi
+
+  {
+    cat <<'EOF'
+# SERVER_BASE_START
+upstream xray_vmess {
+    server 127.0.0.1:9890;
+    keepalive 32;
+}
+upstream xray_vless {
+    server 127.0.0.1:9891;
+    keepalive 32;
+}
+upstream xray_trojan {
+    server 127.0.0.1:9892;
+    keepalive 32;
+}
+server {
+    listen __PORT__ default_server ssl fastopen=500 reuseport;
+EOF
+    if [[ $quic_enabled == 1 ]]; then
+      echo "    listen __PORT__ default_server quic reuseport;"
+      echo "$h2line"
+    else
+      echo "$h2line"
+    fi
+    cat <<'EOF'
+    server_name __DOMAIN__;
+    root /var/www/html;
+    index index.html index.htm;
+    error_page 497 https://$host:__PORT__$request_uri;
+    __ALTSVC__
+    include /etc/nginx/conf.d/.HSTS;
+    add_header Referrer-Policy "origin" always;
+    include /etc/nginx/conf.d/.ssl_certs;
+
+# DOH_START
+    location = /dns-query {
+        proxy_pass https://127.0.0.1:9853;
+        proxy_ssl_verify off;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_buffering off;
+        add_header Cache-Control no-cache;
+    }
+# DOH_END
+EOF
+    if proto_on vmess; then
+      cat <<'EOF'
+# VMESS_START
+    location __VMPATH__ {
+        if ($http_upgrade != "websocket") { return 404; }
+        proxy_pass http://xray_vmess;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_connect_timeout 600s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        chunked_transfer_encoding off;
+        proxy_buffering off;
+        add_header Cache-Control no-cache;
+    }
+# VMESS_END
+EOF
+    fi
+    if proto_on vless; then
+      cat <<'EOF'
+# VLESS_START
+    location __VLPATH__ {
+        if ($http_upgrade != "websocket") { return 404; }
+        proxy_pass http://xray_vless;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_connect_timeout 600s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        chunked_transfer_encoding off;
+        proxy_buffering off;
+        add_header Cache-Control no-cache;
+    }
+# VLESS_END
+EOF
+    fi
+    if proto_on trojan; then
+      cat <<'EOF'
+# TROJAN_START
+    location __TRPATH__ {
+        if ($http_upgrade != "websocket") { return 404; }
+        proxy_pass http://xray_trojan;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_connect_timeout 600s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        chunked_transfer_encoding off;
+        proxy_buffering off;
+        add_header Cache-Control no-cache;
+    }
+# TROJAN_END
+EOF
+    fi
+    echo "# V2_END"
+    [[ -n $custom ]] && echo "$custom"
+    echo "}"
+  } > /etc/nginx/conf.d/default.conf
+
+  sed -i "s|__PORT__|$port|g; s|__DOMAIN__|$domain|g; s|__VMPATH__|$vmpath|g; s|__VLPATH__|/v-$u6|g; s|__TRPATH__|/t-$u6|g" /etc/nginx/conf.d/default.conf
+  sed -i "s|__ALTSVC__|$altsvc|" /etc/nginx/conf.d/default.conf
+
+  if [[ $port == "443" ]]; then
+    cat <<'EOF' >/etc/nginx/conf.d/80.conf
+server {
+    listen 80 default_server reuseport;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+EOF
+  else
+    rm -f /etc/nginx/conf.d/80.conf
+  fi
+}
+
+# ============================================================= DoH (dnsproxy) ==
+install_doh() {
+  ok "安装 DoH 服务 (dnsproxy)..."
+  local garch=$ARCH
+  fetch_release "AdguardTeam/dnsproxy" "^dnsproxy-linux-$garch-.*\\.tar\\.gz$" /tmp/dnsproxy.tar.gz || die "dnsproxy 下载失败"
+  rm -rf /tmp/dnsproxy-ex && mkdir -p /tmp/dnsproxy-ex
+  tar -xzf /tmp/dnsproxy.tar.gz -C /tmp/dnsproxy-ex
+  local bin; bin=$(find /tmp/dnsproxy-ex -name dnsproxy -type f | head -n1)
+  [[ -z $bin ]] && die "dnsproxy 解包失败"
+  mv -f "$bin" "$BASE/dnsproxy" && chmod 755 "$BASE/dnsproxy"
+  rm -rf /tmp/dnsproxy.tar.gz /tmp/dnsproxy-ex
+
+  cat <<'EOF' >/etc/systemd/system/doh-server.service
+[Unit]
+Description=de_GWD DoH Server (dnsproxy)
+After=network.target unbound.service
+Wants=unbound.service
+
+[Service]
+ExecStart=/opt/de_GWD/dnsproxy --listen=127.0.0.1 --https-port=9853 --tls-crt=/var/www/ssl/de_GWD.cer --tls-key=/var/www/ssl/de_GWD.key --upstream=udp://127.0.0.1:53 --upstream=tcp://127.0.0.1:53 --cache --cache-size=8192 --cache-min-ttl=60
+Restart=always
+RestartSec=2
+LimitNOFILE=1000000
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/www/ssl
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl enable doh-server >/dev/null 2>&1
+}
+
+# ================================================================= unbound ====
+unbound_conf() {
+  ok "配置 unbound (本地递归/转发 DNS)..."
+  cat <<'EOF' >/etc/unbound/unbound.conf
+server:
+    verbosity: 0
+    interface: 127.0.0.1
+    port: 53
+    do-ip4: yes
+    do-udp: yes
+    do-tcp: yes
+    do-ip6: no
+    prefer-ip6: no
+    edns-buffer-size: 1232
+    prefetch: yes
+    prefetch-key: yes
+    qname-minimisation: yes
+    aggressive-nsec: yes
+    so-reuseport: yes
+    so-rcvbuf: 4m
+    so-sndbuf: 4m
+    num-threads: 2
+    msg-cache-size: 128m
+    rrset-cache-size: 256m
+    msg-cache-slabs: 4
+    rrset-cache-slabs: 4
+    infra-cache-slabs: 4
+    key-cache-slabs: 4
+    auto-trust-anchor-file: "/var/lib/unbound/root.key"
+forward-zone:
+    name: "."
+    forward-addr: 1.1.1.1
+    forward-addr: 8.8.8.8
+    forward-addr: 9.9.9.9
+    forward-first: no
+EOF
+  unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
+  # DNSSEC 信任锚(有根密钥才启用验证)
+  if [[ -s /var/lib/unbound/root.key ]]; then
+    grep -q 'auto-trust-anchor' /etc/unbound/unbound.conf || true
+  fi
+  cat <<'EOF' >/etc/systemd/system/unbound.service
+[Unit]
+Description=de_GWD unbound DNS
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/unbound -d
+Restart=on-failure
+ReadOnlyPaths=/etc/unbound
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl stop systemd-resolved >/dev/null 2>&1
+  systemctl disable systemd-resolved >/dev/null 2>&1
+  systemctl mask systemd-resolved >/dev/null 2>&1
+  # 直接落实体文件(兼容 Ubuntu systemd-resolved 的 stub 符号链接场景)
+  rm -f /etc/resolv.conf
+  printf 'nameserver 127.0.0.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+  systemctl enable unbound >/dev/null 2>&1
+}
+
+# =========================================================== TLS 证书 acme.sh ==
+ssl_install_dir() {
+  mkdir -p "$SSLDIR"
+  rm -f "$SSLDIR"/*.cer "$SSLDIR"/*.key
+  [[ -f $SSLDIR/dhparam.pem ]] || openssl dhparam -out "$SSLDIR/dhparam.pem" 2048 >/dev/null 2>&1
+}
+
+make_ssl_webroot() {   # 443: HTTP 验证
+  local domain; domain=$(conf_get '.domain')
+  ok "申请证书 (webroot): $domain"
+  curl -s https://get.acme.sh | sh -s email=admin@"$domain" >/dev/null 2>&1
+  /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+  ssl_install_dir
+  # 临时 80 站点供验证
+  cat <<'EOF' >/etc/nginx/conf.d/default.conf
+server {
+    listen 80 default_server reuseport;
+    server_name __DOMAIN__;
+    root /var/www/html;
+}
+EOF
+  sed -i "s/__DOMAIN__/$domain/" /etc/nginx/conf.d/default.conf
+  nginx -t >/dev/null 2>&1 && systemctl restart nginx
+  if ! /root/.acme.sh/acme.sh --issue -d "$domain" -w "$WEBDIR" -k ec-256 --server letsencrypt; then
+    die "证书签发失败(检查域名解析是否指向本机,且 80 端口可访问)"
+  fi
+  /root/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+    --key-file "$SSLDIR/de_GWD.key" --fullchain-file "$SSLDIR/de_GWD.cer" \
+    --reloadcmd "nginx -s reload" >/dev/null 2>&1
+  chown root:www-data "$SSLDIR"/*.key 2>/dev/null && chmod 640 "$SSLDIR"/*.key 2>/dev/null
+  chmod 644 "$SSLDIR"/*.cer "$SSLDIR/dhparam.pem" 2>/dev/null
+}
+
+make_ssl_cf() {   # 非 443 端口: Cloudflare DNS API 验证(支持 Token 或全局 Key)
+  local domain port token zoneid key email
+  domain=$(conf_get '.domain'); port=$(conf_get '.port')
+  ok "申请证书 (Cloudflare DNS): $domain"
+  echo "Cloudflare 凭据(用于 DNS 验证,二选一):"
+  echo "  [1] API Token (推荐,权限 Zone.DNS Edit)"
+  echo "  [2] Global API Key + 邮箱 (旧式)"
+  local style; style=$(ask "选择 [1/2]: ")
+  if [[ $style == "2" ]]; then
+    key=$(ask_secret "CF Global API Key: "); email=$(ask "CF Email: ")
+    export CF_Key="$key" CF_Email="$email"
+  else
+    token=$(ask_secret "CF API Token: ")
+    zoneid=$(ask "CF Zone ID (可选,回车跳过): ")
+    export CF_Token="$token"
+    [[ -n $zoneid ]] && export CF_Zone_ID="$zoneid"
+  fi
+  local top; top=$(echo "$domain" | rev | awk -F. '{print $1"."$2}' | rev)
+  curl -s https://get.acme.sh | sh -s email=admin@"$domain" >/dev/null 2>&1
+  /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+  ssl_install_dir
+  if ! /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$top" -d "*.$top" -k ec-256 --server letsencrypt --dnssleep 120; then
+    die "证书签发失败(检查 Cloudflare 凭据)"
+  fi
+  /root/.acme.sh/acme.sh --install-cert -d "$top" --ecc \
+    --key-file "$SSLDIR/de_GWD.key" --fullchain-file "$SSLDIR/de_GWD.cer" \
+    --reloadcmd "nginx -s reload" >/dev/null 2>&1
+  chmod 600 "$SSLDIR"/*.key 2>/dev/null
+  chown root:www-data "$SSLDIR"/*.key 2>/dev/null && chmod 640 "$SSLDIR"/*.key 2>/dev/null
+  chmod 644 "$SSLDIR"/*.cer "$SSLDIR/dhparam.pem" 2>/dev/null
+}
+
+# ============================================================ Xray 配置生成 ===
+xray_uuid_gen() { cat /proc/sys/kernel/random/uuid; }
+uuid6() { printf %s "$1" | tr -d '-' | tail -c 6; }
+proto_on() { [[ $(conf_get ".protos.$1") == "true" ]]; }
+any_proto() { [[ -n $(conf_get '.protos' | jq -r 'to_entries | map(select(.value==true)) | .[0].key // empty' 2>/dev/null) ]]; }
+domain_proto_on() { proto_on vmess || proto_on vless || proto_on trojan || proto_on trojantcp; }
+sb_proto_on() { proto_on hy2 || proto_on tuic || proto_on anytls; }
+
+# 自签证书(hy2/tuic/anytls 在无域名证书时使用, 分享链接带 insecure=1)
+ensure_self_cert() {
+  [[ -s $SSLDIR/self.cer && -s $SSLDIR/self.key ]] && return 0
+  mkdir -p "$SSLDIR"
+  openssl req -new -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout "$SSLDIR/self.key" -out "$SSLDIR/self.cer" -days 3650 -subj "/CN=de_GWD" >/dev/null 2>&1
+  chown root:www-data "$SSLDIR/self.key" 2>/dev/null; chmod 640 "$SSLDIR/self.key" 2>/dev/null
+  chmod 644 "$SSLDIR/self.cer" 2>/dev/null
+}
+# 输出: <证书> <私钥> <自签标记0/1>
+tls_cert_pair() {
+  if [[ -s $SSLDIR/de_GWD.cer && -s $SSLDIR/de_GWD.key ]]; then
+    echo "$SSLDIR/de_GWD.cer $SSLDIR/de_GWD.key 0"
+  else
+    ensure_self_cert
+    echo "$SSLDIR/self.cer $SSLDIR/self.key 1"
+  fi
+}
+
+xray_inbound_vmess() {
+  jq -n --arg id "$(conf_get '.uuids[0]')" --arg path "$(conf_get '.path')" '{
+    listen: "127.0.0.1", port: 9890, protocol: "vmess",
+    settings: { clients: [{ id: $id, alterId: 0 }] },
+    streamSettings: { network: "ws", security: "none",
+      wsSettings: { path: $path },
+      sockopt: { tcpFastOpen: true, tcpMptcp: true } },
+    sniffing: { enabled: true, destOverride: ["http","tls","quic"] } }'
+}
+xray_inbound_vless_ws() {
+  jq -n --arg id "$(conf_get '.uuids[0]')" --arg path "/v-$(uuid6 "$(conf_get '.uuids[0]')")" '{
+    listen: "127.0.0.1", port: 9891, protocol: "vless",
+    settings: { clients: [{ id: $id }], decryption: "none" },
+    streamSettings: { network: "ws", security: "none",
+      wsSettings: { path: $path },
+      sockopt: { tcpFastOpen: true, tcpMptcp: true } },
+    sniffing: { enabled: true, destOverride: ["http","tls","quic"] } }'
+}
+xray_inbound_trojan_ws() {
+  jq -n --arg id "$(conf_get '.uuids[0]')" --arg path "/t-$(uuid6 "$(conf_get '.uuids[0]')")" '{
+    listen: "127.0.0.1", port: 9892, protocol: "trojan",
+    settings: { clients: [{ password: $id }] },
+    streamSettings: { network: "ws", security: "none",
+      wsSettings: { path: $path },
+      sockopt: { tcpFastOpen: true, tcpMptcp: true } },
+    sniffing: { enabled: true, destOverride: ["http","tls"] } }'
+}
+xray_inbound_trojan_tcp() {
+  local cert key; read -r cert key _ <<< "$(tls_cert_pair)"
+  jq -n --arg id "$(conf_get '.uuids[0]')" --arg c "$cert" --arg k "$key" '{
+    listen: "0.0.0.0", port: 8442, protocol: "trojan",
+    settings: { clients: [{ password: $id }] },
+    streamSettings: { network: "tcp", security: "tls",
+      tlsSettings: { certificates: [{ certificateFile: $c, keyFile: $k }] } },
+    sniffing: { enabled: true, destOverride: ["http","tls"] } }'
+}
+xray_inbound_ss() {
+  jq -n --arg pw "$(conf_get '.uuids[0]')" '{
+    listen: "0.0.0.0", port: 8388, protocol: "shadowsocks",
+    settings: { method: "chacha20-ietf-poly1305", password: $pw, network: "tcp,udp" } }'
+}
+xray_inbound_reality() {   # VLESS + Reality (免域名)
+  local port priv uuids
+  port=$(conf_get '.reality.port'); priv=$(conf_get '.reality.private')
+  uuids=$(conf_get '.uuids[]')
+  local clients="[]"
+  clients=$(echo "$uuids" | while read -r u; do
+    [[ -z $u ]] && continue
+    jq -cn --arg id "$u" '[{id:$id, flow:"xtls-rprx-vision"}]'
+  done | jq -s 'add // []')
+  jq -n --argjson clients "$clients" --arg priv "$priv" --argjson port "$port" \
+        --arg dest "$(conf_get '.reality.dest')" --arg sni "$(conf_get '.reality.sni')" \
+        --arg sid "$(conf_get '.reality.shortid')" '
+  {
+    listen: "0.0.0.0",
+    port: $port,
+    protocol: "vless",
+    settings: { clients: $clients, decryption: "none" },
+    streamSettings: {
+      network: "tcp",
+      security: "reality",
+      realitySettings: {
+        show: false,
+        dest: $dest,
+        xver: 0,
+        serverNames: [$sni],
+        privateKey: $priv,
+        shortIds: [$sid]
+      }
+    },
+    sniffing: { enabled: true, destOverride: ["http","tls","quic"] }
+  }'
+}
+
+xray_gen_config() {
+  local inbounds="[]"
+  if proto_on vmess;     then inbounds=$(echo "$inbounds" | jq --argjson i "$(xray_inbound_vmess)" '. + [$i]'); fi
+  if proto_on vless;     then inbounds=$(echo "$inbounds" | jq --argjson i "$(xray_inbound_vless_ws)" '. + [$i]'); fi
+  if proto_on trojan;    then inbounds=$(echo "$inbounds" | jq --argjson i "$(xray_inbound_trojan_ws)" '. + [$i]'); fi
+  if proto_on trojantcp; then inbounds=$(echo "$inbounds" | jq --argjson i "$(xray_inbound_trojan_tcp)" '. + [$i]'); fi
+  if proto_on ss;        then inbounds=$(echo "$inbounds" | jq --argjson i "$(xray_inbound_ss)" '. + [$i]'); fi
+  if proto_on reality && [[ -n $(conf_get '.reality.private') ]]; then
+    inbounds=$(echo "$inbounds" | jq --argjson i "$(xray_inbound_reality)" '. + [$i]')
+  fi
+  local outbounds='[
+    {"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"tcpFastOpen":true,"tcpNoDelay":true}}},
+    {"tag":"blocked","protocol":"blackhole","settings":{"response":{"type":"http"}}}
+  ]'
+  jq -n --argjson inb "$inbounds" --argjson outb "$outbounds" '{
+    log: { access: "none", error: "/var/log/xray-error.log", loglevel: "warning" },
+    routing: { rules: [] },
+    inbounds: $inb,
+    outbounds: $outb
+  }' > "$XRAYDIR/config.json"
+  chmod 640 "$XRAYDIR/config.json" 2>/dev/null
+  if [[ $XTLSUSER != "root" ]]; then chown $XTLSUSER:$XTLSUSER "$XRAYDIR/config.json"; fi
+  return 0
+}
+
+reality_keygen() {
+  local keys pub priv sni shortid dest port
+  keys=$(/usr/local/bin/xray x25519 2>/dev/null) || die "xray x25519 失败"
+  pub=$(echo "$keys" | awk '/Public key/{print$3}')
+  priv=$(echo "$keys" | awk '/Private key/{print$3}')
+  [[ -z $pub || -z $priv ]] && die "reality 密钥解析失败"
+  shortid=$(openssl rand -hex 8)
+  dest=$(ask "Reality dest (回车=www.microsoft.com:443): "); dest=${dest:-www.microsoft.com:443}
+  sni=${dest%%:*}
+  port=$(ask "Reality 端口 (回车=8443): "); port=${port:-8443}
+  conf_raw '.reality' "{\"enable\":true,\"port\":$port,\"private\":\"$priv\",\"public\":\"$pub\",\"shortid\":\"$shortid\",\"dest\":\"$dest\",\"sni\":\"$sni\"}"
+  conf_raw '.protos' "$(conf_get '.protos // {}' | jq '. + {reality:true}')"
+}
+
+# ====================================================== sing-box (hy2/tuic/anytls) ==
+install_singbox() {
+  [[ $1 != "--force" && -x $BASE/singbox/sing-box ]] && return 0
+  ok "安装 sing-box (官方 release)..."
+  mkdir -p "$BASE/singbox"
+  fetch_release "SagerNet/sing-box" "sing-box-.*-linux-${ARCH}\\.tar\\.gz$" /tmp/singbox.tar.gz || die "sing-box 下载失败"
+  rm -rf /tmp/sb-ex && mkdir -p /tmp/sb-ex
+  tar -xzf /tmp/singbox.tar.gz -C /tmp/sb-ex
+  local bin; bin=$(find /tmp/sb-ex -name sing-box -type f | head -n1)
+  [[ -z $bin ]] && die "sing-box 解包失败"
+  mv -f "$bin" "$BASE/singbox/sing-box" && chmod 755 "$BASE/singbox/sing-box"
+  rm -rf /tmp/singbox.tar.gz /tmp/sb-ex
+  cat <<EOF >/etc/systemd/system/sing-box.service
+[Unit]
+Description=de_GWD sing-box server (Hysteria2/TUIC/AnyTLS)
+After=network.target
+
+[Service]
+User=www-data
+ExecStart=$BASE/singbox/sing-box run -c $BASE/singbox/config.json
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/www/ssl
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chown -R www-data:www-data "$BASE/singbox" 2>/dev/null
+  systemctl enable sing-box >/dev/null 2>&1
+}
+
+singbox_gen_config() {
+  local cert key; read -r cert key _ <<< "$(tls_cert_pair)"
+  local inb="[]"
+  if proto_on hy2; then
+    inb=$(jq -n --argjson a "$inb" --arg c "$cert" --arg k "$key" --arg pw "$(conf_get '.uuids[0]')" \
+      '$a + [{type:"hysteria2", tag:"hy2-in", listen:"::", listen_port:8444,
+              users:[{name:"u1", password:$pw}],
+              tls:{enabled:true, certificate_path:$c, key_path:$k}}]')
+  fi
+  if proto_on tuic; then
+    inb=$(jq -n --argjson a "$inb" --arg c "$cert" --arg k "$key" --arg id "$(conf_get '.uuids[0]')" \
+      '$a + [{type:"tuic", tag:"tuic-in", listen:"::", listen_port:8445,
+              users:[{name:"u1", uuid:$id, password:$id}],
+              congestion_control:"bbr", zero_rtt_handshake:false,
+              tls:{enabled:true, alpn:["h3"], certificate_path:$c, key_path:$k}}]')
+  fi
+  if proto_on anytls; then
+    inb=$(jq -n --argjson a "$inb" --arg c "$cert" --arg k "$key" --arg pw "$(conf_get '.uuids[0]')" \
+      '$a + [{type:"anytls", tag:"atls-in", listen:"::", listen_port:8446, password:$pw,
+              tls:{enabled:true, certificate_path:$c, key_path:$k}}]')
+  fi
+  jq -n --argjson inb "$inb" '{
+    log: { level: "warn", timestamp: true },
+    inbounds: $inb,
+    outbounds: [{ type: "direct", tag: "direct" }],
+    route: { final: "direct" }
+  }' > "$BASE/singbox/config.json"
+  chmod 640 "$BASE/singbox/config.json" 2>/dev/null
+  chown www-data:www-data "$BASE/singbox/config.json" 2>/dev/null
+}
+
+# ================================================================ 分享链接 ====
+# 逐行输出所有已启用协议的 v2rayN 兼容分享链接
+gen_links() {
+  local uuid0 host u6 port
+  uuid0=$(conf_get '.uuids[0]'); u6=$(uuid6 "$uuid0")
+  host=$(conf_get '.domain'); [[ -z $host ]] && host=$(wan_ip)
+  local _c _k insc; read -r _c _k insc <<< "$(tls_cert_pair)"
+  if proto_on vmess; then
+    port=$(conf_get '.port')
+    local vj
+    vj=$(jq -cn --arg add "$host" --arg port "$port" --arg id "$uuid0" \
+      --arg path "$(conf_get '.path')" --arg host "$host" \
+      '{v:"2",ps:($add+"-vmess"),add:$add,port:$port,id:$id,aid:"0",scy:"auto",
+        net:"ws",type:"none",host:$host,path:$path,tls:"tls",sni:$host}')
+    echo "vmess://$(printf %s "$vj" | base64 -w0)"
+  fi
+  if proto_on vless; then
+    port=$(conf_get '.port')
+    echo "vless://$uuid0@$host:$port?encryption=none&security=tls&sni=$host&fp=chrome&type=ws&host=$host&path=/v-$u6#vless-ws"
+  fi
+  if proto_on trojan; then
+    port=$(conf_get '.port')
+    echo "trojan://$uuid0@$host:$port?security=tls&sni=$host&type=ws&host=$host&path=/t-$u6#trojan-ws"
+  fi
+  if proto_on trojantcp; then
+    echo "trojan://$uuid0@$host:8442?security=tls&sni=$host&type=tcp#trojan-tcp"
+  fi
+  if proto_on ss; then
+    local sup; sup=$(printf %s "chacha20-ietf-poly1305:$uuid0" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+    echo "ss://$sup@$host:8388#shadowsocks"
+  fi
+  if proto_on reality && [[ -n $(conf_get '.reality.public') ]]; then
+    local rp pbk sni sid
+    rp=$(conf_get '.reality.port'); pbk=$(conf_get '.reality.public')
+    sni=$(conf_get '.reality.sni'); sid=$(conf_get '.reality.shortid')
+    echo "vless://$uuid0@$host:$rp?security=reality&encryption=none&pbk=$pbk&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=$sni&sid=$sid#reality"
+  fi
+  if proto_on hy2; then
+    echo "hy2://$uuid0@$host:8444?sni=$host&insecure=$insc#hysteria2"
+  fi
+  if proto_on tuic; then
+    echo "tuic://$uuid0:$uuid0@$host:8445?congestion_control=bbr&alpn=h3&sni=$host&allow_insecure=$insc#tuic"
+  fi
+  if proto_on anytls; then
+    echo "anytls://$uuid0@$host:8446?sni=$host&insecure=$insc#anytls"
+  fi
+  return 0
+}
+
+# 订阅文件: base64(全部链接), 由 nginx 以 /sub/<token> 提供
+gen_sub_all() {
+  local token; token=$(conf_get '.subtoken')
+  [[ -z $token || ! -d $WEBDIR ]] && return 0
+  mkdir -p "$WEBDIR/sub"
+  gen_links | base64 -w0 > "$WEBDIR/sub/$token"
+  chmod 644 "$WEBDIR/sub/$token"
+  systemctl is-active nginx >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1
+  return 0
+}
+
+# ================================================================= 安装流程 ===
+ask_domain_port() {
+  local dp domain port
+  while :; do
+    dp=$(ask "输入域名(可带端口,如 a.com 或 a.com:8443): ")
+    [[ "$dp" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] && break
+    warn "域名格式不正确"
+  done
+  domain=${dp%%:*}
+  port=$(echo "$dp" | grep -q ':' && echo "${dp##*:}" || echo 443)
+  conf_set '.domain' "$domain"; conf_set '.port' "$port"
+}
+
+installGWD() {
+  echo
+  echo -e "${CYAN}=== de_GWD Remake 安装 (多协议) ===${cRES}"
+  echo "  [1] vmess+WS+TLS    (需域名, nginx 443, 原版同款)"
+  echo "  [2] vless+WS+TLS    (需域名, nginx 443)"
+  echo "  [3] trojan+WS+TLS   (需域名, nginx 443)"
+  echo "  [4] trojan+TCP+TLS  (需域名, 端口 8442)"
+  echo "  [5] vless+Reality   (免域名, 端口 8443)"
+  echo "  [6] Shadowsocks     (端口 8388, tcp+udp)"
+  echo "  [7] Hysteria2       (UDP, 端口 8444)"
+  echo "  [8] TUIC v5         (UDP, 端口 8445)"
+  echo "  [9] AnyTLS          (端口 8446)"
+  echo "  [A] 全部(推荐)"
+  local sel; sel=$(ask "选择协议(数字/字母组合, 空格分隔, 回车=A): "); sel=${sel:-A}
+  conf_init
+  local protos='{}' tok
+  if [[ "$sel" =~ ^[Aa]$ ]]; then
+    protos='{"vmess":true,"vless":true,"trojan":true,"trojantcp":true,"reality":true,"ss":true,"hy2":true,"tuic":true,"anytls":true}'
+  else
+    for tok in $sel; do
+      case $tok in
+        1) protos=$(echo "$protos" | jq '. + {vmess:true}') ;;
+        2) protos=$(echo "$protos" | jq '. + {vless:true}') ;;
+        3) protos=$(echo "$protos" | jq '. + {trojan:true}') ;;
+        4) protos=$(echo "$protos" | jq '. + {trojantcp:true}') ;;
+        5) protos=$(echo "$protos" | jq '. + {reality:true}') ;;
+        6) protos=$(echo "$protos" | jq '. + {ss:true}') ;;
+        7) protos=$(echo "$protos" | jq '. + {hy2:true}') ;;
+        8) protos=$(echo "$protos" | jq '. + {tuic:true}') ;;
+        9) protos=$(echo "$protos" | jq '. + {anytls:true}') ;;
+        *) warn "忽略: $tok" ;;
+      esac
+    done
+  fi
+  conf_raw '.protos' "$protos"
+  any_proto || die "未选择任何协议"
+
+  conf_raw '.uuids' "[\"$(xray_uuid_gen)\"]"
+  conf_set '.path' "/$(uuid6 "$(conf_get '.uuids[0]')")"
+  conf_set '.subtoken' "$(openssl rand -hex 8)"
+
+  if domain_proto_on; then
+    ask_domain_port
+  else
+    conf_set '.domain' ""; conf_set '.port' "443"
+  fi
+
+  ok "基线环境..."
+  apt_baseline; pkg_dep; limits_conf; sysctl_conf
+  unbound_conf
+  svc_restart unbound && ok "unbound" || warn "unbound 未启动"
+  shaping_conf; nftables_conf
+  svc_restart nftables && ok "nftables + CAKE 整形" || warn "nftables 未启动"
+
+  install_xray
+
+  if domain_proto_on; then
+    install_nginx
+    install_doh
+    svc_restart doh-server && ok "DoH 服务" || warn "DoH 未启动"
+    decoy_site
+    if [[ $(conf_get '.port') == "443" ]]; then
+      make_ssl_webroot
+    else
+      make_ssl_cf
+    fi
+  fi
+
+  if proto_on reality && [[ -z $(conf_get '.reality.private') ]]; then
+    reality_keygen
+  fi
+
+  if sb_proto_on; then
+    install_singbox
+    singbox_gen_config
+    svc_restart sing-box && ok "sing-box (Hysteria2/TUIC/AnyTLS)" || warn "sing-box 未启动"
+  fi
+
+  xray_gen_config
+  if domain_proto_on; then
+    nginx_main_conf; ssl_params_conf; nginx_web_conf
+    nginx -t >/dev/null 2>&1 && systemctl restart nginx && ok "nginx" || warn "nginx 配置异常,请检查 nginx -t"
+  fi
+  svc_restart xray && ok "Xray" || { err "Xray 未启动"; journalctl -u xray -n 20 --no-pager; }
+
+  gen_sub_all
+  enable_autoupdate_ask
+  printNode
+  echo
+  ok "安装完成!以上即全部节点信息(v2rayN 导入示例见上)。"
+  ok "随时输入 shuoyue 打开管理菜单(一键脚本用户)或 bash server。"
+}
+
+updateGWD() {
+  echo -e "${CYAN}=== 更新 de_GWD Remake ===${cRES}"
+  conf_init
+  any_proto || die "尚未安装,请先选择菜单 1"
+  apt_baseline
+  pkg_dep
+  install_xray
+  if domain_proto_on; then
+    install_nginx
+    install_doh
+    svc_restart doh-server
+    [[ -f $SSLDIR/de_GWD.cer ]] || { [[ $(conf_get '.port') == "443" ]] && make_ssl_webroot || make_ssl_cf; }
+    nginx_main_conf; ssl_params_conf; nginx_web_conf
+    systemctl restart nginx
+  fi
+  if sb_proto_on; then
+    install_singbox --force
+    singbox_gen_config
+    svc_restart sing-box
+  else
+    systemctl stop sing-box >/dev/null 2>&1
+    systemctl disable sing-box >/dev/null 2>&1
+  fi
+  svc_restart unbound
+  xray_gen_config
+  svc_restart xray
+  svc_restart nftables 2>/dev/null
+  /etc/rc_online.local 2>/dev/null
+  gen_sub_all
+  printNode
+  ok "更新完成"
+}
+
+# ================================================================ 菜单功能 ===
+changeDomain() {
+  conf_init
+  domain_proto_on || die "当前未启用需要域名的协议(先在菜单 6 开启)"
+  ask_domain_port
+  if [[ $(conf_get '.port') == "443" ]]; then
+    make_ssl_webroot
+  else
+    make_ssl_cf
+  fi
+  nginx_main_conf; ssl_params_conf; nginx_web_conf
+  nginx -t >/dev/null 2>&1 && systemctl restart nginx && ok "域名已更换" || warn "nginx 配置异常"
+  gen_sub_all
+  printNode
+}
+
+changeXrayVerify() {
+  conf_init
+  any_proto || die "尚未安装"
+  local nu np
+  nu=$(ask "输入新 UUID (回车=随机生成): ")
+  [[ -z $nu ]] && nu=$(xray_uuid_gen)
+  conf_raw '.uuids' "[\"$nu\"]"
+  np=$(ask "输入新 WS path (回车=随机): ")
+  [[ -z $np ]] && np="/$(uuid6 "$nu")"
+  conf_set '.path' "$np"
+  xray_gen_config
+  if domain_proto_on; then nginx_web_conf; systemctl restart nginx; fi
+  if sb_proto_on; then singbox_gen_config; svc_restart sing-box; fi
+  svc_restart xray && ok "UUID/path 已更换(所有协议同步)"
+  gen_sub_all
+  printNode
+}
+
+enable_autoupdate_ask() {
+  local a; a=$(ask "开启每日自动更新? [y/N]: ")
+  [[ "$a" =~ ^[Yy] ]] && autoupdate_on || autoupdate_off
+}
+autoupdate_on() {
+  cat <<EOF >"$BASE/autoUpdate"
+#!/bin/bash
+lv="$VERSION"
+rv=\$(curl -fsSL --max-time 15 "$REMOTE_BASE/version" 2>/dev/null | head -n1)
+[[ -z \$rv ]] && exit 0
+if [[ \$(printf '%s\n%s\n' "\$lv" "\$rv" | sort -V | head -n1) == "\$lv" && "\$lv" != "\$rv" ]]; then
+  curl -fsSL --max-time 60 "$REMOTE_BASE/server" -o /tmp/de_GWD_server_new || exit 0
+  [[ \$(du -sk /tmp/de_GWD_server_new | awk '{print\$1}') -lt 30 ]] && exit 0
+  bash /tmp/de_GWD_server_new --update
+  rm -f /tmp/de_GWD_server_new
+fi
+EOF
+  chmod +x "$BASE/autoUpdate"
+  (crontab -l 2>/dev/null | grep -v de_GWD/autoUpdate; echo "30 4 * * * $BASE/autoUpdate") | crontab -
+  ok "自动更新已开启(每日 04:30)"
+}
+autoupdate_off() {
+  (crontab -l 2>/dev/null | grep -v de_GWD/autoUpdate) | crontab -
+  rm -f "$BASE/autoUpdate"
+  ok "自动更新已关闭"
+}
+autoUpdateGWD() {
+  read -rsp "按 Y 开启 / N 关闭: " -n1 a; echo
+  [[ "$a" =~ ^[Yy] ]] && autoupdate_on || autoupdate_off
+}
+
+printNode() {
+  conf_init
+  any_proto || die "尚未安装"
+  local host port suburl link first=1
+  host=$(conf_get '.domain'); [[ -z $host ]] && host=$(wan_ip)
+  echo
+  echo -e "${CYAN}=============== 节点信息 (v2rayN 7.25.4 可直接导入) ===============${cRES}"
+  gen_links > /tmp/gwd_links.$$
+  while IFS= read -r link; do
+    echo -e "${WHITE}$link${cRES}"
+    if [[ $first == 1 ]]; then
+      echo
+      qrencode -t UTF8 -s 1 -m 2 "$link" 2>/dev/null
+      echo
+      first=0
+    fi
+  done < /tmp/gwd_links.$$
+  rm -f /tmp/gwd_links.$$
+  if domain_proto_on; then
+    port=$(conf_get '.port'); local ps=""; [[ $port != "443" ]] && ps=":$port"
+    suburl="https://$host$ps/sub/$(conf_get '.subtoken')"
+    echo -e "${WHITE}订阅地址: ${GREEN}$suburl${cRES}"
+    qrencode -t UTF8 -s 1 -m 2 "$suburl" 2>/dev/null
+    echo
+  fi
+  echo -e "${CYAN}v2rayN 导入示例:${cRES}"
+  echo "  单节点: 复制上方链接 → v2rayN 主界面 Ctrl+V (从剪贴板导入批量URL)"
+  echo "  订  阅: 订阅分组 → 订阅分组设置 → 添加 → 粘贴订阅地址 → 更新订阅(可设自动更新)"
+  echo "  说明: vmess/vless/trojan/ss 由 Xray 内核承载; Hysteria2/TUIC/AnyTLS 由 sing-box 内核承载,"
+  echo "        v2rayN 7.x 会按协议自动调用对应内核, 无需手动配置"
+  echo -e "${CYAN}===================================================================${cRES}"
+}
+
+# ------------------------------------------------------------------- WARP ----
+changeWGCF() {
+  [[ $VIRT_TYPE == "container" ]] && die "容器环境不支持 WARP"
+  read -rsp "[1] 启用 Cloudflare WARP 出站  [2] 删除: " -n1 a; echo
+  local nic laddr; nic=$(detect_nic); laddr=$(local_ip)
+  [[ -z $laddr ]] && die "未检测到本机 IPv4"
+  apt-get install -y -qq wireguard-tools >/dev/null 2>&1
+  if [[ $a == "1" ]]; then
+    # 内核 >= 5.6 才有 wireguard
+    if [[ $(printf '%s\n5.6\n' "$(uname -r)" | sort -rV | head -n1) != "$(uname -r)" ]]; then
+      die "内核 $(uname -r) < 5.6, 请先升级内核"
+    fi
+    ok "下载 wgcf..."
+    fetch_release "ViRb3/wgcf" "^wgcf_.*_linux_${ARCH}$" /usr/local/bin/wgcf || die "wgcf 下载失败"
+    chmod 755 /usr/local/bin/wgcf
+    (cd /tmp && echo | wgcf register >/dev/null 2>&1 && wgcf generate >/dev/null 2>&1)
+    [[ ! -f /tmp/wgcf-profile.conf ]] && die "wgcf 注册失败"
+    local spk cpk
+    cpk=$(awk '/PrivateKey/{print$3}' /tmp/wgcf-profile.conf)
+    spk=$(awk '/PublicKey/{print$3}' /tmp/wgcf-profile.conf)
+    rm -f /tmp/wgcf-account.toml /tmp/wgcf-profile.conf
+    cat <<EOF >/etc/wireguard/wgcf.conf
+[Interface]
+PrivateKey = $cpk
+Address = 172.16.0.2/24
+DNS = 1.1.1.1
+MTU = 1420
+PostUp = ip rule add from $laddr lookup main; ip rule add ipproto udp dport 53 lookup main;
+PostDown = ip rule del from $laddr lookup main; ip rule del ipproto udp dport 53 lookup main;
+
+[Peer]
+PublicKey = $spk
+EndPoint = engage.cloudflareclient.com:2408
+AllowedIPs = 0.0.0.0/0
+AllowedIPs = ::/0
+PersistentKeepalive = 15
+EOF
+    chmod 600 /etc/wireguard/wgcf.conf
+    systemctl enable wg-quick@wgcf >/dev/null 2>&1
+    systemctl restart wg-quick@wgcf >/dev/null 2>&1
+    sleep 3
+    # 修正原版: 先记录前 IP 再对比,判断更稳
+    local after; after=$(wan_ip); local before; before=$laddr
+    if [[ -n $after && "$after" != "$before" ]]; then
+      ok "WARP 已启用, 出口 IP: $after"
+    else
+      warn "WARP 启动但出口未变化, 检查 wgcf (wg show wgcf)"
+    fi
+    /etc/rc_online.local 2>/dev/null
+  else
+    systemctl disable wg-quick@wgcf >/dev/null 2>&1
+    systemctl stop wg-quick@wgcf >/dev/null 2>&1
+    rm -f /etc/wireguard/wgcf.conf
+    /etc/rc_online.local 2>/dev/null
+    ok "WARP 已删除"
+  fi
+}
+
+# ------------------------------------------------- HAProxy TCP 端口转发(多组) --
+relay_gen() {
+  local entries; entries=$(conf_get '.relay')
+  if [[ -z $entries || $entries == "null" || $(echo "$entries" | jq 'length') -eq 0 ]]; then
+    systemctl stop haproxy >/dev/null 2>&1; systemctl disable haproxy >/dev/null 2>&1
+    return
+  fi
+  apt-get install -y -qq haproxy >/dev/null 2>&1
+  {
+    cat <<'EOF'
+global
+    ulimit-n 500000
+    maxconn 200000
+defaults
+    mode tcp
+    option dontlognull
+    timeout connect 10s
+    timeout client 1m
+    timeout server 1m
+    timeout check 10s
+resolvers local
+    nameserver dns 127.0.0.1:53
+    resolve_retries 3
+    timeout retry 3s
+    hold valid 10s
+    accepted_payload_size 8192
+EOF
+    echo "$entries" | jq -c '.[]' | while read -r e; do
+      local up port
+      up=$(echo "$e" | jq -r '.upstream'); port=$(echo "$e" | jq -r '.port')
+      cat <<EOF
+frontend fwd_$port
+    bind :$port
+    default_backend be_$port
+backend be_$port
+    server endpoint $up check resolvers local init-addr none
+EOF
+    done
+  } > /etc/haproxy/haproxy.cfg
+  systemctl enable haproxy >/dev/null 2>&1
+  systemctl restart haproxy >/dev/null 2>&1 && ok "HAProxy 转发生效" || err "HAProxy 启动失败(haproxy -c -f /etc/haproxy/haproxy.cfg 检查)"
+}
+changeTCPPF() {
+  conf_init
+  read -rsp "[1] 添加转发  [2] 删除一条  [3] 清空全部: " -n1 a; echo
+  local entries
+  entries=$(conf_get '.relay')
+  [[ -z $entries || $entries == "null" ]] && entries="[]"
+  case $a in
+    1)
+      local up port
+      up=$(ask "上游地址(域名或IP:端口, 如 relay.example.com:443): ")
+      [[ "$up" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] || die "格式: host:port"
+      port=$(ask "本地监听端口: ")
+      [[ "$port" =~ ^[0-9]+$ ]] || die "端口必须为数字"
+      entries=$(echo "$entries" | jq --arg u "$up" --arg p "$port" '. + [{upstream:$u, port:($p|number)}]')
+      conf_raw '.relay' "$entries"
+      relay_gen
+      ok "转发: 本机:$port -> $up"
+      ;;
+    2)
+      echo "$entries" | jq -r 'to_entries[] | "\(.key): :\(.value.port) -> \(.value.upstream)"' | nl
+      local i; i=$(ask "删除序号: ")
+      entries=$(echo "$entries" | jq --argjson i "$i" 'del(.[ $i - 1 ])')
+      conf_raw '.relay' "$entries"
+      relay_gen
+      ;;
+    3)
+      conf_raw '.relay' '[]'; relay_gen; ok "已清空"
+      ;;
+  esac
+}
+
+# -------------------------------------------------------------- CF speedtest --
+CFspeedTest() {
+  ok "下载 cfspeed..."
+  if fetch_release "makotom/cfspeed" "linux.*${ARCH}" /tmp/cfspeed.bin; then
+    if tar -tzf /tmp/cfspeed.bin >/dev/null 2>&1; then
+      rm -rf /tmp/cfspeed-ex && mkdir -p /tmp/cfspeed-ex
+      tar -xzf /tmp/cfspeed.bin -C /tmp/cfspeed-ex
+      local bin; bin=$(find /tmp/cfspeed-ex -type f -executable | head -n1)
+      [[ -z $bin ]] && bin=$(find /tmp/cfspeed-ex -type f | grep -v '\.' | head -n1)
+      [[ -n $bin ]] && chmod 755 "$bin" && "$bin"
+      rm -rf /tmp/cfspeed.bin /tmp/cfspeed-ex
+    else
+      chmod 755 /tmp/cfspeed.bin && /tmp/cfspeed.bin; rm -f /tmp/cfspeed.bin
+    fi
+  else
+    warn "cfspeed 资产未找到(上游 release 结构可能变化)"
+  fi
+}
+
+# ----------------------------------------------------------------- 内核升级 ---
+installkernel() {
+  [[ $VIRT_TYPE == "container" ]] && die "容器环境不支持更换内核"
+  read -rsp "[1] Zabbly stable 内核: " -n1 a; echo
+  if [[ $a == "1" ]]; then
+    local codename; codename=$(. /etc/os-release; echo "$VERSION_CODENAME")
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
+    cat <<EOF >/etc/apt/sources.list.d/zabbly-kernels-stable.sources
+Enabled: yes
+Types: deb
+URIs: https://zabbly.com/kernel/stable
+Suites: $codename
+Components: main
+Signed-By: /etc/apt/keyrings/zabbly.asc
+EOF
+  apt-get update -qq
+  apt-get install -y -qq linux-zabbly || die "Zabbly 内核不支持该发行版/套件($codename), 仅支持 Debian 12/13 与 Ubuntu 22.04/24.04"
+  ok "内核已安装, 重启生效"
+    read -rsp "现在重启? [y/N]: " -n1 r; echo
+    [[ "$r" =~ ^[Yy] ]] && reboot
+  fi
+}
+
+# ================================================ 重置/端口/卸载/配置子菜单 ====
+regen_all() {   # 统一重建: Xray + sing-box + nginx + 订阅
+  xray_gen_config
+  if sb_proto_on; then singbox_gen_config; svc_restart sing-box; fi
+  if domain_proto_on && [[ -f /etc/nginx/conf.d/default.conf ]]; then nginx_web_conf; fi
+  svc_restart xray
+  gen_sub_all
+}
+
+changePath() {
+  conf_init
+  proto_on vmess || die "vmess 未启用(WS path 仅 vmess 使用; vless/trojan 的路径由 UUID 派生)"
+  local np; np=$(ask "输入新 WS path (回车=随机): ")
+  [[ -z $np ]] && np="/$(uuid6 "$(conf_get '.uuids[0]')")"
+  [[ "$np" != /* ]] && np="/$np"
+  conf_set '.path' "$np"
+  regen_all
+  ok "WS path 已更换"
+  printNode
+}
+
+resetPassword() {
+  conf_init
+  any_proto || die "尚未安装"
+  echo "将生成新 UUID(即所有协议共用的密码/用户名),旧节点立即失效,订阅自动更新。"
+  echo "vless/trojan 的 WS path 由 UUID 派生,会同步轮换。"
+  read -rsp "确认重置? [y/N]: " -n1 a; echo
+  [[ "$a" =~ ^[Yy] ]] || { ok "已取消"; return; }
+  conf_raw '.uuids' "[\"$(xray_uuid_gen)\"]"
+  regen_all
+  ok "UUID/密码已重置,全部协议同步生效"
+  printNode
+}
+
+changePort() {
+  conf_init
+  domain_proto_on || die "当前仅启用免域名协议(Reality/SS/hy2/tuic/anytls 端口各自固定),无 nginx 端口可改"
+  echo "当前端口: $(conf_get '.port')"
+  local np; np=$(ask "新端口 (443 或 1024-65535): ")
+  [[ "$np" =~ ^[0-9]+$ ]] && [[ $np -ge 1024 ]] && [[ $np -le 65535 ]] || die "端口无效"
+  conf_set '.port' "$np"
+  regen_all
+  nginx -t >/dev/null 2>&1 && systemctl restart nginx && ok "端口已更改为 $np(订阅/链接已同步)" || warn "nginx 配置异常,请运行 nginx -t 检查"
+  printNode
+}
+
+uninstallGWD() {
+  read -rp "确认卸载? 将删除 全部配置/证书/节点数据/网站目录,输入 yes 确认: " c
+  [[ $c == "yes" ]] || { ok "已取消"; return; }
+  ok "停止服务..."
+  local s
+  for s in xray sing-box doh-server haproxy wg-quick@wgcf nginx nftables unbound; do
+    systemctl stop "$s" >/dev/null 2>&1
+    systemctl disable "$s" >/dev/null 2>&1
+  done
+  nft flush ruleset 2>/dev/null
+  ok "移除服务单元与文件..."
+  rm -f /etc/systemd/system/xray.service /etc/systemd/system/sing-box.service \
+        /etc/systemd/system/doh-server.service /etc/systemd/system/unbound.service \
+        /etc/systemd/system/nftables.service
+  rm -rf /etc/systemd/system/networking.service.d
+  systemctl daemon-reload
+  (crontab -l 2>/dev/null | grep -vE 'de_GWD|acme\.sh') | crontab - 2>/dev/null
+  rm -rf /root/.acme.sh
+  rm -rf /opt/de_GWD "$SSLDIR" "$WEBDIR"
+  rm -f /etc/wireguard/wgcf.conf /usr/local/bin/xray /usr/local/bin/shuoyue /etc/rc_online.local
+  rm -rf /usr/local/share/xray
+  rm -f /etc/apt/sources.list.d/nginx.list /etc/apt/keyrings/nginx-archive-keyring.asc
+  rm -f /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/80.conf \
+        /etc/nginx/conf.d/.HSTS /etc/nginx/conf.d/.ssl_certs
+  read -rsp "同时卸载 nginx/unbound/haproxy 组件? [y/N]: " -n1 r; echo
+  if [[ "$r" =~ ^[Yy] ]]; then
+    apt-get purge -y -qq nginx nginx-* unbound haproxy >/dev/null 2>&1
+    apt-get autoremove -y -qq >/dev/null 2>&1
+  fi
+  rm -f /etc/resolv.conf
+  printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf
+  sysctl --system >/dev/null 2>&1
+  ok "卸载完成(内核网络调优参数保留,无副作用;重装可直接跑一键脚本)"
+}
+
+config_menu() {
+  conf_init
+  any_proto || die "尚未安装"
+  echo
+  echo "--- 更改配置 ---"
+  echo "  [1] 更换域名(重新签发证书)"
+  echo "  [2] 协议开关(9 种协议随时启停)"
+  echo "  [3] Reality 密钥(重生成/开关)"
+  echo "  [4] 修改 WS path(仅 vmess)"
+  echo "  [5] Cloudflare WARP 出站"
+  echo "  [6] HAProxy TCP 端口转发"
+  echo "  [q] 返回"
+  read -rsp "选择: " -n1 c; echo
+  case $c in
+    1) changeDomain ;;
+    2) protos_menu ;;
+    3) reality_menu ;;
+    4) changePath ;;
+    5) changeWGCF ;;
+    6) changeTCPPF ;;
+  esac
+}
+
+# ==================================================================== 菜单 ====
+status_panel() {
+  echo -e "  Nginx    : $(svc_ok nginx && echo -e "${GREEN}✓${cRES}" || echo -e "${RED}✕${cRES}")   Xray: $(svc_ok xray && echo -e "${GREEN}✓${cRES}" || echo -e "${RED}✕${cRES}")   DoH: $(svc_ok doh-server && echo -e "${GREEN}✓${cRES}" || echo -e "${RED}✕${cRES}")   unbound: $(svc_ok unbound && echo -e "${GREEN}✓${cRES}" || echo -e "${RED}✕${cRES}")"
+  echo -e "  协议: $(conf_get '.protos // {}' | jq -r 'to_entries | map(select(.value==true) | .key) | join(",")' 2>/dev/null)   版本: $VERSION   $VIRT_TYPE"
+  [[ -f $SSLDIR/de_GWD.cer ]] && echo -e "  证书到期: $(openssl x509 -enddate -noout -in $SSLDIR/de_GWD.cer 2>/dev/null | cut -d= -f2)"
+  svc_ok wg-quick@wgcf && echo -e "${PURPLE}  [Enabled] Cloudflare WARP${cRES}"
+  svc_ok haproxy && echo -e "${PURPLE}  [Enabled] HAProxy TCP Port Forward${cRES}"
+}
+
+start_menu() {
+  clear
+  while :; do
+    echo -e "${CYAN}=====================================================${cRES}"
+    echo -e "${WHITE}   朔月 Shuoyue ${VERSION}  -  Debian 多协议旁路网关${cRES}"
+    echo -e "${CYAN}=====================================================${cRES}"
+    status_panel
+    echo
+    echo "  1. 安装 (Install, 9 种协议勾选)"
+    echo "  2. 升级 (Update: 组件最新版 + 系统全面升级)"
+    echo "  3. 卸载 (Uninstall, 完整移除)"
+    echo "  4. 更改配置 (域名/协议开关/Reality/WS path/WARP/转发)"
+    echo "  5. 更改端口 (Port, 仅 nginx 类协议)"
+    echo "  6. 重置 UUID/密码 (所有协议同步, 订阅自动更新)"
+    echo "  7. 节点信息/订阅 (Info + v2rayN 导入示例)"
+    echo "  8. Cloudflare 测速"
+    [[ $VIRT_TYPE != "container" ]] && echo "  9. 升级内核 (Kernel, Zabbly)"
+    echo "  0. 自动更新开关 (AutoUpdate)"
+    echo " CTRL+C 退出"
+    echo
+    read -rp "请输入数字: " num
+    case $num in
+      1) installGWD ;;
+      2) updateGWD ;;
+      3) uninstallGWD ;;
+      4) config_menu ;;
+      5) changePort ;;
+      6) resetPassword ;;
+      7) printNode ;;
+      8) CFspeedTest ;;
+      9) installkernel ;;
+      0) autoUpdateGWD ;;
+      *) warn "输入有误" ;;
+    esac
+  done
+}
+
+reality_menu() {
+  conf_init
+  any_proto || die "尚未安装"
+  read -rsp "[1] 启用/重新生成 Reality  [2] 关闭 Reality: " -n1 a; echo
+  case $a in
+    1)
+      reality_keygen
+      xray_gen_config
+      svc_restart xray
+      gen_sub_all
+      printNode
+      ;;
+    2)
+      conf_raw '.protos' "$(conf_get '.protos // {}' | jq '.reality=false')"
+      xray_gen_config
+      svc_restart xray
+      gen_sub_all
+      ok "Reality 已关闭"
+      ;;
+  esac
+}
+
+protos_menu() {
+  conf_init
+  any_proto || die "尚未安装"
+  echo "当前启用: $(conf_get '.protos // {}' | jq -r 'to_entries | map(select(.value==true) | .key) | join(", ")')"
+  echo "输入要切换的协议编号(空格分隔, 回车=不变):"
+  echo "  1 vmess  2 vless  3 trojan  4 trojantcp  5 reality"
+  echo "  6 ss  7 hy2(Hysteria2)  8 tuic  9 anytls"
+  local sel tok; sel=$(ask "切换: ")
+  [[ -z $sel ]] && return
+  local names=(vmess vless trojan trojantcp reality ss hy2 tuic anytls)
+  for tok in $sel; do
+    [[ "$tok" =~ ^[1-9]$ ]] || { warn "忽略: $tok"; continue; }
+    local p=${names[$((tok-1))]}
+    if proto_on "$p"; then
+      conf_raw '.protos' "$(conf_get '.protos // {}' | jq --arg k "$p" '.[$k]=false')"
+      ok "已关闭: $p"
+    else
+      conf_raw '.protos' "$(conf_get '.protos // {}' | jq --arg k "$p" '.[$k]=true')"
+      ok "已开启: $p"
+      if [[ $p == "reality" && -z $(conf_get '.reality.private') ]]; then
+        reality_keygen
+      fi
+    fi
+  done
+  if sb_proto_on; then
+    install_singbox
+    singbox_gen_config
+    svc_restart sing-box
+  else
+    systemctl stop sing-box >/dev/null 2>&1
+    systemctl disable sing-box >/dev/null 2>&1
+  fi
+  xray_gen_config
+  if domain_proto_on && [[ -f /etc/nginx/conf.d/default.conf ]]; then
+    nginx_web_conf
+    systemctl reload nginx 2>/dev/null
+  fi
+  svc_restart xray
+  gen_sub_all
+  printNode
+}
+
+# -------------------------------------------------------------------- 入口 ---
+case "$1" in
+  --update)   updateGWD; exit 0 ;;
+  --install)  installGWD; exit 0 ;;
+  --version)  echo "$VERSION"; exit 0 ;;
+esac
+start_menu
