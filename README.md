@@ -74,8 +74,11 @@ https://<你的域名>/<10位随机路径>/?t=<token>
 - **协议勾选**:19 种协议按内核分组列出,显示端口与「需域名 / 免域名」,支持全选 / 仅 Xray / 仅 Sing-box;点「保存并应用」即写入并重建 Xray / sing-box / nginx 配置、重启服务
 - **全局配置**:域名(可含端口)、服务端口、UUID(带一键生成)、订阅路径密码、CDN 优选 IP / 落地域名
 - **订阅**:直接显示并一键复制 `https://<域名>/sub/<token>`
-- **分享链接**:逐条卡片展示全部已启用协议的 v2rayN 链接,单条 / 全部一键复制
+- **分享链接**:逐条卡片展示全部已启用协议的 v2rayN 链接,单条 / 全部一键复制。**打开面板即渲染**,无需先点「重新拉取链接」(`--cli status` 已自带 `links`)
 - **凭据**:token 与随机路径存于 `/opt/de_GWD/conf.json`(0600),`shuoyue --cli status` 可重新查看
+
+![Web 控制面板](docs/panel-v1.3.4.png)
+
 
 安全设计:token 常量时间比较、POST 校验 Origin/Referer 与 Host 一致(CSRF)、请求体上限 256 KiB、协议 id 与域名/UUID/端口全部白名单校验、所有对 server 的调用串行化(`--cli` 单入口,避免并发重建配置)。
 
@@ -279,6 +282,9 @@ Web 控制面板需要 `python3`(标准库即可,无需 pip);面板由 nginx 反
 - `server` / `client`:服务端 / 旁路网关客户端主脚本(Debian / Ubuntu)
 - `client-openwrt`:OpenWrt / Kwrt 客户端主脚本(procd + uci + opkg + nft TPROXY)
 - `panel.py`:Web 控制面板(单文件,随 install.sh 一并下载到 `/opt/de_GWD/`)
+- `SHA256SUMS`:上面四个文件的哈希清单(install.sh 下载后强校验;改动后跑 `bash gen_sums.sh` 重新生成)
+- `docs/`:README 引用的截图
+
 - `version`:版本文件(自动更新比对他源)
 - `_original/`:原版仓库完整克隆,仅作对照参考,可删除
 - `LICENSE.md`:EPL-2.0 说明与原版出处
