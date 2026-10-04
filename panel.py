@@ -613,10 +613,14 @@ main{max-width:1280px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
 section{background:var(--panel);border:1px solid var(--bd);border-radius:var(--r);padding:14px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
 .card{border:1px solid var(--bd);border-radius:8px;padding:10px;background:var(--panel2)}
-.proto{display:flex;gap:10px;align-items:flex-start;cursor:pointer;user-select:none}
+.proto{display:flex;gap:10px;align-items:flex-start;cursor:pointer;user-select:none;transition:border-color .15s,box-shadow .15s,background .15s}
 .proto:hover{border-color:var(--acc)}
 .proto.on{border-color:var(--acc);box-shadow:inset 0 0 0 1px rgba(76,141,255,.25)}
-.proto input{margin:3px 0 0;width:16px;height:16px;accent-color:var(--acc);flex:0 0 auto}
+.proto.installed{border-color:rgba(46,160,67,0.7);background:linear-gradient(135deg,rgba(46,160,67,0.12) 0%,rgba(22,27,34,0.95) 100%);box-shadow:0 0 10px rgba(46,160,67,0.2)}
+.proto.installed:hover{border-color:#3fb950;box-shadow:0 0 14px rgba(46,160,67,0.35)}
+.proto.installed.on{border-color:#3fb950;box-shadow:0 0 16px rgba(46,160,67,0.35),inset 0 0 0 1px rgba(46,160,67,0.5)}
+.proto.installed input{accent-color:#3fb950}
+.tag.installed-badge{background:rgba(46,160,67,0.18);border-color:#2ea043;color:#3fb950;font-weight:600;display:inline-flex;align-items:center;gap:4px}
 .pname{font-weight:600;word-break:break-word}
 .pid{display:block;color:var(--dim);font-size:12px;margin:2px 0 6px;word-break:break-all}
 .meta{display:flex;flex-wrap:wrap;gap:6px}
@@ -998,6 +1002,7 @@ function protoList() {
   }
   return PROTOS;
 }
+var INSTALLED_PROTOS = {};
 function renderProtos() {
   var list = protoList();
   var groups = [["xray", "Xray 内核"], ["singbox", "Sing-box 内核"]];
@@ -1006,11 +1011,15 @@ function renderProtos() {
     var items = list.filter(function (p) { return p.group === g[0]; });
     if (!items.length) { return ""; }
     var cards = items.map(function (p) {
-      return '<label class="card proto" data-group="' + p.group + '" title="' + esc(p.desc || "") + '">' +
+      var isInst = !!INSTALLED_PROTOS[p.id];
+      var instBadge = isInst ? '<span class="tag installed-badge"><span class="dot ok" style="width:6px;height:6px;margin:0"></span>已安装</span>' : '';
+      return '<label class="card proto' + (isInst ? ' installed' : '') + '" data-group="' + p.group + '" data-pid="' + esc(p.id) + '" title="' + esc(p.desc || "") + '">' +
         '<input type="checkbox" class="pk" value="' + esc(p.id) + '">' +
         '<div><div class="pname">' + esc(p.name) + "</div>" +
         '<code class="pid">' + esc(p.id) + "</code>" +
-        '<div class="meta"><span class="tag port-tag" data-pid="' + esc(p.id) + '" title="点击快捷修改此协议端口">' + esc(p.port) + ' ✏️</span>' +
+        '<div class="meta">' +
+        instBadge +
+        '<span class="tag port-tag" data-pid="' + esc(p.id) + '" title="点击快捷修改此协议端口">' + esc(p.port) + ' ✏️</span>' +
         (p.needs_domain ? '<span class="tag warn">需域名</span>' : '<span class="tag ok">免域名</span>') +
         "</div></div></label>";
     }).join("");
@@ -1113,6 +1122,44 @@ function setChecks(src) {
   });
   updateCount();
 }
+function updateInstalledStatus(src) {
+  var map = {};
+  if (Array.isArray(src)) {
+    src.forEach(function (id) { map[String(id)] = true; });
+  } else if (src && typeof src === "object") {
+    map = src;
+  }
+  INSTALLED_PROTOS = map;
+  $$(".proto").forEach(function (card) {
+    var cb = card.querySelector ? card.querySelector(".pk") : null;
+    if (!cb) { return; }
+    var pid = cb.value;
+    var isInst = !!map[pid];
+    if (card.classList && card.classList.toggle) {
+      card.classList.toggle("installed", isInst);
+    }
+    var meta = card.querySelector ? card.querySelector(".meta") : null;
+    if (!meta) { return; }
+    var badge = card.querySelector ? card.querySelector(".installed-badge") : null;
+    if (isInst) {
+      if (!badge) {
+        var b = document.createElement("span");
+        b.className = "tag installed-badge";
+        b.innerHTML = '<span class="dot ok" style="width:6px;height:6px;margin:0"></span>已安装';
+        if (meta.firstChild) {
+          meta.insertBefore(b, meta.firstChild);
+        } else {
+          meta.appendChild(b);
+        }
+      }
+    } else {
+      if (badge && badge.parentNode) {
+        badge.parentNode.removeChild(badge);
+      }
+    }
+  });
+}
+window.updateInstalledStatus = updateInstalledStatus;
 $$("[data-quick]").forEach(function (btn) {
   btn.addEventListener("click", function () {
     var mode = btn.getAttribute("data-quick");
@@ -1160,7 +1207,10 @@ function applyStatus(d) {
       renderProtos();
     }
   }
-  if (d.protos) { setChecks(d.protos); }
+  if (d.protos) {
+    setChecks(d.protos);
+    updateInstalledStatus(d.protos);
+  }
   if (d.domain) { $("#f-domain").value = d.domain; }
   if (d.uuid) { $("#f-uuid").value = d.uuid; }
   if (d.subtoken) { $("#f-subtoken").value = d.subtoken; }
@@ -1519,6 +1569,7 @@ function handleInstallProtos(triggerBtn) {
   }), "正在安装并应用协议…").then(function (r) {
     if (r && r.ok && r.data) {
       applyStatus(r.data.data || r.data);
+      updateInstalledStatus(ids);
       toast("✅ 所选协议已成功安装并启动！");
       loadStatus();
     }
@@ -1559,6 +1610,7 @@ if (btnProtoReinstall) {
     }), "正在重新安装协议…").then(function (r) {
       if (r && r.ok && r.data) {
         applyStatus(r.data.data || r.data);
+        updateInstalledStatus(ids);
         toast("✅ 所选协议已重新安装，底层配置已彻底重建！");
         loadStatus();
       }
@@ -1591,6 +1643,7 @@ if (btnProtoUninstall) {
         if (r && r.ok && r.data) {
           applyStatus(r.data.data || r.data);
           setChecks([]);
+          updateInstalledStatus([]);
           toast("✅ 已卸载并停用所有代理协议服务");
           loadStatus();
         }
@@ -1604,6 +1657,7 @@ if (btnProtoUninstall) {
     busy(this, api("/api/protos", "POST", { protos: remaining }), "正在卸载协议…").then(function (r) {
       if (r && r.ok && r.data) {
         applyStatus(r.data.data || r.data);
+        updateInstalledStatus(remaining);
         ids.forEach(function (id) {
           var cb = $('.pk[value="' + id + '"]');
           if (cb) {
