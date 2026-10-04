@@ -197,6 +197,25 @@ command -v apt-get >/dev/null 2>&1 || die "未检测到 apt,本脚本仅支持 D
 ARCH=$(dpkg --print-architecture 2>/dev/null)
 [[ "$ARCH" != "amd64" && "$ARCH" != "arm64" ]] && die "不支持的架构: ${ARCH:-未知}(仅 amd64/arm64)"
 
+# 快速卸载入口：若传入 del / uninstall / --uninstall 直接执行彻底清理
+if [[ "${1:-}" =~ ^(--uninstall|uninstall|del)$ ]]; then
+  if [[ -x "$BASE/server" ]]; then
+    shift
+    exec bash "$BASE/server" --uninstall "$@"
+  elif [[ -x "$BASE/client" ]]; then
+    shift
+    exec bash "$BASE/client" --uninstall "$@"
+  else
+    mkdir -p "$BASE"
+    echo -n "下载卸载脚本... "
+    dl_checked server "$BASE/server" 30
+    chmod +x "$BASE/server"
+    echo -e "${GREEN}OK${cRES}"
+    shift
+    exec bash "$BASE/server" --uninstall "$@"
+  fi
+fi
+
 echo
 echo -e "${CYAN}=============================================${cRES}"
 echo -e "${WHITE}   朔月 Shuoyue — Debian 多协议旁路网关${cRES}"
@@ -242,10 +261,11 @@ else
   echo "  [2] 客户端 — 家里闲置设备做旁路网关,其他设备把网关指向它"
   echo "  [3] 退出(以后输入 shuoyue 打开菜单)"
   echo "  [4] 升级更新 — 直接升级服务端核心、Web 控制面板及后续新增功能与修复补丁"
+  echo "  [5] 彻底卸载 — 清理所有协议服务、证书、自建防火墙规则、Web 面板及配置文件"
   if [[ $has_installed -eq 1 ]]; then
-    read -rp "选择 [1/2/3/4, 已安装推荐 4, 回车=4]: " c; c=${c:-4}
+    read -rp "选择 [1/2/3/4/5, 已安装推荐 4, 回车=4]: " c; c=${c:-4}
   else
-    read -rp "选择 [1/2/3/4, 回车=1]: " c; c=${c:-1}
+    read -rp "选择 [1/2/3/4/5, 回车=1]: " c; c=${c:-1}
   fi
 fi
 
@@ -266,6 +286,10 @@ case $c in
   4|[Uu]|[Uu][Pp][Dd][Aa][Tt][Ee])
     clear
     exec bash "$BASE/server" --update
+    ;;
+  5|[Uu][Nn][Ii][Nn][Ss][Tt][Aa][Ll][Ll]|[Dd][Ee][Ll])
+    clear
+    exec bash "$BASE/server" --uninstall
     ;;
   *)
     clear

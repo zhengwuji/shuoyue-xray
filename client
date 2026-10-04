@@ -2889,7 +2889,7 @@ case "${1:-}" in
     nftables_apply || { err "nftables 重建失败"; exit 1; }
     ok "配置与规则已重建"
     exit 0 ;;
-  --uninstall) uninstallGWD; exit 0 ;;
+  --uninstall|uninstall|del) uninstallGWD; exit 0 ;;
   --version)   echo "$VERSION"; exit 0 ;;
   --help|-h)
     cat <<EOF

@@ -3745,7 +3745,7 @@ uninstallGWD() {
 
   ok "停止服务与清理后台进程..."
   local s
-  local svcs=(xray sing-box doh-server haproxy wg-quick@wgcf nginx degwd-nftables degwd-shaping nftables unbound cloudflared)
+  local svcs=(xray sing-box doh-server haproxy wg-quick@wgcf wg-quick@wg0 nginx degwd-nftables degwd-shaping nftables unbound cloudflared smartdns adguardhome)
   [[ $keep_panel -eq 0 ]] && svcs+=(degwd-panel)
   for s in "${svcs[@]}"; do
     systemctl stop "$s" >/dev/null 2>&1 || true
@@ -3757,19 +3757,32 @@ uninstallGWD() {
   pkill -9 -f 'xray run' 2>/dev/null || true
   pkill -9 -f 'sing-box run' 2>/dev/null || true
   pkill -9 -f 'doh-server' 2>/dev/null || true
+  pkill -9 -f 'smartdns' 2>/dev/null || true
+  pkill -9 -f 'adguardhome' 2>/dev/null || true
   if [[ $keep_panel -eq 0 ]]; then
     pkill -9 -f 'degwd.*panel\.py' 2>/dev/null || true
     pkill -9 -f 'python.*panel\.py' 2>/dev/null || true
   fi
 
-  # 清理 WireGuard 网络设备
+  # 清理 WireGuard 与虚拟网卡设备
   wg-quick down wgcf 2>/dev/null || true
+  wg-quick down wg0 2>/dev/null || true
   ip link delete wgcf 2>/dev/null || true
+  ip link delete wg0 2>/dev/null || true
+  ip link delete ifb4eth0 2>/dev/null || true
+  ip link delete ifb0 2>/dev/null || true
+  ip rule del fwmark 0x1/0x1 table 100 2>/dev/null || true
+  ip route del local default dev lo scope host table 100 2>/dev/null || true
 
   # 只删本方案自建表, 不动 Docker/firewalld 等其他 nft 表
   nft delete table inet degwd_bypassflow 2>/dev/null || true
   nft delete table inet degwd_filter 2>/dev/null || true
   nft delete table inet degwd_router 2>/dev/null || true
+  nft delete table ip de_GWD 2>/dev/null || true
+  nft delete table ip degwd_filter 2>/dev/null || true
+  nft delete table ip degwd_router 2>/dev/null || true
+  nft delete table ip degwd_offload 2>/dev/null || true
+  nft delete table ip degwd_relay 2>/dev/null || true
 
   ok "移除服务单元与文件..."
   local units=(
@@ -3778,6 +3791,8 @@ uninstallGWD() {
     /etc/systemd/system/cloudflared.service
     /etc/systemd/system/doh-server.service
     /etc/systemd/system/unbound.service
+    /etc/systemd/system/smartdns.service
+    /etc/systemd/system/adguardhome.service
     /etc/systemd/system/degwd-nftables.service
     /etc/systemd/system/degwd-shaping.service
   )
@@ -3799,10 +3814,12 @@ uninstallGWD() {
   rm -rf "$SSLDIR"
   rm -rf "$WEBDIR/sub" 2>/dev/null || true
 
-  # 清理核心二进制及共享数据
-  rm -f /usr/local/bin/xray /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/shuoyue /usr/local/bin/de_GWD /etc/rc_online.local
+  # 清理核心二进制、命令软链及共享数据
+  rm -f /usr/local/bin/xray /usr/local/bin/sing-box /usr/local/bin/cloudflared \
+        /usr/local/bin/shuoyue /usr/bin/shuoyue /usr/local/bin/shuoyue-gw /usr/bin/shuoyue-gw \
+        /usr/local/bin/de_GWD /usr/bin/de_GWD /etc/rc_online.local
   rm -rf /usr/local/share/xray /usr/local/share/sing-box
-  rm -f /etc/wireguard/wgcf.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf
+  rm -f /etc/wireguard/wgcf.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf /etc/wireguard/wg0.conf
 
   # 移除本方案写入的 drop-in 配置(不动用户原有的 sysctl/limits 配置)
   rm -f /etc/sysctl.d/99-degwd.conf /etc/security/limits.d/99-degwd.conf
