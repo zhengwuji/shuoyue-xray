@@ -1009,13 +1009,14 @@ transition:opacity .2s;z-index:9;max-width:90vw}
 
   <section>
     <h2>操作</h2>
-    <div class="toolbar">
+    <div class="toolbar" style="display:flex;align-items:center;flex-wrap:wrap;gap:8px">
       <button class="primary" id="btn-save">保存并应用（勾选的协议）</button>
       <button id="btn-reset">重新生成 UUID/Path</button>
       <button id="btn-regen">重建配置</button>
       <button id="btn-links">重新拉取链接</button>
+      <button class="danger" id="btn-uninstall-all" style="margin-left:auto">🗑️ 彻底卸载系统</button>
     </div>
-    <div class="note">重建配置 / 切换协议 / 重置凭据都会在服务端重写 Xray / sing-box / nginx 配置并重启服务，耗时较长，请勿连续点击。</div>
+    <div class="note">重建配置 / 切换协议 / 重置凭据都会在服务端重写 Xray / sing-box / nginx 配置并重启服务，耗时较长，请勿连续点击。彻底卸载将停止所有服务、移除配置证书并关闭面板。</div>
   </section>
 
   <section>
@@ -1790,6 +1791,32 @@ $("#btn-links").addEventListener("click", function () {
     }
   });
 });
+var btnUninstallAll = $("#btn-uninstall-all");
+if (btnUninstallAll) {
+  btnUninstallAll.addEventListener("click", function () {
+    if (!confirm("⚠️ 高危警告：彻底卸载将删除全部协议配置、证书、节点数据、自建防火墙规则并停止所有服务！\n\n确定要继续吗？")) {
+      return;
+    }
+    var c = prompt("请输入大写 UNINSTALL 确认彻底卸载：");
+    if (c !== "UNINSTALL") {
+      toast("已取消卸载（需输入 UNINSTALL）");
+      return;
+    }
+    var purgePkgs = confirm("是否同时卸载并清理 Nginx / Unbound / HAProxy 等底层软件包？\n\n【确定】= 同时卸载软件包\n【取消】= 仅卸载节点服务与配置（推荐）");
+
+    var btn = this;
+    busy(btn, api("/api/uninstall", "POST", { confirm: "UNINSTALL", purge_pkgs: purgePkgs }), "正在彻底卸载系统…").then(function (r) {
+      if (r && r.ok) {
+        document.body.innerHTML = '<div style="max-width:600px;margin:80px auto;padding:30px;background:#161b22;border:1px solid #30363d;border-radius:12px;text-align:center;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;color:#e6edf3;">' +
+          '<div style="font-size:48px;margin-bottom:16px">🗑️</div>' +
+          '<h2 style="color:#3fb950;margin-bottom:12px;font-size:22px">de_GWD 系统已彻底卸载完毕</h2>' +
+          '<p style="color:#8b949e;line-height:1.6;font-size:14px;margin-bottom:20px">所有协议核心、系统服务、证书、隧道、防火墙规则及 Web 面板已全部清理。<br>如果后续需要重新使用，可重新运行一键脚本进行安装。</p>' +
+          '<div style="padding:10px 16px;background:#0d1117;border-radius:6px;font-family:monospace;font-size:13px;color:#58a6ff;display:inline-block">服务已停止 · 您可以关闭此浏览器窗口</div>' +
+          '</div>';
+      }
+    });
+  });
+}
 var btnSaveWarp = $("#btn-save-warp");
 if (btnSaveWarp) {
   btnSaveWarp.addEventListener("click", function () {
@@ -2377,7 +2404,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 status = self._send_error_json(403, "CSRF 校验失败: %s" % reason)
                 return
             if path not in ("/api/protos", "/api/cfg", "/api/regen", "/api/reset",
-                            "/api/warp", "/api/sub", "/api/kill_third_party", "/api/cloudflared", "/api/ports"):
+                            "/api/warp", "/api/sub", "/api/kill_third_party", "/api/cloudflared", "/api/ports",
+                            "/api/uninstall"):
                 self._drain_body()
                 status = self._send_error_json(404, "路径不存在")
                 return
@@ -2401,6 +2429,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 status = self._handle_simple(["regen"])
             elif path == "/api/kill_third_party":
                 status = self._handle_kill_third_party(body)
+            elif path == "/api/uninstall":
+                status = self._handle_uninstall(body)
             else:
                 status = self._handle_simple(["reset"])
         except Exception as exc:
@@ -2659,6 +2689,49 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                         continue
             return self._finish_cli(run_cli(["cfg", "-"], stdin_data=json.dumps({"proto_ports": clean_ports})))
         return self._send_error_json(400, "未知动作: %s，支持 randomize|reset|set|batch" % action)
+
+    def _handle_uninstall(self, body):
+        """POST /api/uninstall —— 彻底卸载系统、停用所有服务并清理数据。"""
+        if not isinstance(body, dict):
+            return self._send_error_json(400, "请求体必须是 JSON 对象")
+        confirm_str = str(body.get("confirm") or "").strip().upper()
+        if confirm_str != "UNINSTALL":
+            return self._send_error_json(400, "确认口令不正确，需输入 UNINSTALL")
+        purge_pkgs = bool(body.get("purge_pkgs"))
+        cli_args = ["uninstall", "--keep-panel"]
+        if purge_pkgs:
+            cli_args.append("--purge-pkgs")
+        res = run_cli(cli_args)
+        if not res.get("ok"):
+            return self._finish_cli(res)
+
+        def _delayed_panel_exit():
+            time.sleep(1.5)
+            try:
+                subprocess.run(["systemctl", "stop", "degwd-panel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["systemctl", "disable", "degwd-panel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if os.path.exists("/etc/systemd/system/degwd-panel.service"):
+                    try:
+                        os.remove("/etc/systemd/system/degwd-panel.service")
+                    except Exception:
+                        pass
+                subprocess.run(["systemctl", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            try:
+                if os.path.exists(BASE):
+                    shutil.rmtree(BASE, ignore_errors=True)
+            except Exception:
+                pass
+            os._exit(0)
+
+        t = threading.Thread(target=_delayed_panel_exit, daemon=True)
+        t.start()
+
+        return self._send_json(200, {
+            "ok": True,
+            "message": "de_GWD 及所有协议服务、配置、证书已彻底卸载。Web 面板已清理并正在退出。"
+        })
 
 
 # ------------------------------------------------------------------- 启动 ---

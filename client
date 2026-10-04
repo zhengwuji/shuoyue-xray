@@ -64,6 +64,32 @@ write_atomic() {
   chmod "$2" "$t" && mv -f "$t" "$1"
 }
 
+# 模板渲染插值的转义: 让值能安全放进 bash ${s//pat/rep} 的替换串。
+# 不用 sed 的原因: sed 替换串里 \ 是转义字符(会被吃掉)、& 表示「已匹配文本」,
+# 值里的这两个字符会被静默改写。bash 参数展开的替换串里 \ 原样保留(\\ 才折叠),
+# 故 \ 与 & 各转义一次即无损(实测见 .probe/t_escape.sh、.probe/t_subst_esc.sh)。
+esc_rep() {   # $1=原值 -> 可安全作为 ${s//pat/rep} 替换串的文本
+  local v="$1"
+  v=${v//\\/\\\\}
+  v=${v//&/\\&}
+  printf '%s' "$v"
+}
+
+# 模板渲染: $1=文件, 之后按 KEY VALUE 成对给出 __KEY__ 占位符的字面替换值。
+# 权限沿用原文件(调用方刚写完时的模式), 不重设 —— 例如 autoUpdate 必须是 755 可执行。
+render_tpl() {   # $1=file, 其后 KEY VALUE ...
+  local f="$1"; shift
+  (( $# >= 2 && $# % 2 == 0 )) || { warn "render_tpl 参数不成对"; return 1; }
+  local mode; mode=$(stat -c '%a' "$f" 2>/dev/null) || return 1
+  local c; c=$(cat "$f" 2>/dev/null) || return 1
+  local k v
+  while (( $# >= 2 )); do
+    k="$1"; v=$(esc_rep "$2"); shift 2
+    c=${c//"__${k}__"/$v}
+  done
+  printf '%s\n' "$c" | write_atomic "$f" "$mode"
+}
+
 # 拆分 host:port, 支持 [ipv6]:port 与裸 IPv6; 结果写入全局 SP_HOST/SP_PORT
 # 原写法 `host=${x%%:*}; port=${x##*:}` 有两个坑:
 #   1. [2001:db8::1]:443 会被切成 host="[" port="db8::1]:443"
@@ -945,9 +971,19 @@ nft_reserved_only() {
   while IFS= read -r e; do [[ -n $e ]] && elt="$elt$e, "; done <<<"$reserved"
   elt=${elt%, }
   [[ -z $elt ]] && return 0
-  # RESERVED_IP 是文件内 define, 用 sed 原地替换该行即可生效
+  # RESERVED_IP 是文件内 define, 原地重写该行即可生效。
+  # 不用 sed: 替换串里的 \ 会被吃掉、& 表示「已匹配文本」, 而这些值来自用户输入的
+  # .dns.china(可含 & 或 \), 会被静默改写(与 server 的 Alt-Svc 缺陷同源)。
+  # 这里用 bash 逐行重写 + write_atomic, 逐字节无损且原子。
   local line; line="define RESERVED_IP = $elt"
-  sed -i "s|^define RESERVED_IP = .*|$line|" "$BASE/nftables/default.nft" 2>/dev/null || return 1
+  [[ -f $BASE/nftables/default.nft ]] || return 1
+  local ln
+  { while IFS= read -r ln; do
+      case $ln in
+        'define RESERVED_IP = '*|'define RESERVED_IP =') printf '%s\n' "$line" ;;
+        *) printf '%s\n' "$ln" ;;
+      esac
+    done < "$BASE/nftables/default.nft"; } | write_atomic "$BASE/nftables/default.nft" 644 || return 1
   nft list table ip de_GWD >/dev/null 2>&1 || return 0
   # 只重建 ip de_GWD 这一张表: 抽出文件里的 define 行 + 该表块单独加载,
   # 既不动 degwd_filter/degwd_router/degwd_offload, 也不重启单元(不断现有连接)
@@ -2538,7 +2574,7 @@ echo "$rv" > "$VERSION_FILE"
 exec bash "$SELF" --update
 EOF
   # 注入仓库地址(heredoc 用 <<'EOF' 保持字面, 占位符在此替换)
-  sed -i "s|__REMOTE_BASE__|$REMOTE_BASE|" "$BASE/autoUpdate"
+  render_tpl "$BASE/autoUpdate" REMOTE_BASE "$REMOTE_BASE"
   if command -v crontab >/dev/null 2>&1; then
     (crontab -l 2>/dev/null | grep -F -v -- "$BASE/autoUpdate"; echo "0 5 * * * $BASE/autoUpdate") | crontab -
   else

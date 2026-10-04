@@ -56,6 +56,35 @@ write_atomic() {   # $1=dest $2=mode
   chmod "$2" "$t" && mv -f "$t" "$1"
 }
 
+# 模板渲染插值的转义: 让值能安全放进 bash ${s//pat/rep} 的替换串。
+# 为什么不用 sed: sed 替换串里 \ 是转义字符(会被吃掉)、& 表示「已匹配文本」。
+# 于是 Alt-Svc 的值 'h3=\":443\"' 落盘时反斜杠消失, 变成 "h3=":443";ma=86400"
+# —— 引号边界被拆成多个 token, add_header 参数个数就可能不对(实测见 .probe/t_sed_altsvc.sh)。
+# bash 参数展开的替换串里 \ 会保留但 \\ 会折叠成一个 \, 且 & 同样是特殊字符,
+# 故 \ 与 & 各转义一次即无损(12 组值实测全对, 见 .probe/t_subst_esc.sh)。
+esc_rep() {   # $1=原值 -> 可安全作为 ${s//pat/rep} 替换串的文本
+  local v="$1"
+  v=${v//\\/\\\\}
+  v=${v//&/\\&}
+  printf '%s' "$v"
+}
+
+# 模板渲染: $1=文件, 之后按 KEY VALUE 成对给出 __KEY__ 占位符的字面替换值。
+# 用 bash 参数展开而非 sed: 值里的 \ & 不会被静默改写(见 esc_rep 说明)。
+# 权限沿用原文件(取不到时退回 644)。
+render_tpl() {   # $1=file, 其后 KEY VALUE ...
+  local f="$1"; shift
+  (( $# >= 2 && $# % 2 == 0 )) || { warn "render_tpl 参数不成对"; return 1; }
+  local mode; mode=$(stat -c '%a' "$f" 2>/dev/null) || mode=644
+  local c k v
+  c=$(cat "$f" 2>/dev/null) || return 1
+  while [[ $# -ge 2 ]]; do
+    k="$1"; v=$(esc_rep "$2"); shift 2
+    c=${c//"__${k}__"/$v}
+  done
+  printf '%s\n' "$c" | write_atomic "$f" "$mode"
+}
+
 ask()  { local v; read -r -p "$1" v; echo "$v"; }
 ask_secret() { local v; read -rsp "$1" v; echo; echo "$v"; }
 
@@ -1467,8 +1496,10 @@ EOF
     echo "}"
   } > /etc/nginx/conf.d/default.conf
 
-  sed -i "s|__PORT__|$port|g; s|__DOMAIN__|$domain|g; s|__VMPATH__|$vmpath|g; s|__VLPATH__|/v-$u6|g; s|__TRPATH__|/t-$u6|g; s|__TR2PATH__|/tw-$u6|g; s|__VEPATH__|/ve-$u6|g" /etc/nginx/conf.d/default.conf
-  sed -i "s|__ALTSVC__|$altsvc|" /etc/nginx/conf.d/default.conf
+  render_tpl /etc/nginx/conf.d/default.conf \
+    PORT "$port" DOMAIN "$domain" \
+    VMPATH "$vmpath" VLPATH "/v-$u6" TRPATH "/t-$u6" TR2PATH "/tw-$u6" VEPATH "/ve-$u6" \
+    ALTSVC "$altsvc"
 
   if [[ $port == "443" ]]; then
     cat <<'EOF' >/etc/nginx/conf.d/80.conf
@@ -1645,7 +1676,7 @@ server {
     root /var/www/html;
 }
 EOF
-  sed -i "s/__DOMAIN__/$domain/" /etc/nginx/conf.d/default.conf
+  render_tpl /etc/nginx/conf.d/default.conf DOMAIN "$domain"
   nginx -t >/dev/null 2>&1 && systemctl restart nginx
   if ! /root/.acme.sh/acme.sh --issue -d "$domain" -w "$WEBDIR" -k ec-256 --server letsencrypt; then
     die "证书签发失败(检查域名解析是否指向本机,且 80 端口可访问)"
@@ -2784,6 +2815,8 @@ changeXrayVerify() {
   conf_raw '.uuids' "[\"$nu\"]"
   np=$(ask "输入新 WS path (回车=随机): ")
   [[ -z $np ]] && np="/$(uuid6 "$nu")"
+  [[ "$np" != /* ]] && np="/$np"
+  [[ "$np" =~ ^/[A-Za-z0-9._~/-]{1,128}$ ]] || die "path 只允许字母数字与 . _ ~ - / (长度 1-128), 且必须以 / 开头"
   conf_set '.path' "$np"
   xray_gen_config
   if domain_proto_on; then nginx_web_conf; systemctl restart nginx; fi
@@ -3599,6 +3632,7 @@ changePath() {
   local np; np=$(ask "输入新 WS path (回车=随机): ")
   [[ -z $np ]] && np="/$(uuid6 "$(conf_get '.uuids[0]')")"
   [[ "$np" != /* ]] && np="/$np"
+  [[ "$np" =~ ^/[A-Za-z0-9._~/-]{1,128}$ ]] || die "path 只允许字母数字与 . _ ~ - / (长度 1-128), 且必须以 / 开头"
   conf_set '.path' "$np"
   regen_all
   ok "WS path 已更换"
@@ -3692,34 +3726,84 @@ changePort() {
 }
 
 uninstallGWD() {
-  read -rp "确认卸载? 将删除 全部配置/证书/节点数据/网站目录,输入 yes 确认: " c
-  [[ $c == "yes" ]] || { ok "已取消"; return; }
-  ok "停止服务..."
-  local s
-  for s in xray sing-box doh-server haproxy wg-quick@wgcf nginx degwd-nftables degwd-shaping nftables unbound degwd-panel; do
-    systemctl stop "$s" >/dev/null 2>&1
-    systemctl disable "$s" >/dev/null 2>&1
+  local force=0 keep_panel=0 purge_pkgs=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--force|-y|--yes|--noninteractive) force=1 ;;
+      --keep-panel) keep_panel=1 ;;
+      --purge-pkgs) purge_pkgs=1 ;;
+    esac
+    shift
   done
+
+  if [[ $force -eq 0 ]]; then
+    read -rp "确认卸载? 将删除 全部配置/证书/节点数据/网站目录,输入 yes 确认: " c
+    [[ $c == "yes" ]] || { ok "已取消"; return 0; }
+    read -rsp "同时卸载 nginx/unbound/haproxy 等底层软件包? [y/N]: " -n1 r; echo
+    [[ "$r" =~ ^[Yy] ]] && purge_pkgs=1
+  fi
+
+  ok "停止服务与清理后台进程..."
+  local s
+  local svcs=(xray sing-box doh-server haproxy wg-quick@wgcf nginx degwd-nftables degwd-shaping nftables unbound cloudflared)
+  [[ $keep_panel -eq 0 ]] && svcs+=(degwd-panel)
+  for s in "${svcs[@]}"; do
+    systemctl stop "$s" >/dev/null 2>&1 || true
+    systemctl disable "$s" >/dev/null 2>&1 || true
+  done
+
+  # 杀灭可能的残留与孤儿进程
+  pkill -9 -f 'cloudflared.*tunnel' 2>/dev/null || true
+  pkill -9 -f 'xray run' 2>/dev/null || true
+  pkill -9 -f 'sing-box run' 2>/dev/null || true
+  pkill -9 -f 'doh-server' 2>/dev/null || true
+  if [[ $keep_panel -eq 0 ]]; then
+    pkill -9 -f 'degwd.*panel\.py' 2>/dev/null || true
+    pkill -9 -f 'python.*panel\.py' 2>/dev/null || true
+  fi
+
+  # 清理 WireGuard 网络设备
+  wg-quick down wgcf 2>/dev/null || true
+  ip link delete wgcf 2>/dev/null || true
+
   # 只删本方案自建表, 不动 Docker/firewalld 等其他 nft 表
-  nft delete table inet degwd_bypassflow 2>/dev/null
-  nft delete table inet degwd_filter 2>/dev/null
-  nft delete table inet degwd_router 2>/dev/null
+  nft delete table inet degwd_bypassflow 2>/dev/null || true
+  nft delete table inet degwd_filter 2>/dev/null || true
+  nft delete table inet degwd_router 2>/dev/null || true
+
   ok "移除服务单元与文件..."
-  rm -f /etc/systemd/system/xray.service /etc/systemd/system/sing-box.service \
-        /etc/systemd/system/doh-server.service /etc/systemd/system/unbound.service \
-        /etc/systemd/system/degwd-nftables.service /etc/systemd/system/degwd-shaping.service \
-        /etc/systemd/system/degwd-panel.service
+  local units=(
+    /etc/systemd/system/xray.service
+    /etc/systemd/system/sing-box.service
+    /etc/systemd/system/cloudflared.service
+    /etc/systemd/system/doh-server.service
+    /etc/systemd/system/unbound.service
+    /etc/systemd/system/degwd-nftables.service
+    /etc/systemd/system/degwd-shaping.service
+  )
+  [[ $keep_panel -eq 0 ]] && units+=(/etc/systemd/system/degwd-panel.service)
+  rm -f "${units[@]}"
   rm -rf /etc/systemd/system/networking.service.d
+
   # 恢复发行版 nginx 默认站点(安装时备份过)
   if [[ -e $BASE/backup/nginx-sites-enabled-default && ! -e /etc/nginx/sites-enabled/default ]]; then
     cp -a "$BASE/backup/nginx-sites-enabled-default" /etc/nginx/sites-enabled/default 2>/dev/null
   fi
-  systemctl daemon-reload
-  (crontab -l 2>/dev/null | grep -vE 'de_GWD|acme\.sh') | crontab - 2>/dev/null
+  systemctl daemon-reload 2>/dev/null || true
+
+  # 清理计划任务 (crontab)
+  (crontab -l 2>/dev/null | grep -vE 'de_GWD|shuoyue|acme\.sh|cloudflared|cf_speed') | crontab - 2>/dev/null || true
+
+  # 清理证书与密钥
   rm -rf /root/.acme.sh
-  rm -rf "$BASE" "$SSLDIR" "$WEBDIR"
-  rm -f /etc/wireguard/wgcf.conf /usr/local/bin/xray /usr/local/bin/shuoyue /etc/rc_online.local
-  rm -rf /usr/local/share/xray
+  rm -rf "$SSLDIR"
+  rm -rf "$WEBDIR/sub" 2>/dev/null || true
+
+  # 清理核心二进制及共享数据
+  rm -f /usr/local/bin/xray /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/shuoyue /usr/local/bin/de_GWD /etc/rc_online.local
+  rm -rf /usr/local/share/xray /usr/local/share/sing-box
+  rm -f /etc/wireguard/wgcf.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf
+
   # 移除本方案写入的 drop-in 配置(不动用户原有的 sysctl/limits 配置)
   rm -f /etc/sysctl.d/99-degwd.conf /etc/security/limits.d/99-degwd.conf
   rm -f /etc/apt/apt.conf.d/01deGWD
@@ -3727,15 +3811,33 @@ uninstallGWD() {
   rm -f /etc/apt/sources.list.d/nginx.list /etc/apt/keyrings/nginx-archive-keyring.asc
   rm -f /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/80.conf \
         /etc/nginx/conf.d/.HSTS /etc/nginx/conf.d/.ssl_certs
-  read -rsp "同时卸载 nginx/unbound/haproxy 组件? [y/N]: " -n1 r; echo
-  if [[ "$r" =~ ^[Yy] ]]; then
-    apt-get purge -y -qq nginx nginx-* unbound haproxy >/dev/null 2>&1
-    apt-get autoremove -y -qq >/dev/null 2>&1
+
+  # 清理基准工作目录 (若保留面板用于响应退出，则仅保留 panel 目录)
+  if [[ $keep_panel -eq 1 ]]; then
+    find "$BASE" -mindepth 1 -maxdepth 1 ! -name 'panel' -exec rm -rf {} + 2>/dev/null || true
+  else
+    rm -rf "$BASE" "$WEBDIR"
   fi
+
+  # 软件包清理
+  if [[ $purge_pkgs -eq 1 ]]; then
+    ok "正在卸载底层软件包 (nginx/unbound/haproxy/cloudflared)..."
+    apt-get purge -y -qq nginx nginx-* unbound haproxy cloudflared >/dev/null 2>&1 || true
+    apt-get autoremove -y -qq >/dev/null 2>&1 || true
+  else
+    # 保留 nginx 时，重载以恢复默认干净配置
+    if command -v nginx >/dev/null 2>&1; then
+      nginx -t >/dev/null 2>&1 && systemctl restart nginx >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 恢复标准 DNS
+  chattr -i /etc/resolv.conf 2>/dev/null || true
   rm -f /etc/resolv.conf
-  printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf
-  sysctl --system >/dev/null 2>&1
-  ok "卸载完成(已移除本方案的 sysctl/limits drop-in 与自建 nft 表;重装可直接跑一键脚本)"
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+  sysctl --system >/dev/null 2>&1 || true
+
+  ok "卸载完成(已移除所有核心、配置、证书、自建 nft 表与 drop-in 配置; 重装可直接跑一键脚本)"
 }
 
 config_menu() {
@@ -5085,6 +5187,21 @@ cli_dispatch() {
     sub)     conf_init; sub_toggle "${1:-on}" >/dev/null 2>&1; cli_json "{\"ok\":true,\"sub_on\":$(conf_get '.sub_on' | grep -q false && echo false || echo true)}" ;;
     suburl)  conf_init; local h; h=$(conf_get '.domain'); [[ -z $h ]] && h=$(wan_ip); printf 'https://%s/sub/%s\n' "$h" "$(conf_get '.subtoken')" ;;
     kill_tp) cli_kill_tp "${1:-}" ;;
+    uninstall)
+      local keep_p=0 purge_p=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --keep-panel) keep_p=1 ;;
+          --purge-pkgs) purge_p=1 ;;
+        esac
+        shift
+      done
+      local u_args=(-f)
+      [[ $keep_p -eq 1 ]] && u_args+=(--keep-panel)
+      [[ $purge_p -eq 1 ]] && u_args+=(--purge-pkgs)
+      uninstallGWD "${u_args[@]}" >&2
+      cli_json '{"ok":true,"message":"卸载完成"}'
+      ;;
     *)       cli_json '{"ok":false,"error":"unknown subcommand"}' ; return 1 ;;
   esac
 }
@@ -5094,6 +5211,8 @@ case "${1:-}" in
   --update)        updateGWD; exit 0 ;;
   --install)       installGWD; exit 0 ;;
   --install-cli)   cli_install_legacy; exit 0 ;;
+  --uninstall|uninstall|del|-u)
+                   shift; uninstallGWD "$@"; exit 0 ;;
   --version)       echo "$VERSION"; exit 0 ;;
   --detect|-d)     show_proxy_detection; exit 0 ;;
   --kill-tp)       shift; stop_or_uninstall_third_party "$@"; exit $? ;;
