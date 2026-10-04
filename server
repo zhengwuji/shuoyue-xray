@@ -230,6 +230,16 @@ local_ip() {
 wan_ip() { curl -4fsS --max-time 8 whatismyip.akamai.com 2>/dev/null || curl -4fsS --max-time 8 ifconfig.me 2>/dev/null; }
 
 svc_ok() { systemctl is-active "$1" >/dev/null 2>&1; }
+
+# ufw 是否处于 active。
+# 不用 `ufw status | grep -q`: grep 命中即退出会让 ufw 收 SIGPIPE(141),
+# set -o pipefail 下管道被判失败 -> "active" 被误读为 "inactive", 规则就放不进去。
+ufw_active() {
+  command -v ufw >/dev/null 2>&1 || return 1
+  local s=""
+  s=$(ufw status 2>/dev/null || true)
+  grep -q "Status: active" <<<"$s"
+}
 # 重启服务;容器/受限环境不支持 Nice= 时自动去除后重试(继承原版兜底模式)
 svc_restart() {
   local s="$1"
@@ -591,6 +601,10 @@ pkg_dep() {
   #   dnsutils      —— 无 dig/host/nslookup 调用(用 unbound-host 代替)
   #   net-tools     —— 无 ifconfig/netstat/route 调用(全用 iproute2 的 ip)
   #   git/bc/sudo/unzip —— 全文无调用
+  #   libmimallocN  —— 全文无 LD_PRELOAD / ld.so.preload 引用, 装了也不会被
+  #                    Xray/nginx 加载; 且包名随 Debian 版本变化
+  #                    (bookworm=libmimalloc2.0, trixie+=libmimalloc3,
+  #                    Ubuntu 侧命名又不同), 属于纯负担, 已整体删除
   # 补: unbound-anchor / unbound-host 在 Debian 是**独立的二进制包**,
   #     unbound 包自 bookworm 起已不再 Depends 它俩 → 不装则 DNSSEC
   #     信任锚生成与校验(server 里的 unbound-anchor / unbound-host 调用)静默失败
@@ -598,17 +612,6 @@ pkg_dep() {
            gnupg nftables chrony ethtool unbound unbound-anchor unbound-host; do
     dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
   done
-  # mimalloc 包名随 Debian 版本变化: bookworm=libmimalloc2.0, trixie+=libmimalloc3
-  local mi codename=""
-  codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
-  case "$codename" in
-    bookworm|bullseye) mi=libmimalloc2.0 ;;
-    trixie|forky|sid)  mi=libmimalloc3 ;;
-    *)                 mi="" ;;   # 未知版本交给 apt 兜底, 不硬编码
-  esac
-  if [[ -n $mi ]] && ! dpkg -s "$mi" >/dev/null 2>&1; then
-    need="$need $mi"
-  fi
   # irqbalance 多核有益
   [[ $(nproc --all) -gt 1 ]] && ! dpkg -s irqbalance >/dev/null 2>&1 && need="$need irqbalance"
   if [[ -n $need ]]; then
@@ -1029,6 +1032,17 @@ EOF
 }
 
 # ================================================================= nginx =====
+# nginx.org 官方源只收录「已发布」的发行版套件: Debian 侧有 buster/bullseye/
+# bookworm/trixie, Ubuntu 侧有 focal/jammy/noble/oracular/plucky/questing/resolute;
+# **testing(forky)/sid 与更新的未发布套件一律没有**。写源前先探测 Release 是否存在,
+# 避免在 testing 上写出一条必然 404 的源, 让 apt-get update 报错刷屏。
+nginx_org_suite_ok() {   # $1=base $2=suite
+  local code
+  code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 15 \
+         -I "$1/dists/$2/Release" 2>/dev/null)
+  [[ $code == "200" ]]
+}
+
 install_nginx() {
   ok "安装 nginx..."
   # Debian 与 Ubuntu 官方源自适应; 源不可用时回退发行版包
@@ -1039,14 +1053,25 @@ install_nginx() {
   if [[ -n $suite ]]; then
     local base="https://nginx.org/packages/debian"
     [[ $distro == "ubuntu" ]] && base="https://nginx.org/packages/ubuntu"
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL https://nginx.org/keys/nginx_signing.key -o /etc/apt/keyrings/nginx-archive-keyring.asc 2>/dev/null
-    if [[ -s /etc/apt/keyrings/nginx-archive-keyring.asc ]]; then
-      echo "deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.asc] $base $suite nginx" >/etc/apt/sources.list.d/nginx.list
-      apt-get update -qq 2>/dev/null
+    if nginx_org_suite_ok "$base" "$suite"; then
+      mkdir -p /etc/apt/keyrings
+      curl -fsSL https://nginx.org/keys/nginx_signing.key -o /etc/apt/keyrings/nginx-archive-keyring.asc 2>/dev/null
+      if [[ -s /etc/apt/keyrings/nginx-archive-keyring.asc ]]; then
+        echo "deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.asc] $base $suite nginx" >/etc/apt/sources.list.d/nginx.list
+        apt-get update -qq 2>/dev/null
+      fi
+    else
+      # testing(forky)/sid 等新套件: nginx.org 没有对应目录, 直接用发行版包
+      warn "nginx.org 官方源暂无 $suite 套件(常见于 Debian testing/sid), 改用发行版自带 nginx"
     fi
   fi
-  if ! apt-cache policy nginx 2>/dev/null | grep -q 'nginx.org'; then
+  # 注意: 不可写成 `apt-cache policy nginx | grep -q ...`。
+  # grep -q 命中即退出会关闭管道读端, apt-cache 继续写时收到 SIGPIPE(141);
+  # 在 set -o pipefail 下整个管道被判定失败, 于是「源可用」被误读为「源不可用」,
+  # 会把刚写好的 nginx.list 删掉(间歇性, 静默丢失 HTTP/3)。改为先取回输出再匹配。
+  local nginx_policy=""
+  nginx_policy=$(apt-cache policy nginx 2>/dev/null || true)
+  if ! grep -q 'nginx.org' <<<"$nginx_policy"; then
     rm -f /etc/apt/sources.list.d/nginx.list
     apt-get update -qq 2>/dev/null
   fi
@@ -1534,10 +1559,16 @@ EOF
   if [[ -s /var/lib/unbound/root.key ]]; then
     if ! unbound-checkconf /etc/unbound/unbound.conf >/dev/null 2>&1; then
       warn "unbound 配置校验未通过, DNSSEC 可能未生效(请检查 /var/lib/unbound/root.key)"
-    elif unbound-host -C /etc/unbound/unbound.conf -v -t A dnssec-failed.org 2>&1 | grep -q 'validation failure'; then
-      ok "unbound DNSSEC 校验链路正常(已验证 dnssec-failed.org 被正确拒绝)"
     else
-      warn "unbound DNSSEC 验证未确认(网络受限时属正常), 信任锚已存在"
+      # 不用 `... | grep -q`: grep 提前退出会让 unbound-host 收 SIGPIPE,
+      # set -o pipefail 下管道被判失败, 校验通过会被误读为不通过。
+      local uhout=""
+      uhout=$(unbound-host -C /etc/unbound/unbound.conf -v -t A dnssec-failed.org 2>&1 || true)
+      if grep -q 'validation failure' <<<"$uhout"; then
+        ok "unbound DNSSEC 校验链路正常(已验证 dnssec-failed.org 被正确拒绝)"
+      else
+        warn "unbound DNSSEC 验证未确认(网络受限时属正常), 信任锚已存在"
+      fi
     fi
   else
     warn "未生成 /var/lib/unbound/root.key, DNSSEC 验证将不可用"
@@ -2556,7 +2587,7 @@ installGWD() {
 
   local pport; pport=$(panel_port)
   # 防火墙放行面板端口 (若开启了 ufw)
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  if ufw_active; then
     ufw allow ${pport}/tcp >/dev/null 2>&1 && ok "ufw 已放行 ${pport}/tcp"
   fi
 
@@ -2687,7 +2718,7 @@ updateGWD() {
     systemctl daemon-reload
     svc_restart degwd-panel && ok "Web 控制面板服务已重新加载" || warn "Web 控制面板重启异常"
     local pport; pport=$(panel_port)
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_active; then
       ufw allow "$pport/tcp" >/dev/null 2>&1
     fi
     if domain_proto_on && [[ -f /etc/nginx/conf.d/default.conf ]]; then
@@ -2981,7 +3012,9 @@ warp_set_mode() {
 warp_test_unlock() {
   local test_port=9899
   local proxy_opt=""
-  if ss -tln 2>/dev/null | grep -qE ":$test_port\s"; then
+  local ssout=""
+  ssout=$(ss -tln 2>/dev/null || true)
+  if grep -qE ":$test_port\s" <<<"$ssout"; then
     proxy_opt="socks5://127.0.0.1:$test_port"
   fi
 
@@ -3436,7 +3469,9 @@ changeTCPPF() {
       [[ "$up" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] || die "格式: host:port"
       port=$(ask "本地监听端口: ")
       port_valid "$port" || die "端口无效: 必须是 1-65535, 且不能是本方案保留端口(53/80/443/3000/8442-8446/9853/9890-9892/9896/51820)"
-      ss -lntp 2>/dev/null | grep -q ":$port " && die "端口 $port 已被占用"
+      local ssrelay=""
+      ssrelay=$(ss -lntp 2>/dev/null || true)
+      grep -q ":$port " <<<"$ssrelay" && die "端口 $port 已被占用"
       entries=$(echo "$entries" | jq --arg u "$up" --arg p "$port" '. + [{upstream:$u, port:($p|number)}]')
       conf_raw '.relay' "$entries"
       relay_gen
@@ -3475,11 +3510,44 @@ CFspeedTest() {
 }
 
 # ----------------------------------------------------------------- 内核升级 ---
+# Zabbly stable 内核仓库只收录「稳定」套件:
+#   Debian: bookworm / trixie      Ubuntu: jammy / noble / resolute
+# testing(forky)/sid 与 Ubuntu 非 LTS(questing/plucky/oracular 等)没有对应目录,
+# 直接写源会让 apt-get update 报 404。这里先探测 Release, 探测失败再退到同家族
+# 的稳定套件(只用于取 linux-zabbly 内核包, 不引入其它软件)。
+zabbly_suite_ok() {   # $1=suite
+  local code
+  code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 15 \
+         -I "https://pkgs.zabbly.com/kernel/stable/dists/$1/Release" 2>/dev/null)
+  [[ $code == "200" ]]
+}
+
+zabbly_pick_suite() {   # $1=codename; 回显可用套件, 无则回显空串
+  local cn=$1 fb=""
+  [[ -z $cn ]] && { echo ""; return 0; }
+  if zabbly_suite_ok "$cn"; then echo "$cn"; return 0; fi
+  case "$cn" in
+    forky|sid|trixie)              fb=trixie  ;;
+    bookworm|bullseye|buster)      fb=bookworm ;;
+    questing|plucky|oracular|noble|jammy) fb=noble ;;
+    resolute)                      fb=resolute ;;
+  esac
+  if [[ -n $fb ]] && zabbly_suite_ok "$fb"; then echo "$fb"; return 0; fi
+  echo ""
+}
+
 installkernel() {
   [[ $VIRT_TYPE == "container" ]] && die "容器环境不支持更换内核"
   read -rsp "[1] Zabbly stable 内核: " -n1 a; echo
   if [[ $a == "1" ]]; then
     local codename; codename=$(. /etc/os-release; echo "$VERSION_CODENAME")
+    local zsuite; zsuite=$(zabbly_pick_suite "$codename")
+    if [[ -z $zsuite ]]; then
+      warn "Zabbly 内核仓库没有 $codename 对应套件(仅收录 Debian bookworm/trixie 与 Ubuntu jammy/noble/resolute), 已跳过内核升级"
+      return 0
+    fi
+    [[ $zsuite != "$codename" ]] && \
+      warn "Zabbly 无 $codename 套件, 回退使用 $zsuite 的 linux-zabbly 内核包"
     mkdir -p /etc/apt/keyrings
     # 原 https://zabbly.com/key.asc 可用; 源 URI 原为 zabbly.com/kernel/stable(404/502), 实测 pkgs.zabbly.com 200
     curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc || die "Zabbly GPG key 下载失败"
@@ -3503,12 +3571,12 @@ installkernel() {
 Enabled: yes
 Types: deb
 URIs: https://pkgs.zabbly.com/kernel/stable
-Suites: $codename
+Suites: $zsuite
 Components: main
 Signed-By: /etc/apt/keyrings/zabbly.asc
 EOF
   apt-get update -qq
-  apt-get install -y -qq linux-zabbly || die "Zabbly 内核不支持该发行版/套件($codename), 仅支持 Debian 12/13 与 Ubuntu 22.04/24.04"
+  apt-get install -y -qq linux-zabbly || die "linux-zabbly 安装失败(Zabbly 套件 $zsuite); 可执行 rm -f /etc/apt/sources.list.d/zabbly-kernels-stable.sources 后重试"
   ok "内核已安装, 重启生效"
     read -rsp "现在重启? [y/N]: " -n1 r; echo
     [[ "$r" =~ ^[Yy] ]] && reboot
@@ -4149,10 +4217,14 @@ change_panel_port() {
   fi
 
   if command -v ss >/dev/null 2>&1; then
-    if ss -tln | grep -qE ":$np\s"; then
+    local ssout2=""
+    ssout2=$(ss -tln 2>/dev/null || true)
+    if grep -qE ":$np\s" <<<"$ssout2"; then
       local pids
       pids=$(lsof -ti :$np 2>/dev/null || true)
-      if [[ -n $pids ]] && ! systemctl status degwd-panel 2>/dev/null | grep -q "$pids"; then
+      local pstatus=""
+      pstatus=$(systemctl status degwd-panel 2>/dev/null || true)
+      if [[ -n $pids ]] && ! grep -q "$pids" <<<"$pstatus"; then
         warn "端口 $np 已被其他系统进程占用，请换一个"; return 1
       fi
     fi
@@ -4164,7 +4236,7 @@ change_panel_port() {
   panel_unit_conf
   svc_restart degwd-panel && ok "degwd-panel 已重启生效" || warn "degwd-panel 重启异常"
 
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  if ufw_active; then
     ufw allow "$np/tcp" >/dev/null 2>&1 && ok "ufw 已放行 $np/tcp"
     if [[ "$cur_port" != "$np" && "$cur_port" != "3000" ]]; then
       ufw delete allow "$cur_port/tcp" >/dev/null 2>&1 || true

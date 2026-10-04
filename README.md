@@ -116,10 +116,12 @@ install.sh 会自动识别 OpenWrt,下载 OpenWrt 原生客户端(`client-openwr
 | 系统 | 支持度 | 说明 |
 |---|---|---|
 | Debian 12 / 13 (amd64/arm64) | ✅ 完整支持 | 主力目标,所有功能可用 |
-| Ubuntu 22.04 / 24.04 | ✅ 完整支持 | 自动适配:nginx 官方源走 /ubuntu、静态 IP 走 netplan、systemd-resolved 正确接管 |
+| Ubuntu 22.04 / 24.04 / 26.04 | ✅ 完整支持 | 自动适配:nginx 官方源走 /ubuntu、静态 IP 走 netplan、systemd-resolved 正确接管 |
 | OpenWrt (客户端) | ✅ 支持 | procd 服务、opkg 依赖、uci/dnsmasq 集成、nft TPROXY;自动补 bash;服务端不适用 |
-| Debian 11 | ⚠️ 可用 | 个别包(如 libmimalloc)缺失自动跳过;内核 5.10 已带 WireGuard |
+| Debian testing (forky) / sid | ⚠️ 可用 | nginx.org 与 Zabbly 内核源均未收录该套件,已自动回退发行版 nginx 并跳过内核升级;其余功能正常 |
+| Debian 11 | ⚠️ 可用 | 内核 5.10 已带 WireGuard;上游源未收录 bullseye 的 nginx 官方包时自动回退 |
 | Ubuntu 20.04 | ⚠️ 可用 | smartdns 未收录(客户端会明确报错提示);建议升级到 22.04+ |
+| Ubuntu 非 LTS(questing/plucky 等) | ⚠️ 可用 | nginx.org 有对应套件;Zabbly 内核源无对应目录,内核升级自动跳过 |
 | 其他 apt 系(Mint 等) | ❓ 未测 | 理论同 Ubuntu 流程 |
 | RHEL / Arch / Alpine | ❌ 不支持 | 脚本基于 apt/dpkg |
 
@@ -128,7 +130,7 @@ install.sh 会自动识别 OpenWrt,下载 OpenWrt 原生客户端(`client-openwr
 - **安装即最新**:Xray、sing-box、dnsproxy(DoH)、AdGuard Home、wgcf、acme.sh 均从各自官方 GitHub release 拉 latest(带 sha256 校验);nginx 优先 nginx.org 官方源(支持 HTTP3),不可用时回退发行版包;系统包在安装时执行 `apt full-upgrade`
 - **菜单 0(更新)**:重新拉取上述全部组件最新版 + 重建配置,系统包同样 full-upgrade
 - **自动更新(cron)**:仅更新脚本自身(版本号比对),不触碰组件——组件升级统一走菜单 0,避免半夜自动大动干戈
-- 内核升级是可选菜单(Zabbly 源,支持 Debian 12/13 与 Ubuntu 22.04/24.04),不强制
+- 内核升级是可选菜单(Zabbly 源,覆盖 Debian 12/13 与 Ubuntu 22.04/24.04/26.04)。脚本会先探测上游 `dists/<codename>/Release`,套件不存在时自动跳过并提示,不会写出一条必然 404 的源
 
 
 ## v2rayN 导入示例

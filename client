@@ -216,14 +216,23 @@ EOF
 pkg_dep() {
   local need="" p
   # 只装真正用到的包。已删除(全文无调用, 计数为 1 即只出现在本列表):
-  #   socat/screen/bc/unzip/gnupg/wget —— 无任何调用
+  #   socat/screen/bc/unzip/wget —— 无任何调用
   #   resolvconf —— 会接管 /etc/resolv.conf, 与 resolv_setup() 手写的内容冲突
-  # 保留: util-linux(flock), wireguard-tools(wg/wg-quick), dnsutils(dig),
-  #       gnupg(installkernel 校验 Zabbly key 指纹), ca-certificates(HTTPS 信任链)
-  for p in jq qrencode curl dnsutils nftables chrony ethtool \
+  # 保留: util-linux(flock), wireguard-tools(wg/wg-quick), gnupg(installkernel
+  #       校验 Zabbly key 指纹), ca-certificates(HTTPS 信任链)
+  for p in jq qrencode curl nftables chrony ethtool \
            ca-certificates gnupg wireguard-tools util-linux; do
     dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
   done
+  # dig 由 bind9-dnsutils 提供。Debian 13(trixie)+ / Ubuntu 25.10+ 起 dnsutils
+  # 只剩过渡包(新发行版索引里已无该名字), 新版本一律给 bind9-dnsutils;
+  # bionic/focal/buster 等老版本尚无 bind9-dnsutils, 只能用 dnsutils。
+  local codename="" digpkg=bind9-dnsutils
+  codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
+  case "$codename" in
+    bionic|focal|buster) digpkg=dnsutils ;;
+  esac
+  dpkg -s "$digpkg" >/dev/null 2>&1 || need="$need $digpkg"
   dpkg -s smartdns >/dev/null 2>&1 || need="$need smartdns"
   if [[ -n $need ]]; then
     apt-get update -qq
@@ -236,6 +245,12 @@ pkg_dep() {
       done
       [[ -n $failed ]] && warn "以下包不可用已跳过:${failed}"
     fi
+  fi
+  # dig 仍不可用(发行版改名或索引异常) → 用另一个包名再兜一次
+  if ! command -v dig >/dev/null 2>&1; then
+    local digalt=dnsutils
+    [[ $digpkg == dnsutils ]] && digalt=bind9-dnsutils
+    apt-get install -y -qq "$digalt" >/dev/null 2>&1 || true
   fi
   command -v smartdns >/dev/null || die "smartdns 不可用(该发行版未收录)。请先手动安装 smartdns(参考 README 支持矩阵), 或改用 Debian 12+/Ubuntu 22.04+"
 }
@@ -362,7 +377,13 @@ net_static() {   # 静态 IP (四种网络管理器自适应: nmcli/netplan/syst
   cp -a /etc/NetworkManager "$bdir/" 2>/dev/null
   ok "已备份原网络配置到 $bdir"
 
-  if command -v nmcli >/dev/null 2>&1 && nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "connected"; then
+  # 注意: 不能写成 `nmcli ... | grep -q "connected"`。grep -q 命中即退出会让 nmcli
+  # 收到 SIGPIPE(141), set -o pipefail 下管道被判失败, 「已连接」会被误读为「未连接」。
+  local nmstate=""
+  if command -v nmcli >/dev/null 2>&1; then
+    nmstate=$(nmcli -t -f DEVICE,STATE device status 2>/dev/null || true)
+  fi
+  if grep -q "connected" <<<"$nmstate"; then
     local con; con=$(nmcli -t -f DEVICE,NAME,STATE connection show --active 2>/dev/null | grep "^$nic:" | cut -d: -f2 | head -n1)
     if [[ -n $con ]]; then
       local ipaddr prefix; ipaddr=${cidr%%/*}; prefix=${cidr##*/}
@@ -2407,9 +2428,41 @@ health_check() {   # $1="full" 才跑外网探测(主菜单每轮调用会拖慢
 }
 
 # ================================================================ 内核 =========
+# Zabbly stable 内核仓库只收录「稳定」套件:
+#   Debian: bookworm / trixie      Ubuntu: jammy / noble / resolute
+# testing(forky)/sid 与 Ubuntu 非 LTS 没有对应目录, 直接写源会让 apt-get update
+# 报 404。先探测 Release, 探测失败再退到同家族的稳定套件(仅用于取内核包)。
+zabbly_suite_ok() {   # $1=suite
+  local code
+  code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 15 \
+         -I "https://pkgs.zabbly.com/kernel/stable/dists/$1/Release" 2>/dev/null)
+  [[ $code == "200" ]]
+}
+
+zabbly_pick_suite() {   # $1=codename; 回显可用套件, 无则回显空串
+  local cn=$1 fb=""
+  [[ -z $cn ]] && { echo ""; return 0; }
+  if zabbly_suite_ok "$cn"; then echo "$cn"; return 0; fi
+  case "$cn" in
+    forky|sid|trixie)              fb=trixie  ;;
+    bookworm|bullseye|buster)      fb=bookworm ;;
+    questing|plucky|oracular|noble|jammy) fb=noble ;;
+    resolute)                      fb=resolute ;;
+  esac
+  if [[ -n $fb ]] && zabbly_suite_ok "$fb"; then echo "$fb"; return 0; fi
+  echo ""
+}
+
 installkernel() {
   local codename; codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
   [[ -z $codename ]] && { err "无法识别发行版 codename"; return 1; }
+  local zsuite; zsuite=$(zabbly_pick_suite "$codename")
+  if [[ -z $zsuite ]]; then
+    warn "Zabbly 内核仓库没有 $codename 对应套件(仅收录 Debian bookworm/trixie 与 Ubuntu jammy/noble/resolute), 已跳过内核升级"
+    return 0
+  fi
+  [[ $zsuite != "$codename" ]] && \
+    warn "Zabbly 无 $codename 套件, 回退使用 $zsuite 的 linux-zabbly 内核包"
   mkdir -p /etc/apt/keyrings
   # 源 URI 原写 zabbly.com/kernel/stable(实测 404/502), 官方仓库在 pkgs.zabbly.com
   curl -fsSL --max-time 30 https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc \
@@ -2435,13 +2488,13 @@ installkernel() {
 Enabled: yes
 Types: deb
 URIs: https://pkgs.zabbly.com/kernel/stable
-Suites: $codename
+Suites: $zsuite
 Components: main
 Signed-By: /etc/apt/keyrings/zabbly.asc
 EOF
   apt-get update -qq
   apt-get install -y -qq linux-zabbly \
-    || { err "Zabbly 内核不支持该发行版/套件($codename), 仅支持 Debian 12/13 与 Ubuntu 22.04/24.04"; return 1; }
+    || { err "linux-zabbly 安装失败(Zabbly 套件 $zsuite); 可执行 rm -f /etc/apt/sources.list.d/zabbly-kernels-stable.sources 后重试"; return 1; }
   ok "内核已安装, 重启生效"
   read -rsp "现在重启? [y/N]: " -n1 r; echo
   [[ "$r" =~ ^[Yy] ]] && reboot
