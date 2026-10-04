@@ -703,6 +703,10 @@ transition:opacity .2s;z-index:9;max-width:90vw}
 .test-card.fail{border-color:rgba(248,81,73,.4)}
 .test-status.ok{color:#3fb950;font-weight:600;font-size:11px}
 .test-status.fail{color:#f85149;font-weight:600;font-size:11px}
+.port-tag{cursor:pointer;transition:all .15s}
+.port-tag:hover{border-color:var(--acc);color:var(--acc)}
+.port-row{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:6px 8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;font-size:12px}
+.port-row input{width:75px;padding:2px 6px;font-size:12px;text-align:center;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-radius:4px}
 </style>
 </head>
 <body>
@@ -743,12 +747,24 @@ transition:opacity .2s;z-index:9;max-width:90vw}
 
   <section>
     <h2>协议选择</h2>
-    <div class="toolbar">
+    <div class="toolbar" style="flex-wrap:wrap;gap:8px">
       <button class="mini" data-quick="all">全选</button>
       <button class="mini" data-quick="none">全不选</button>
       <button class="mini" data-quick="xray">仅 Xray</button>
       <button class="mini" data-quick="singbox">仅 Sing-box（含 Naive）</button>
       <span class="dim" id="pick-count"></span>
+      <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
+        <button class="mini" id="btn-rand-ports" style="background:rgba(88,166,255,0.15);border-color:#58a6ff;color:#58a6ff;font-weight:600" title="为所有协议分配互不相同的独立高位随机端口（10000~60000）">🎲 一键随机所有端口</button>
+        <button class="mini" id="btn-reset-ports" title="将所有协议端口恢复为默认初始端口">🔄 恢复默认端口</button>
+        <button class="mini" id="btn-toggle-port-mgr" title="展开/收起各协议独立端口详细配置">⚙️ 独立端口配置</button>
+      </div>
+    </div>
+    <div id="port-mgr-panel" style="display:none;margin-top:10px;padding:12px;background:var(--panel2);border:1px solid var(--bd);border-radius:6px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+        <span style="font-weight:600;font-size:13px">🔌 协议独立端口详细配置（支持单独修改任意协议端口或一键随机）</span>
+        <button class="mini primary" id="btn-save-custom-ports">保存独立端口修改</button>
+      </div>
+      <div id="port-mgr-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px"></div>
     </div>
     <div id="proto-groups"></div>
   </section>
@@ -975,7 +991,7 @@ function renderProtos() {
         '<input type="checkbox" class="pk" value="' + esc(p.id) + '">' +
         '<div><div class="pname">' + esc(p.name) + "</div>" +
         '<code class="pid">' + esc(p.id) + "</code>" +
-        '<div class="meta"><span class="tag">' + esc(p.port) + "</span>" +
+        '<div class="meta"><span class="tag port-tag" data-pid="' + esc(p.id) + '" title="点击快捷修改此协议端口">' + esc(p.port) + ' ✏️</span>' +
         (p.needs_domain ? '<span class="tag warn">需域名</span>' : '<span class="tag ok">免域名</span>') +
         "</div></div></label>";
     }).join("");
@@ -988,7 +1004,75 @@ function renderProtos() {
       updateCount();
     });
   });
+  $$(".port-tag").forEach(function (el) {
+    el.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var pid = el.getAttribute("data-pid");
+      var cur = el.textContent.replace(/[^0-9]/g, "");
+      var np = prompt("修改协议 [" + pid + "] 的端口\n(当前: " + cur + "，范围 1024-65535，留空回车则随机生成):", cur);
+      if (np === null) { return; }
+      np = np.trim();
+      if (!np) {
+        np = Math.floor(10000 + Math.random() * 50000);
+      }
+      var portNum = parseInt(np, 10);
+      if (isNaN(portNum) || portNum < 1024 || portNum > 65535) {
+        alert("端口必须在 1024-65535 之间");
+        return;
+      }
+      api("/api/ports", "POST", { action: "set", id: pid, port: String(portNum) }, function (err, res) {
+        if (err) { alert("修改端口失败: " + err); return; }
+        if (res && res.protolist) {
+          updateProtoList(res.protolist);
+        }
+        loadStatus();
+        toast("协议 " + pid + " 端口已更新为 " + portNum);
+      });
+    });
+  });
   updateCount();
+}
+function updateProtoList(newlist) {
+  if (Array.isArray(newlist) && newlist.length) {
+    SERVER_PROTOS = newlist;
+    PROTOS = newlist.map(function (p) {
+      return {
+        id: p.id,
+        name: p.name || p.id,
+        group: p.kernel === "xray" ? "xray" : "singbox",
+        port: String(p.port || ""),
+        needs_domain: !!p.needs_domain,
+        desc: p.desc || ""
+      };
+    });
+    renderProtos();
+    renderPortMgrGrid();
+  }
+}
+window.updateProtoList = updateProtoList;
+
+function renderPortMgrGrid() {
+  var grid = $("#port-mgr-grid");
+  if (!grid) { return; }
+  var list = protoList();
+  grid.innerHTML = list.map(function (p) {
+    var numPort = p.port.replace(/[^0-9]/g, "");
+    return '<div class="port-row">' +
+      '<span style="font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(p.name) + '">' + esc(p.name) + '</span>' +
+      '<input type="text" class="custom-port-inp" data-pid="' + esc(p.id) + '" value="' + esc(numPort) + '" maxlength="5">' +
+      '<button class="mini btn-rand-single" data-pid="' + esc(p.id) + '" title="为该协议单独随机端口">🎲</button>' +
+    '</div>';
+  }).join("");
+  $$(".btn-rand-single").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var pid = btn.getAttribute("data-pid");
+      var inp = grid.querySelector('.custom-port-inp[data-pid="' + pid + '"]');
+      if (inp) {
+        inp.value = Math.floor(10000 + Math.random() * 50000);
+      }
+    });
+  });
 }
 function checkedIds() {
   return $$(".pk").filter(function (cb) { return cb.checked; }).map(function (cb) { return cb.value; });
@@ -1563,6 +1647,75 @@ if (btnCfQuick) {
   });
 }
 
+var btnRandPorts = $("#btn-rand-ports");
+if (btnRandPorts) {
+  btnRandPorts.addEventListener("click", function () {
+    if (!confirm("确认将全部协议分配互不相同的独立高位随机端口（10000~60000）？\n每个协议将拥有完全不同的端口，自动避开系统保留端口，并自动重启内核与更新订阅！")) {
+      return;
+    }
+    busy(btnRandPorts, api("/api/ports", "POST", { action: "randomize" }), "正在随机端口…").then(function (r) {
+      if (r && r.ok) {
+        if (r.data && r.data.protolist) {
+          updateProtoList(r.data.protolist);
+        }
+        toast("✅ 全部协议独立随机端口已分配并生效！");
+        loadStatus();
+      }
+    });
+  });
+}
+var btnResetPorts = $("#btn-reset-ports");
+if (btnResetPorts) {
+  btnResetPorts.addEventListener("click", function () {
+    if (!confirm("确认将所有协议恢复为默认预设端口？")) {
+      return;
+    }
+    busy(btnResetPorts, api("/api/ports", "POST", { action: "reset" }), "正在重置…").then(function (r) {
+      if (r && r.ok) {
+        if (r.data && r.data.protolist) {
+          updateProtoList(r.data.protolist);
+        }
+        toast("✅ 已恢复所有协议为默认端口！");
+        loadStatus();
+      }
+    });
+  });
+}
+var btnTogglePortMgr = $("#btn-toggle-port-mgr");
+if (btnTogglePortMgr) {
+  btnTogglePortMgr.addEventListener("click", function () {
+    var p = $("#port-mgr-panel");
+    if (p) {
+      if (p.style.display === "none") {
+        p.style.display = "block";
+        renderPortMgrGrid();
+      } else {
+        p.style.display = "none";
+      }
+    }
+  });
+}
+var btnSavePorts = $("#btn-save-custom-ports");
+if (btnSavePorts) {
+  btnSavePorts.addEventListener("click", function () {
+    var inputs = $$(".custom-port-inp");
+    var pports = {};
+    for (var i = 0; i < inputs.length; i++) {
+      var pid = inputs[i].getAttribute("data-pid");
+      var val = parseInt(inputs[i].value.trim(), 10);
+      if (!isNaN(val) && val >= 1024 && val <= 65535) {
+        pports[pid] = val;
+      }
+    }
+    busy(btnSavePorts, api("/api/ports", "POST", { action: "batch", proto_ports: pports }), "正在保存…").then(function (r) {
+      if (r && r.ok) {
+        toast("独立端口配置已保存并重载内核");
+        loadStatus();
+      }
+    });
+  });
+}
+
 $("#btn-cfg").addEventListener("click", function () {
   var payload = {};
   var map = {
@@ -1877,6 +2030,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 status = self._finish_cli(run_cli(["warp", "test"]))
             elif path == "/api/cloudflared":
                 status = self._finish_cli(run_cli(["cf_tunnel", "status"]))
+            elif path == "/api/ports":
+                status = self._finish_cli(run_cli(["ports", "list"]))
             else:
                 status = self._send_error_json(404, "路径不存在")
         except Exception as exc:  # 任何异常都不能让进程崩溃
@@ -1901,7 +2056,7 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 status = self._send_error_json(403, "CSRF 校验失败: %s" % reason)
                 return
             if path not in ("/api/protos", "/api/cfg", "/api/regen", "/api/reset",
-                            "/api/warp", "/api/sub", "/api/kill_third_party", "/api/cloudflared"):
+                            "/api/warp", "/api/sub", "/api/kill_third_party", "/api/cloudflared", "/api/ports"):
                 self._drain_body()
                 status = self._send_error_json(404, "路径不存在")
                 return
@@ -1917,6 +2072,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 status = self._handle_warp(body)
             elif path == "/api/cloudflared":
                 status = self._handle_cloudflared(body)
+            elif path == "/api/ports":
+                status = self._handle_ports(body)
             elif path == "/api/sub":
                 status = self._handle_switch(body, "sub")
             elif path == "/api/regen":
@@ -2129,6 +2286,39 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             "config": str(body.get("config") or ""),
         })
         return self._finish_cli(run_cli(["kill_tp", payload]))
+
+    def _handle_ports(self, body):
+        """POST /api/ports —— 随机端口 / 重置端口 / 单独修改指定协议端口。"""
+        if not isinstance(body, dict):
+            return self._send_error_json(400, "请求体必须是 JSON 对象")
+        action = str(body.get("action") or "").strip().lower()
+        if action in ("randomize", "rand"):
+            return self._finish_cli(run_cli(["ports", "randomize"]))
+        elif action == "reset":
+            return self._finish_cli(run_cli(["ports", "reset"]))
+        elif action == "set":
+            pid = str(body.get("id") or "").strip()
+            port = str(body.get("port") or "").strip()
+            if not PROTO_ID_RE.match(pid):
+                return self._send_error_json(400, "非法协议 ID")
+            if not re.match(r"^[0-9]+$", port) or not (1024 <= int(port) <= 65535):
+                return self._send_error_json(400, "端口必须在 1024-65535 之间")
+            return self._finish_cli(run_cli(["ports", "set", pid, port]))
+        elif action == "batch":
+            pports = body.get("proto_ports")
+            if not isinstance(pports, dict):
+                return self._send_error_json(400, "proto_ports 必须为键值对对象")
+            clean_ports = {}
+            for k, v in pports.items():
+                if PROTO_ID_RE.match(str(k)):
+                    try:
+                        pv = int(v)
+                        if 1024 <= pv <= 65535:
+                            clean_ports[str(k)] = pv
+                    except (ValueError, TypeError):
+                        continue
+            return self._finish_cli(run_cli(["cfg", "-"], stdin_data=json.dumps({"proto_ports": clean_ports})))
+        return self._send_error_json(400, "未知动作: %s，支持 randomize|reset|set|batch" % action)
 
 
 # ------------------------------------------------------------------- 启动 ---

@@ -340,17 +340,28 @@ find_next_free_port() {
   echo "$base_port"
 }
 
-# 动态获取协议的实际可用端口 (第三方冲突时自动智能避让)
+# 动态获取协议的实际可用端口 (第三方冲突时自动智能避让, 支持独立自定义与随机端口)
 effective_proto_port() {
   local id="$1"
   local def="$2"
-  case "$id" in
-    vmess|vless|trojan|wsenc|trojanws)
-      conf_get '.port // 443'
-      return 0
-      ;;
-  esac
 
+  # 1. 优先读取持久化自定义/随机端口
+  local saved
+  saved=$(conf_get ".proto_ports[\"$id\"]")
+
+  # xhttpupip 回退到 xhttptls 端口
+  if [[ "$id" == "xhttpupip" && (-z $saved || "$saved" == "null") ]]; then
+    saved=$(conf_get '.proto_ports["xhttptls"]')
+  fi
+
+  if [[ -n $saved && "$saved" != "null" && "$saved" =~ ^[0-9]+$ ]]; then
+    if ! is_port_occupied_by_third_party "$saved"; then
+      echo "$saved"
+      return 0
+    fi
+  fi
+
+  # 2. Reality 历史配置兼容
   if [[ "$id" == "reality" ]]; then
     local rp
     rp=$(conf_get '.reality.port')
@@ -359,15 +370,15 @@ effective_proto_port() {
     fi
   fi
 
-  local saved
-  saved=$(conf_get ".proto_ports[\"$id\"]")
-  if [[ -n $saved && "$saved" != "null" && "$saved" =~ ^[0-9]+$ ]]; then
-    if ! is_port_occupied_by_third_party "$saved"; then
-      echo "$saved"
+  # 3. 5 个基于 Nginx WS 反代的协议在未单独自定义端口时，默认继承 Nginx 业务主端口 (.port // 443)
+  case "$id" in
+    vmess|vless|trojan|wsenc|trojanws)
+      conf_get '.port // 443'
       return 0
-    fi
-  fi
+      ;;
+  esac
 
+  # 4. 默认端口若被第三方占用，自动智能避让并持久化
   if is_port_occupied_by_third_party "$def"; then
     local new_port
     new_port=$(find_next_free_port "$def")
@@ -377,6 +388,90 @@ effective_proto_port() {
   fi
 
   echo "$def"
+}
+
+# ------------------------------------------------ 协议随机端口与独立端口分配 ---
+# 生成一个在 10000..60000 之间且未被占用、非系统保留、未被当前已分配集合使用的随机端口
+generate_random_port() {
+  local exclude_list="$1"
+  local cand tries=0 max_tries=500
+  local reserved=" 53 80 443 1080 3000 8388 8442 8443 8444 8445 8446 8447 8448 8449 8450 8451 8452 9853 9890 9891 9892 9893 9894 9895 9896 9899 51820 "
+  local panel_p; panel_p=$(panel_port 2>/dev/null || true)
+  [[ -n $panel_p ]] && reserved="$reserved $panel_p "
+
+  while (( tries < max_tries )); do
+    cand=$(( 10000 + RANDOM % 50000 ))
+    (( tries++ ))
+    [[ $reserved == *" $cand "* ]] && continue
+    [[ " $exclude_list " == *" $cand "* ]] && continue
+    if is_port_occupied_by_third_party "$cand"; then
+      continue
+    fi
+    echo "$cand"
+    return 0
+  done
+
+  echo "$(( 20000 + RANDOM % 40000 ))"
+  return 0
+}
+
+# 为所有协议分配完全不同的独立高位随机端口（10000~60000）
+randomize_all_proto_ports() {
+  conf_init
+  local allocated=""
+  local pids
+  pids=$(proto_ids)
+  local new_ports_json="{}"
+
+  for pid in $pids; do
+    if [[ "$pid" == "xhttpupip" ]]; then
+      local xp
+      xp=$(echo "$new_ports_json" | jq -r '.["xhttptls"] // empty')
+      [[ -z $xp ]] && xp=$(proto_port xhttptls)
+      new_ports_json=$(echo "$new_ports_json" | jq --arg id "$pid" --argjson p "$xp" '. + {($id): $p}')
+      continue
+    fi
+
+    local rp
+    rp=$(generate_random_port "$allocated")
+    allocated="$allocated $rp"
+    new_ports_json=$(echo "$new_ports_json" | jq --arg id "$pid" --argjson p "$rp" '. + {($id): $p}')
+    if [[ "$pid" == "reality" ]]; then
+      conf_raw '.reality.port' "$rp"
+    fi
+  done
+
+  conf_raw '.proto_ports' "$new_ports_json"
+  ok "已成功为所有协议生成互不相同、无冲突的独立高位随机端口"
+}
+
+# 恢复所有协议端口为默认值
+reset_all_proto_ports() {
+  conf_init
+  conf_raw '.proto_ports' "{}"
+  conf_raw '.reality.port' "8443"
+  ok "已恢复所有协议为默认端口"
+}
+
+# 单独设置指定协议的端口
+set_single_proto_port() {
+  local id="$1" port="$2"
+  conf_init
+  proto_valid "$id" || die "未知协议 ID: $id"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "端口格式无效: $port"
+  (( port >= 1024 && port <= 65535 )) || die "端口范围必须在 1024-65535 之间"
+  if is_port_occupied_by_third_party "$port"; then
+    die "端口 $port 已被系统其他进程占用"
+  fi
+  conf_raw ".proto_ports[\"$id\"]" "$port"
+  if [[ "$id" == "reality" ]]; then
+    conf_raw '.reality.port' "$port"
+  elif [[ "$id" == "xhttptls" ]]; then
+    conf_raw '.proto_ports["xhttpupip"]' "$port"
+  elif [[ "$id" == "xhttpupip" ]]; then
+    conf_raw '.proto_ports["xhttptls"]' "$port"
+  fi
+  ok "协议 $id 端口已修改为: $port"
 }
 
 # ------------------------------------------------ GitHub release downloader ---
@@ -1144,12 +1239,35 @@ EOF
     if [[ $quic_enabled == 1 ]]; then
       echo "    listen __PORT__ default_server quic reuseport;"
     fi
+    local extra_ws_ports=() p pp
+    for p in vmess vless trojan trojanws wsenc; do
+      if proto_on "$p"; then
+        pp=$(proto_port "$p")
+        if [[ -n $pp && "$pp" != "$port" && "$pp" != "null" ]]; then
+          extra_ws_ports+=("$pp")
+        fi
+      fi
+    done
+    if [[ ${#extra_ws_ports[@]} -gt 0 ]]; then
+      local unique_extra
+      unique_extra=$(printf '%s\n' "${extra_ws_ports[@]}" | sort -u)
+      for pp in $unique_extra; do
+        if [[ -n $h2line ]]; then
+          echo "    listen $pp ssl fastopen=500 reuseport;"
+        else
+          echo "    listen $pp ssl http2 fastopen=500 reuseport;"
+        fi
+        if [[ $quic_enabled == 1 ]]; then
+          echo "    listen $pp quic reuseport;"
+        fi
+      done
+    fi
     [[ -n $h2line ]] && echo "$h2line"
     cat <<'EOF'
     server_name __DOMAIN__;
     root /var/www/html;
     index index.html index.htm;
-    error_page 497 https://$host:__PORT__$request_uri;
+    error_page 497 https://$host:$server_port$request_uri;
     __ALTSVC__
     include /etc/nginx/conf.d/.HSTS;
     add_header Referrer-Policy "origin" always;
@@ -2153,7 +2271,7 @@ gen_links() {
   # CDN 优选 IP / 落地域名(UpIP), 缺省回落到 host
   local upip; upip=$(conf_get '.upip'); [[ -z $upip ]] && upip=$host
   if proto_on vmess; then
-    port=$(conf_get '.port')
+    port=$(proto_port vmess)
     local vj
     vj=$(jq -cn --arg add "$host" --arg port "$port" --arg id "$uuid0" \
       --arg path "$(conf_get '.path')" --arg host "$host" \
@@ -2162,15 +2280,15 @@ gen_links() {
     emit_link vmess "vmess://$(printf %s "$vj" | base64 -w0)"
   fi
   if proto_on vless; then
-    port=$(conf_get '.port')
+    port=$(proto_port vless)
     emit_link vless "vless://$uuid0@$host:$port?encryption=none&security=tls&sni=$host&fp=chrome&type=ws&host=$host&path=/v-$u6#vless-ws"
   fi
   if proto_on trojan; then
-    port=$(conf_get '.port')
+    port=$(proto_port trojan)
     emit_link trojan "trojan://$uuid0@$host:$port?security=tls&sni=$host&type=ws&host=$host&path=/t-$u6#trojan-ws"
   fi
   if proto_on trojanws; then
-    port=$(conf_get '.port')
+    port=$(proto_port trojanws)
     emit_link trojanws "trojan://$uuid0@$host:$port?security=tls&sni=$host&type=ws&host=$host&path=/tw-$u6#trojan-ws2"
   fi
   if proto_on trojantcp; then
@@ -2178,7 +2296,7 @@ gen_links() {
   fi
   # ---- VLESS + WebSocket + VLESS 加密 -------------------------------------
   if proto_on wsenc; then
-    port=$(conf_get '.port')
+    port=$(proto_port wsenc)
     local wenc; wenc=$(vless_enc_pair 2>/dev/null); wenc=${wenc#* }
     emit_link wsenc "vless://$uuid0@$host:$port?encryption=$(urlenc "$wenc")&security=tls&sni=$host&fp=chrome&type=ws&host=$host&path=/ve-$u6#vless-ws-enc"
   fi
@@ -3268,25 +3386,69 @@ resetPassword() {
 changePort() {
   conf_init
   echo
-  echo -e "${CYAN}=== 更改端口管理 ===${cRES}"
-  echo "  [1] 更改业务节点服务端口 (Nginx TLS 端口, 当前: $(conf_get '.port // 443'))"
+  echo -e "${CYAN}=== 更改端口管理 (支持独立端口与一键随机) ===${cRES}"
+  echo "  [1] 更改业务服务主端口 (Nginx TLS 端口, 当前: $(conf_get '.port // 443'))"
   echo "  [2] 更改 Web 控制面板端口 (网页 GUI 端口, 当前: $(panel_port))"
+  echo "  [3] 更改指定协议端口 (自定义单个协议端口，支持回车随机)"
+  echo "  [4] 🎲 一键随机所有协议端口 (为全部协议分配互不相同、无冲突的独立高位端口)"
+  echo "  [5] 恢复所有协议为默认端口"
   echo "  [q] 返回"
   echo
-  read -rp "请选择 [1/2, q 返回]: " opt
+  read -rp "请选择 [1-5, q 返回]: " opt
   case $opt in
     1)
-      domain_proto_on || die "当前仅启用免域名协议(Reality/SS/hy2/tuic/anytls 端口各自固定), 无 nginx 端口可改"
-      echo "当前端口: $(conf_get '.port')"
-      local np; np=$(ask "新端口 (443 或 1024-65535): ")
+      domain_proto_on || die "当前仅启用免域名协议，无 nginx 端口可改"
+      echo "当前主端口: $(conf_get '.port')"
+      local np; np=$(ask "新主端口 (443 或 1024-65535): ")
       service_port_valid "$np" || die "端口无效: 需 443 或 1024-65535, 且不能占用内核内部端口"
       conf_set '.port' "$np"
       regen_all
-      nginx -t >/dev/null 2>&1 && systemctl restart nginx && ok "业务端口已更改为 $np(订阅/链接已同步)" || warn "nginx 配置异常,请运行 nginx -t 检查"
+      nginx -t >/dev/null 2>&1 && systemctl restart nginx && ok "业务主端口已更改为 $np (订阅/链接已同步)" || warn "nginx 配置异常,请运行 nginx -t 检查"
       printNode
       ;;
     2)
       change_panel_port
+      ;;
+    3)
+      echo
+      echo -e "${GREEN}当前各协议端口状态:${cRES}"
+      local id name kern port dom desc actport
+      while IFS='|' read -r id name kern port dom desc; do
+        [[ -z $id ]] && continue
+        actport=$(proto_port "$id")
+        printf "  %-12s (%-26s): %s\n" "$id" "$name" "$actport"
+      done <<< "$PROTO_TABLE"
+      echo
+      local target; target=$(ask "请输入要修改的协议 ID (如 reality, hy2, vless...): ")
+      [[ -z $target ]] && { ok "已取消"; return 0; }
+      proto_valid "$target" || die "无效的协议 ID: $target"
+      local cur; cur=$(proto_port "$target")
+      local newp; newp=$(ask "请输入 $target 的新端口 [1024-65535，回车随机生成，当前: $cur]: ")
+      if [[ -z $newp ]]; then
+        newp=$(generate_random_port "")
+        ok "随机生成可用端口: $newp"
+      fi
+      set_single_proto_port "$target" "$newp"
+      regen_all
+      ok "协议 $target 端口已成功更新为 $newp"
+      printNode
+      ;;
+    4)
+      echo "将为所有协议分配互不相同的高位随机端口 (10000~60000)，自动避开冲突与系统保留端口。"
+      read -rsp "确认一键随机所有协议端口? [y/N]: " -n1 c; echo
+      [[ "$c" =~ ^[Yy] ]] || { ok "已取消"; return 0; }
+      randomize_all_proto_ports
+      regen_all
+      ok "所有协议端口已随机化完成，服务已重启，订阅链接已更新！"
+      printNode
+      ;;
+    5)
+      read -rsp "确认恢复所有协议端口为默认值? [y/N]: " -n1 c; echo
+      [[ "$c" =~ ^[Yy] ]] || { ok "已取消"; return 0; }
+      reset_all_proto_ports
+      regen_all
+      ok "已恢复所有协议为默认端口，服务已重启！"
+      printNode
       ;;
     *)
       return 0
@@ -4528,6 +4690,16 @@ cli_cfg() {
       conf_set '.reality.port' "$v"
     fi
   done
+  local pports; pports=$(printf '%s' "$j" | jq -c '.proto_ports // empty')
+  if [[ -n $pports && "$pports" != "null" ]]; then
+    for pid in $(echo "$pports" | jq -r 'keys[]'); do
+      local pval; pval=$(echo "$pports" | jq -r --arg k "$pid" '.[$k]')
+      if [[ "$pval" =~ ^[0-9]+$ ]] && (( pval >= 1024 && pval <= 65535 )); then
+        conf_raw ".proto_ports[\"$pid\"]" "$pval"
+        [[ "$pid" == "reality" ]] && conf_raw '.reality.port' "$pval"
+      fi
+    done
+  fi
   apply_protos
   gen_sub_all
   cli_json '{"ok":true}'
@@ -4543,6 +4715,34 @@ cli_dispatch() {
     regen)   cli_regen ;;
     reset)   cli_reset ;;
     cfg)     cli_cfg "${1:-}" ;;
+    ports)
+      conf_init
+      local p_act="${1:-}"; shift || true
+      case "$p_act" in
+        randomize|rand)
+          randomize_all_proto_ports >&2
+          regen_all >&2
+          cli_json "{\"ok\":true,\"protolist\":$(proto_table_json)}"
+          ;;
+        reset)
+          reset_all_proto_ports >&2
+          regen_all >&2
+          cli_json "{\"ok\":true,\"protolist\":$(proto_table_json)}"
+          ;;
+        set)
+          set_single_proto_port "${1:-}" "${2:-}" >&2 || return 1
+          regen_all >&2
+          cli_json "{\"ok\":true,\"protolist\":$(proto_table_json)}"
+          ;;
+        list|"")
+          cli_json "{\"ok\":true,\"protolist\":$(proto_table_json)}"
+          ;;
+        *)
+          cli_json '{"ok":false,"error":"未知 ports 操作，支持: randomize | reset | set <id> <port> | list"}'
+          return 1
+          ;;
+      esac
+      ;;
     warp)
       conf_init
       local w_act="${1:-}"; shift || true
@@ -4584,6 +4784,8 @@ case "${1:-}" in
   --version)       echo "$VERSION"; exit 0 ;;
   --detect|-d)     show_proxy_detection; exit 0 ;;
   --kill-tp)       shift; stop_or_uninstall_third_party "$@"; exit $? ;;
+  --ports)         changePort; exit 0 ;;
+  --random-ports)  randomize_all_proto_ports; regen_all; printNode; exit 0 ;;
   --warp)          cloudflare_menu; exit 0 ;;
   --warp-mode)     shift; warp_set_mode "${1:-warp_google}"; exit $? ;;
   --warp-test)     warp_test_interactive; exit 0 ;;
