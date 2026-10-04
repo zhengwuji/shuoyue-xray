@@ -632,7 +632,10 @@ button:hover:not(:disabled){border-color:var(--acc)}
 button:disabled{opacity:.5;cursor:not-allowed}
 button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
 button.ok{background:#1f6f36;border-color:#1f6f36;color:#fff}
+button.danger{background:#da3633;border-color:#f85149;color:#fff}
+button.danger:hover:not(:disabled){background:#b62324;border-color:#ff7b72}
 button.mini{padding:2px 9px;font-size:12px;border-radius:6px}
+.proto-actions-bar{margin-top:14px;padding:12px 14px;background:rgba(255,255,255,0.02);border:1px solid var(--bd);border-radius:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
 .form{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
 .field{display:flex;flex-direction:column;gap:5px}
 .field>label{font-size:12px;color:var(--dim)}
@@ -767,6 +770,22 @@ transition:opacity .2s;z-index:9;max-width:90vw}
       <div id="port-mgr-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px"></div>
     </div>
     <div id="proto-groups"></div>
+    <div class="proto-actions-bar">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <button class="primary" id="btn-proto-install" style="padding:8px 18px;font-size:13px;font-weight:600;display:inline-flex;align-items:center;gap:6px" title="将上方勾选的所有协议立即保存并安装部署，启动代理服务">
+          <span>🚀 安装所选协议</span>
+        </button>
+        <button id="btn-proto-reinstall" style="padding:8px 16px;font-size:13px;font-weight:600;display:inline-flex;align-items:center;gap:6px" title="根据当前勾选的协议重新生成底层 Xray / Sing-box / Nginx 配置并重启全部服务">
+          <span>🔄 重新安装</span>
+        </button>
+        <button class="danger" id="btn-proto-uninstall" style="padding:8px 16px;font-size:13px;font-weight:600;display:inline-flex;align-items:center;gap:6px" title="卸载并停用勾选的协议，释放端口">
+          <span>🗑️ 卸载协议</span>
+        </button>
+      </div>
+      <div class="dim" style="font-size:12px">
+        <span>💡 勾选上方协议后点击「安装」生效；「重新安装」重建底层配置；「卸载」停用所选协议并释放端口</span>
+      </div>
+    </div>
   </section>
 
   <section>
@@ -1109,8 +1128,10 @@ $$("[data-quick]").forEach(function (btn) {
 });
 
 /* -------------------------------------------------------------- 状态与链接 */
+var LAST_STATUS = null;
 function applyStatus(d) {
   if (!d || typeof d !== "object") { return; }
+  LAST_STATUS = d;
   var installed = !!d.installed;
   var badge = $("#badge");
   badge.innerHTML = '<span class="dot ' + (installed ? "ok" : "err") + '"></span>' +
@@ -1472,7 +1493,7 @@ if (btnDetect) {
   });
 }
 
-$("#btn-save").addEventListener("click", function () {
+function handleInstallProtos(triggerBtn) {
   var ids = checkedIds();
   if (!ids.length) { toast("请至少勾选一个协议"); return; }
   var needDomain = false;
@@ -1493,12 +1514,110 @@ $("#btn-save").addEventListener("click", function () {
   if (domainVal) {
     prepJob = api("/api/cfg", "POST", { domain: domainVal });
   }
-  busy(this, prepJob.then(function () {
+  busy(triggerBtn, prepJob.then(function () {
     return api("/api/protos", "POST", { protos: ids });
-  }), "保存并应用协议").then(function (r) {
-    if (r && r.ok && r.data) { applyStatus(r.data.data || r.data); }
+  }), "正在安装并应用协议…").then(function (r) {
+    if (r && r.ok && r.data) {
+      applyStatus(r.data.data || r.data);
+      toast("✅ 所选协议已成功安装并启动！");
+      loadStatus();
+    }
   });
-});
+}
+
+var btnSave = $("#btn-save");
+if (btnSave) {
+  btnSave.addEventListener("click", function () { handleInstallProtos(this); });
+}
+
+var btnProtoInstall = $("#btn-proto-install");
+if (btnProtoInstall) {
+  btnProtoInstall.addEventListener("click", function () { handleInstallProtos(this); });
+}
+
+var btnProtoReinstall = $("#btn-proto-reinstall");
+if (btnProtoReinstall) {
+  btnProtoReinstall.addEventListener("click", function () {
+    var ids = checkedIds();
+    if (!ids.length) {
+      if (!confirm("当前未勾选任何协议，重新安装将重新构建底层配置并重启服务，继续？")) { return; }
+      busy(this, api("/api/regen", "POST", {}), "正在重新安装…").then(function (r) {
+        if (r && r.ok && r.data) {
+          applyStatus(r.data.data || r.data);
+          toast("✅ 底层服务配置已重建并重启！");
+          loadStatus();
+        }
+      });
+      return;
+    }
+    if (!confirm("确认重新安装所选协议（共 " + ids.length + " 个）？\n将应用勾选的协议并彻底重新生成 Xray / Sing-box / Nginx 配置。")) {
+      return;
+    }
+    var trigger = this;
+    busy(trigger, api("/api/protos", "POST", { protos: ids }).then(function () {
+      return api("/api/regen", "POST", {});
+    }), "正在重新安装协议…").then(function (r) {
+      if (r && r.ok && r.data) {
+        applyStatus(r.data.data || r.data);
+        toast("✅ 所选协议已重新安装，底层配置已彻底重建！");
+        loadStatus();
+      }
+    });
+  });
+}
+
+var btnProtoUninstall = $("#btn-proto-uninstall");
+if (btnProtoUninstall) {
+  btnProtoUninstall.addEventListener("click", function () {
+    var ids = checkedIds();
+    var curProtos = (LAST_STATUS && LAST_STATUS.protos) ? LAST_STATUS.protos : {};
+    var activeIds = [];
+    if (Array.isArray(curProtos)) {
+      activeIds = curProtos.slice();
+    } else if (curProtos && typeof curProtos === "object") {
+      for (var k in curProtos) {
+        if (curProtos[k]) { activeIds.push(k); }
+      }
+    }
+    if (!ids.length) {
+      if (!activeIds.length) {
+        toast("当前未启用任何代理协议，无需卸载");
+        return;
+      }
+      if (!confirm("当前未勾选特定协议，确认卸载并停用所有已启用的代理协议（共 " + activeIds.length + " 个）？\n将关闭各协议代理服务并释放端口。")) {
+        return;
+      }
+      busy(this, api("/api/protos", "POST", { protos: [] }), "正在卸载所有协议…").then(function (r) {
+        if (r && r.ok && r.data) {
+          applyStatus(r.data.data || r.data);
+          setChecks([]);
+          toast("✅ 已卸载并停用所有代理协议服务");
+          loadStatus();
+        }
+      });
+      return;
+    }
+    if (!confirm("确认卸载并停用勾选的 " + ids.length + " 个协议？\n将从服务中移除这些协议并释放对应端口。")) {
+      return;
+    }
+    var remaining = activeIds.filter(function (id) { return ids.indexOf(id) < 0; });
+    busy(this, api("/api/protos", "POST", { protos: remaining }), "正在卸载协议…").then(function (r) {
+      if (r && r.ok && r.data) {
+        applyStatus(r.data.data || r.data);
+        ids.forEach(function (id) {
+          var cb = $('.pk[value="' + id + '"]');
+          if (cb) {
+            cb.checked = false;
+            if (cb.closest(".proto")) { cb.closest(".proto").classList.remove("on"); }
+          }
+        });
+        updateCount();
+        toast("✅ 所选协议已成功卸载并停用！");
+        loadStatus();
+      }
+    });
+  });
+}
 $("#btn-regen").addEventListener("click", function () {
   if (!confirm("重建配置会重写 Xray / sing-box / nginx 配置并重启服务，继续？")) { return; }
   busy(this, api("/api/regen", "POST", {}), "重建配置").then(function (r) {
