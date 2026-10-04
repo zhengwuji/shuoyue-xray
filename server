@@ -981,6 +981,8 @@ install_xray() {
   # 调度优先级。这里改成在 [Service] 段落内按条件插入。
   local _nice=""
   [[ $VIRT_TYPE != "container" ]] && _nice="Nice=-8"
+  # 清理任何外部官方脚本遗留的 drop-in override(如 10-donot_touch_single_conf.conf)
+  rm -rf /etc/systemd/system/xray.service.d 2>/dev/null
   # 自有 systemd 单元(带 hardening,继承原版)
   write_atomic /etc/systemd/system/xray.service 644 <<EOF
 [Unit]
@@ -989,6 +991,8 @@ After=network.target nss-lookup.target
 
 [Service]
 User=$XTLSUSER
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ExecStart=/usr/local/bin/xray run -confdir $XRAYDIR
 Restart=on-failure
 RestartPreventExitStatus=23
@@ -1002,11 +1006,16 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
+  touch /var/log/xray-error.log 2>/dev/null
   if [[ $XTLSUSER != "root" ]]; then
     chown -R $XTLSUSER:$XTLSUSER "$XRAYDIR" 2>/dev/null
+    chown "$XTLSUSER:$XTLSUSER" /var/log/xray-error.log 2>/dev/null
+    chmod 644 /var/log/xray-error.log 2>/dev/null
     chmod 750 "$XRAYDIR"; chmod 640 "$XRAYDIR"/config.json 2>/dev/null
     # reality 私钥等只读给运行用户
   fi
+  mkdir -p /usr/local/etc/xray 2>/dev/null
+  ln -sf "$XRAYDIR/config.json" /usr/local/etc/xray/config.json 2>/dev/null
 }
 
 # ================================================================= nginx =====
@@ -2042,9 +2051,18 @@ xray_gen_config() {
     rm -f "$cfg_tmp"
     die "Xray 配置生成/校验失败, 已保留旧配置 $XRAYDIR/config.json"
   fi
-  chmod 640 "$cfg_tmp" 2>/dev/null
-  if [[ $XTLSUSER != "root" ]]; then chown $XTLSUSER:$XTLSUSER "$cfg_tmp"; fi
+  chmod 644 "$cfg_tmp" 2>/dev/null
+  if [[ $XTLSUSER != "root" ]]; then chown "$XTLSUSER:$XTLSUSER" "$cfg_tmp" 2>/dev/null; fi
   mv -f "$cfg_tmp" "$XRAYDIR/config.json" || { rm -f "$cfg_tmp"; die "Xray 配置替换失败"; }
+  touch /var/log/xray-error.log 2>/dev/null
+  if [[ $XTLSUSER != "root" ]]; then
+    chown -R "$XTLSUSER:$XTLSUSER" "$XRAYDIR" 2>/dev/null
+    chown "$XTLSUSER:$XTLSUSER" /var/log/xray-error.log 2>/dev/null
+    chmod 644 /var/log/xray-error.log 2>/dev/null
+  fi
+  chmod 644 "$XRAYDIR/config.json" 2>/dev/null
+  mkdir -p /usr/local/etc/xray 2>/dev/null
+  ln -sf "$XRAYDIR/config.json" /usr/local/etc/xray/config.json 2>/dev/null
   return 0
 }
 
