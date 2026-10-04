@@ -1701,9 +1701,28 @@ ensure_self_cert() {
   chown root:www-data "$SSLDIR/self.key" 2>/dev/null; chmod 640 "$SSLDIR/self.key" 2>/dev/null
   chmod 644 "$SSLDIR/self.cer" 2>/dev/null
 }
+open_all_ports() {
+  if which iptables >/dev/null 2>&1; then
+    iptables -I INPUT -p tcp --dport 1024:65535 -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p udp --dport 1024:65535 -j ACCEPT 2>/dev/null || true
+  fi
+  if which ufw >/dev/null 2>&1; then
+    ufw allow 1024:65535/tcp >/dev/null 2>&1 || true
+    ufw allow 1024:65535/udp >/dev/null 2>&1 || true
+  fi
+  if which nft >/dev/null 2>&1; then
+    nft add rule inet filter input tcp dport 1024-65535 accept 2>/dev/null || true
+    nft add rule inet filter input udp dport 1024-65535 accept 2>/dev/null || true
+  fi
+  ok "已执行开放系统 1024-65535 所有高位端口"
+}
+
 # 输出: <证书> <私钥> <自签标记0/1>
 tls_cert_pair() {
-  if [[ -s $SSLDIR/de_GWD.cer && -s $SSLDIR/de_GWD.key ]]; then
+  local alns; alns=$(conf_get '.alns // empty')
+  if [[ $alns == "y" && -s $SSLDIR/de_GWD.cer && -s $SSLDIR/de_GWD.key ]]; then
+    echo "$SSLDIR/de_GWD.cer $SSLDIR/de_GWD.key 0"
+  elif [[ -s $SSLDIR/de_GWD.cer && -s $SSLDIR/de_GWD.key && $alns != "n" && $alns != "off" ]]; then
     echo "$SSLDIR/de_GWD.cer $SSLDIR/de_GWD.key 0"
   else
     ensure_self_cert
@@ -2284,7 +2303,17 @@ emit_link() {
 gen_links() {
   local uuid0 host u6 port
   uuid0=$(conf_get '.uuids[0]'); u6=$(uuid6 "$uuid0")
-  host=$(conf_get '.domain'); [[ -z $host ]] && host=$(wan_ip)
+  host=$(conf_get '.domain')
+  local ippz; ippz=$(conf_get '.ippz // empty')
+  if [[ $ippz == "4" ]]; then
+    local v4; v4=$(curl -4s --max-time 2 https://api.ipify.org 2>/dev/null || wan_ip)
+    [[ -n $v4 ]] && host="$v4"
+  elif [[ $ippz == "6" ]]; then
+    local v6; v6=$(curl -6s --max-time 2 https://api64.ipify.org 2>/dev/null || wan_ip)
+    [[ -n $v6 ]] && host="[$v6]"
+  else
+    [[ -z $host ]] && host=$(wan_ip)
+  fi
   local _c _k insc; read -r _c _k insc <<< "$(tls_cert_pair)"
   # CDN 优选 IP / 落地域名(UpIP), 缺省回落到 host
   local upip; upip=$(conf_get '.upip'); [[ -z $upip ]] && upip=$host
@@ -4537,8 +4566,22 @@ cli_cfg_json() {
     --arg cdns "$(conf_get '.cdn')" \
     --arg port "$(conf_get '.port')" \
     --arg rport "$(conf_get '.reality.port')" \
-    '{uuid:$uuid, prefix:$prefix, reality_sni:$reality_sni, reality_dest:$reality_dest,
-      reality_port:$rport, upip:$upip, cdn:$cdns, port:$port}'
+    --arg alns "$(conf_get '.alns // ""')" \
+    --arg hyjpt "$(conf_get '.hyjpt // ""')" \
+    --arg cdnym "$(conf_get '.cdnym // ""')" \
+    --arg warp "$(conf_get '.warp.mode // ""')" \
+    --arg ippz "$(conf_get '.ippz // ""')" \
+    --arg oap "$(conf_get '.oap // ""')" \
+    --arg sub "$(conf_get '.sub // ""')" \
+    --arg subid "$(conf_get '.subtoken // ""')" \
+    --arg subpt "$(conf_get '.sub_port // ""')" \
+    --arg argo "$(conf_get '.argo.mode // ""')" \
+    --arg agn "$(conf_get '.argo.domain // ""')" \
+    --arg agk "$(conf_get '.argo.token // ""')" \
+    '{uuid:$uuid, prefix:$prefix, name:$prefix, reality_sni:$reality_sni, reym:$reality_sni,
+      reality_dest:$reality_dest, reality_port:$rport, upip:$upip, cfip:$upip, cdn:$cdns, port:$port,
+      alns:$alns, hyjpt:$hyjpt, cdnym:$cdnym, warp:$warp, ippz:$ippz, oap:$oap,
+      sub:$sub, subid:$subid, subpt:$subpt, argo:$argo, agn:$agn, agk:$agk}'
 }
 
 cli_links() {
@@ -4662,7 +4705,7 @@ cli_cfg() {
     j=$(cat)
   fi
   printf '%s' "$j" | jq -e . >/dev/null 2>&1 || { cli_json '{"ok":false,"error":"invalid json"}'; return 1; }
-  for k in domain uuid subtoken prefix reality_sni reality_dest upip cdn; do
+  for k in domain uuid subtoken subid prefix name reality_sni reym reality_dest upip cfip cdn alns hyjpt cdnym warp ippz oap sub subpt argo agn agk; do
     v=$(printf '%s' "$j" | jq -r --arg k "$k" '.[$k] // empty')
     [[ -z $v ]] && continue
     case $k in
@@ -4675,25 +4718,67 @@ cli_cfg() {
         [[ "$v" =~ ^[0-9a-fA-F-]{36}$ ]] || { cli_json '{"ok":false,"error":"bad uuid"}'; return 1; }
         conf_raw '.uuids' "[\"$v\"]"
         ;;
-      subtoken)
+      subtoken|subid)
         [[ "$v" =~ ^[A-Za-z0-9._~-]{1,128}$ ]] || { cli_json '{"ok":false,"error":"bad subtoken"}'; return 1; }
         conf_set '.subtoken' "$v"
         ;;
-      prefix)
+      prefix|name)
         conf_set '.prefix' "$v"
         ;;
-      reality_sni)
+      reality_sni|reym)
         conf_set '.reality.sni' "$v"
         ;;
       reality_dest)
         conf_set '.reality.dest' "$v"
         ;;
-      upip)
-        [[ "$v" =~ ^[A-Za-z0-9.:-]+$ ]] || { cli_json '{"ok":false,"error":"bad upip"}'; return 1; }
+      upip|cfip)
+        [[ "$v" =~ ^[A-Za-z0-9.:\ -]+$ ]] || { cli_json '{"ok":false,"error":"bad upip"}'; return 1; }
         conf_set '.upip' "$v"
         ;;
       cdn)
         conf_set '.cdn' "$v"
+        ;;
+      alns)
+        conf_set '.alns' "$v"
+        ;;
+      hyjpt)
+        conf_set '.hyjpt' "$v"
+        ;;
+      cdnym)
+        conf_set '.cdnym' "$v"
+        ;;
+      warp)
+        warp_set_mode "$v" >&2 || true
+        ;;
+      ippz)
+        conf_set '.ippz' "$v"
+        ;;
+      oap)
+        conf_set '.oap' "$v"
+        [[ "$v" == "y" ]] && open_all_ports >&2 || true
+        ;;
+      sub)
+        if [[ $v == "y" || $v == "true" || $v == "on" ]]; then
+          conf_raw '.sub_on' "true"
+          conf_set '.sub' "y"
+        else
+          conf_raw '.sub_on' "false"
+          conf_set '.sub' ""
+        fi
+        ;;
+      subpt)
+        if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1024 && v <= 65535 )); then
+          conf_raw '.sub_port' "$v"
+        fi
+        ;;
+      argo)
+        conf_set '.argo.mode' "$v"
+        ;;
+      agn)
+        conf_set '.argo.domain' "$v"
+        ;;
+      agk)
+        conf_set '.argo.token' "$v"
         ;;
     esac
   done

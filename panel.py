@@ -640,6 +640,15 @@ button.danger{background:#da3633;border-color:#f85149;color:#fff}
 button.danger:hover:not(:disabled){background:#b62324;border-color:#ff7b72}
 button.mini{padding:2px 9px;font-size:12px;border-radius:6px}
 .proto-actions-bar{margin-top:14px;padding:12px 14px;background:rgba(255,255,255,0.02);border:1px solid var(--bd);border-radius:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+.pill{display:inline-block;font-size:11px;padding:1px 7px;border:1px solid #30363d;border-radius:999px;color:var(--dim);margin-left:8px;background:rgba(255,255,255,0.04);font-family:ui-monospace,Consolas,monospace;font-weight:normal}
+.cfg-card{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:16px}
+.cfg-card h2{font-size:16px;margin:0 0 14px;color:var(--fg);display:flex;align-items:center;gap:8px}
+.cfg-row{display:grid;grid-template-columns:220px 1fr;gap:14px;align-items:center;margin:10px 0}
+@media(max-width:680px){.cfg-row{grid-template-columns:1fr;gap:6px}}
+.cfg-row label{display:flex;align-items:center;font-size:13px;font-weight:500;color:var(--fg)}
+.cfg-row input[type=text],.cfg-row input[type=password],.cfg-row select{width:100%;padding:9px 12px;border:1px solid var(--bd);border-radius:8px;background:#0d1117;color:var(--fg);font:inherit;outline:none}
+.cfg-row input[type=text]:focus,.cfg-row input[type=password]:focus,.cfg-row select:focus{border-color:var(--acc)}
+.cfg-row input:disabled,.cfg-row select:disabled{opacity:.45;cursor:not-allowed}
 .form{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
 .field{display:flex;flex-direction:column;gap:5px}
 .field>label{font-size:12px;color:var(--dim)}
@@ -792,52 +801,92 @@ transition:opacity .2s;z-index:9;max-width:90vw}
     </div>
   </section>
 
-  <section>
-    <h2>全局配置</h2>
-    <div class="form">
-      <div class="field">
-        <label for="f-domain">域名（可含端口，如 a.example.com:8443）</label>
-        <input type="text" id="f-domain" placeholder="a.example.com" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="f-port">服务端口（nginx 类协议，默认 443）</label>
-        <input type="text" id="f-port" placeholder="443" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="f-uuid">UUID（所有协议共用）</label>
-        <div class="row">
-          <input type="text" id="f-uuid" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
-          <button class="mini" id="btn-genuuid">生成</button>
-        </div>
-      </div>
-      <div class="field">
-        <label for="f-subtoken">订阅路径密码（sub token）</label>
-        <input type="text" id="f-subtoken" placeholder="1a2b3c4d5e6f7a8b" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="f-upip">CDN 优选 IP / 落地域名（xhttp-tls-UpIP 用）</label>
-        <input type="text" id="f-upip" placeholder="1.2.3.4 或 up.example.com" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="f-prefix">节点名称前缀（写进分享链接的 # 片段）</label>
-        <input type="text" id="f-prefix" placeholder="朔月" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="f-rsni">Reality 伪装域名（SNI，默认 www.microsoft.com）</label>
-        <input type="text" id="f-rsni" placeholder="www.microsoft.com" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="f-rdest">Reality 回落目标（host:port，默认 www.microsoft.com:443）</label>
-        <input type="text" id="f-rdest" placeholder="www.microsoft.com:443" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="f-rport">Reality 端口（默认 8443）</label>
-        <input type="text" id="f-rport" placeholder="8443" autocomplete="off">
+  <section class="cfg-card">
+    <h2>相关全局配置调整：</h2>
+    <div class="cfg-row">
+      <label for="f-uuid">UUID 密码 <span class="pill">uuid</span></label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="text" id="f-uuid" placeholder="留空则随机生成uuid密码" autocomplete="off">
+        <button class="primary" id="btn-genuuid" type="button" style="white-space:nowrap;padding:9px 16px;border-radius:8px;font-weight:600">生成 UUID</button>
       </div>
     </div>
-    <div class="toolbar" style="margin-top:12px">
-      <button class="primary" id="btn-cfg">保存全局配置</button>
-      <span class="dim">只提交填写了内容的字段；会重建配置并重启内核</span>
+    <div class="cfg-row">
+      <label for="f-reym">Reality 域名 <span class="pill">reym</span></label>
+      <input type="text" id="f-reym" placeholder="选择Reality相关协议后可用，留空默认apple.com" autocomplete="off">
+    </div>
+    <div class="cfg-row">
+      <label for="f-cfip">CDN优选IP域名 <span class="pill">cfip</span></label>
+      <input type="text" id="f-cfip" placeholder="支持2个优选IP域名(空格间隔)，留空默认优选域名" autocomplete="off">
+    </div>
+    <div class="cfg-row">
+      <label for="f-alns">启用域名IP证书TLS <span class="pill">alns</span></label>
+      <select id="f-alns">
+        <option value="off">默认 关闭 (HY2/TUIC/Anytls/Xhttp-tls为自签证TLS)</option>
+        <option value="on">开启 (申请/启用域名IP证书TLS)</option>
+      </select>
+    </div>
+    <div class="cfg-row">
+      <label for="f-hyjpt">Hysteria2端口跳跃 <span class="pill">hyjpt</span></label>
+      <input type="text" id="f-hyjpt" placeholder="支持多个范围端口与单端口混用(空格间隔)，例: 123:456 789" autocomplete="off">
+    </div>
+    <div class="cfg-row">
+      <label for="f-cdnym">CF解析IP的域名 <span class="pill">cdnym</span></label>
+      <input type="text" id="f-cdnym" placeholder="Vmess-ws、Vless-xhttp/ws-enc启用80、回源CDN时可用" autocomplete="off">
+    </div>
+    <div class="cfg-row">
+      <label for="f-warp">套WARP-IP出站 <span class="pill">warp</span></label>
+      <select id="f-warp">
+        <option value="direct">默认 服务器本地IP出站</option>
+        <option value="warp_v4">WARP IPv4出站</option>
+        <option value="warp_v6">WARP IPv6出站</option>
+        <option value="warp_dual">WARP 双栈出站</option>
+      </select>
+    </div>
+    <div class="cfg-row">
+      <label for="f-ippz">IPv4/IPv6 配置导出 <span class="pill">ippz</span></label>
+      <select id="f-ippz">
+        <option value="auto">默认 自动</option>
+        <option value="v4">导出 IPv4</option>
+        <option value="v6">导出 IPv6</option>
+      </select>
+    </div>
+    <div class="cfg-row">
+      <label for="f-oap">当前系统开放所有端口 <span class="pill">oap</span></label>
+      <select id="f-oap">
+        <option value="off">默认 关闭</option>
+        <option value="on">开启 (开放系统所有高位端口)</option>
+      </select>
+    </div>
+    <div class="cfg-row">
+      <label for="f-name">导出节点名称前缀 <span class="pill">name</span></label>
+      <input type="text" id="f-name" placeholder="留空则默认协议名前缀" autocomplete="off">
+    </div>
+
+    <details style="margin-top:14px;border:1px dashed var(--bd);border-radius:8px;padding:10px 14px">
+      <summary style="cursor:pointer;font-weight:600;color:var(--dim);font-size:13px">⚙️ 高级基础参数设置（域名、服务端口、Reality 回落目标与端口）</summary>
+      <div style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px">
+        <div class="field">
+          <label for="f-domain">域名（可含端口，如 a.example.com:8443）</label>
+          <input type="text" id="f-domain" placeholder="a.example.com" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="f-port">服务端口（nginx 类协议，默认 443）</label>
+          <input type="text" id="f-port" placeholder="443" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="f-rdest">Reality 回落目标（默认 www.microsoft.com:443）</label>
+          <input type="text" id="f-rdest" placeholder="www.microsoft.com:443" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="f-rport">Reality 端口（默认 8443）</label>
+          <input type="text" id="f-rport" placeholder="8443" autocomplete="off">
+        </div>
+      </div>
+    </details>
+
+    <div class="toolbar" style="margin-top:14px;display:flex;align-items:center;gap:12px">
+      <button class="primary" id="btn-cfg" style="padding:9px 22px;font-size:14px;font-weight:600">💾 保存全局配置</button>
+      <span class="dim" style="font-size:12px">只提交填写或修改的配置项；保存后重载生效</span>
     </div>
   </section>
 
@@ -902,20 +951,49 @@ transition:opacity .2s;z-index:9;max-width:90vw}
     </details>
   </section>
 
-  <section>
-    <h2>订阅服务开关</h2>
-    <div class="form">
-      <div class="field">
-        <label for="f-subon">订阅服务开关（/sub/&lt;token&gt; 可访问） <span id="sw-sub" class="tag">未知</span></label>
-        <select id="f-subon">
-          <option value="">保持不变</option>
-          <option value="on">启用</option>
-          <option value="off">关闭</option>
-        </select>
-      </div>
+  <section class="cfg-card">
+    <h2>Clash/Mihomo、Singbox、聚合单节点的订阅链接设置：</h2>
+    <div class="cfg-row">
+      <label for="f-sub">启用订阅链接 <span class="pill">sub</span></label>
+      <select id="f-sub">
+        <option value="off">默认 关闭 (仅显示单节点分享链接)</option>
+        <option value="on">开启 (启用多客户端订阅服务)</option>
+      </select>
     </div>
-    <div class="toolbar" style="margin-top:12px">
-      <button class="primary" id="btn-sub-switch">应用订阅开关</button>
+    <div class="cfg-row">
+      <label for="f-subid">订阅链接密码 <span class="pill">subid</span></label>
+      <input type="text" id="f-subid" placeholder="留空默认uuid路径密码" autocomplete="off">
+    </div>
+    <div class="cfg-row">
+      <label for="f-subpt">订阅链接端口 <span class="pill">subpt</span></label>
+      <input type="text" id="f-subpt" placeholder="留空则随机端口" autocomplete="off">
+    </div>
+    <div class="toolbar" style="margin-top:14px;display:flex;align-items:center;gap:12px">
+      <button class="primary" id="btn-sub-save" style="padding:8px 20px;font-size:13px;font-weight:600">💾 保存订阅设置</button>
+      <span class="dim" style="font-size:12px">开启后可通过 /sub/ 路径或独立端口访问订阅</span>
+    </div>
+  </section>
+
+  <section class="cfg-card">
+    <h2>Argo临时/固定隧道CDN：</h2>
+    <div class="cfg-row">
+      <label for="f-argo">启用Argo隧道开关 <span class="pill">argo</span></label>
+      <select id="f-argo">
+        <option value="off">默认 关闭</option>
+        <option value="on">开启 (支持临时/固定Argo隧道)</option>
+      </select>
+    </div>
+    <div class="cfg-row">
+      <label for="f-agn">固定隧道CF域名 <span class="pill">agn</span></label>
+      <input type="text" id="f-agn" placeholder="Zero Trust已设置有子域名称的CF域名，留空则临时隧道" autocomplete="off">
+    </div>
+    <div class="cfg-row">
+      <label for="f-agk">固定隧道Token <span class="pill">agk</span></label>
+      <input type="password" id="f-agk" placeholder="Zero Trust已提取ey开头的秘钥，留空则临时隧道" autocomplete="off">
+    </div>
+    <div class="toolbar" style="margin-top:14px;display:flex;align-items:center;gap:12px">
+      <button class="primary" id="btn-argo-save" style="padding:8px 20px;font-size:13px;font-weight:600">💾 保存Argo隧道设置</button>
+      <span class="dim" style="font-size:12px">填写Token与域名绑定固定隧道；留空自动开启临时隧道</span>
     </div>
   </section>
 
@@ -1211,15 +1289,34 @@ function applyStatus(d) {
     setChecks(d.protos);
     updateInstalledStatus(d.protos);
   }
-  if (d.domain) { $("#f-domain").value = d.domain; }
-  if (d.uuid) { $("#f-uuid").value = d.uuid; }
-  if (d.subtoken) { $("#f-subtoken").value = d.subtoken; }
+  if (d.domain && $("#f-domain")) { $("#f-domain").value = d.domain; }
+  if (d.uuid && $("#f-uuid")) { $("#f-uuid").value = d.uuid; }
   var cfg = d.cfg || {};
-  if (cfg.port) { $("#f-port").value = String(cfg.port); }
-  if (cfg.upip) { $("#f-upip").value = cfg.upip; }
-  if (cfg.prefix) { $("#f-prefix").value = cfg.prefix; }
-  if (cfg.reality_sni) { $("#f-rsni").value = cfg.reality_sni; }
-  if (cfg.reality_dest) { $("#f-rdest").value = cfg.reality_dest; }
+  if (cfg.uuid && $("#f-uuid")) { $("#f-uuid").value = cfg.uuid; }
+  if ((cfg.reym || cfg.reality_sni) && $("#f-reym")) { $("#f-reym").value = cfg.reym || cfg.reality_sni; }
+  if ((cfg.cfip || cfg.upip) && $("#f-cfip")) { $("#f-cfip").value = cfg.cfip || cfg.upip; }
+  if (cfg.alns && $("#f-alns")) { $("#f-alns").value = (cfg.alns === "1" || cfg.alns === "on" || cfg.alns === "y") ? "on" : "off"; }
+  if (cfg.hyjpt && $("#f-hyjpt")) { $("#f-hyjpt").value = cfg.hyjpt; }
+  if (cfg.cdnym && $("#f-cdnym")) { $("#f-cdnym").value = cfg.cdnym; }
+  if (cfg.warp && $("#f-warp")) { $("#f-warp").value = cfg.warp; }
+  if (cfg.ippz && $("#f-ippz")) { $("#f-ippz").value = cfg.ippz; }
+  if (cfg.oap && $("#f-oap")) { $("#f-oap").value = (cfg.oap === "1" || cfg.oap === "on" || cfg.oap === "y") ? "on" : "off"; }
+  if ((cfg.name || cfg.prefix) && $("#f-name")) { $("#f-name").value = cfg.name || cfg.prefix; }
+  if (cfg.port && $("#f-port")) { $("#f-port").value = String(cfg.port); }
+  if (cfg.reality_dest && $("#f-rdest")) { $("#f-rdest").value = cfg.reality_dest; }
+  if (cfg.reality_port && $("#f-rport")) { $("#f-rport").value = String(cfg.reality_port); }
+
+  // 订阅卡片回显
+  var isSubOn = (cfg.sub === "y" || cfg.sub === "on" || cfg.sub === "1" || d.sub_on === true);
+  if ($("#f-sub")) { $("#f-sub").value = isSubOn ? "on" : "off"; }
+  if ($("#f-subid")) { $("#f-subid").value = cfg.subid || cfg.subtoken || d.subtoken || ""; }
+  if ($("#f-subpt")) { $("#f-subpt").value = cfg.subpt || ""; }
+
+  // Argo 卡片回显
+  var isArgoOn = (cfg.argo === "on" || cfg.argo === "y" || cfg.argo === "1");
+  if ($("#f-argo")) { $("#f-argo").value = isArgoOn ? "on" : "off"; }
+  if ($("#f-agn")) { $("#f-agn").value = cfg.agn || ""; }
+  if ($("#f-agk")) { $("#f-agk").value = cfg.agk || ""; }
   var warpObj = (typeof d.warp === "object" && d.warp !== null) ? d.warp : { enabled: !(!d.warp), mode: (d.warp ? "warp_google" : "direct"), v4: "" };
   var isWarpOn = !(!warpObj.enabled);
   var warpMode = warpObj.mode || (isWarpOn ? "warp_google" : "direct");
@@ -1891,20 +1988,71 @@ if (btnSavePorts) {
 
 $("#btn-cfg").addEventListener("click", function () {
   var payload = {};
-  var map = {
-    domain: "#f-domain", uuid: "#f-uuid", port: "#f-port",
-    upip: "#f-upip", subtoken: "#f-subtoken", prefix: "#f-prefix",
-    reality_sni: "#f-rsni", reality_dest: "#f-rdest", reality_port: "#f-rport"
+  var fields = {
+    uuid: "#f-uuid",
+    reym: "#f-reym",
+    cfip: "#f-cfip",
+    alns: "#f-alns",
+    hyjpt: "#f-hyjpt",
+    cdnym: "#f-cdnym",
+    warp: "#f-warp",
+    ippz: "#f-ippz",
+    oap: "#f-oap",
+    name: "#f-name",
+    domain: "#f-domain",
+    port: "#f-port",
+    reality_dest: "#f-rdest",
+    reality_port: "#f-rport"
   };
-  Object.keys(map).forEach(function (key) {
-    var v = $(map[key]).value.trim();
+  Object.keys(fields).forEach(function (key) {
+    var el = $(fields[key]);
+    if (!el) { return; }
+    var v = el.value.trim();
     if (v) { payload[key] = v; }
   });
-  if (!Object.keys(payload).length) { toast("没有可提交的字段"); return; }
+  if (!Object.keys(payload).length) { toast("没有可提交的配置字段"); return; }
   busy(this, api("/api/cfg", "POST", payload), "保存全局配置").then(function (r) {
-    if (r && r.ok && r.data) { applyStatus(r.data.data || r.data); }
+    if (r && r.ok && r.data) {
+      applyStatus(r.data.data || r.data);
+      toast("✅ 全局配置已更新并生效！");
+      loadStatus();
+    }
   });
 });
+
+var btnSubSave = $("#btn-sub-save");
+if (btnSubSave) {
+  btnSubSave.addEventListener("click", function () {
+    var payload = {
+      sub: $("#f-sub") ? $("#f-sub").value : "off",
+      subid: ($("#f-subid") ? $("#f-subid").value : "").trim(),
+      subpt: ($("#f-subpt") ? $("#f-subpt").value : "").trim()
+    };
+    busy(this, api("/api/cfg", "POST", payload), "保存订阅设置").then(function (r) {
+      if (r && r.ok) {
+        toast("✅ 订阅设置已更新生效！");
+        loadStatus();
+      }
+    });
+  });
+}
+
+var btnArgoSave = $("#btn-argo-save");
+if (btnArgoSave) {
+  btnArgoSave.addEventListener("click", function () {
+    var payload = {
+      argo: $("#f-argo") ? $("#f-argo").value : "off",
+      agn: ($("#f-agn") ? $("#f-agn").value : "").trim(),
+      agk: ($("#f-agk") ? $("#f-agk").value : "").trim()
+    };
+    busy(this, api("/api/cfg", "POST", payload), "保存Argo隧道设置").then(function (r) {
+      if (r && r.ok) {
+        toast("✅ Argo 隧道设置已更新生效！");
+        loadStatus();
+      }
+    });
+  });
+}
 $("#btn-genuuid").addEventListener("click", function () {
   var buf = new Uint8Array(16);
   if (window.crypto && crypto.getRandomValues) { crypto.getRandomValues(buf); }
@@ -2344,9 +2492,9 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_cfg(self, body):
         """POST /api/cfg —— 局部更新配置（只提交给出的字段）。"""
-        # 与 server cli_cfg 支持的键保持一致（多出的键会被 server 忽略）
-        allowed = ("domain", "port", "uuid", "subtoken", "prefix",
-                   "reality_sni", "reality_dest", "reality_port", "upip", "cdn")
+        allowed = ("domain", "port", "uuid", "subtoken", "subid", "prefix", "name",
+                   "reality_sni", "reym", "reality_dest", "reality_port", "upip", "cfip", "cdn",
+                   "alns", "hyjpt", "cdnym", "warp", "ippz", "oap", "sub", "subpt", "argo", "agn", "agk")
         payload = {}
         for key in allowed:
             if key not in body:
@@ -2355,34 +2503,53 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             if value is None:
                 continue
             value = str(value).strip()
+            std_key = key
+            if key == "reym":
+                std_key = "reality_sni"
+            elif key == "cfip":
+                std_key = "upip"
+            elif key == "name":
+                std_key = "prefix"
+            elif key == "subid":
+                std_key = "subtoken"
+
             if value == "":
+                payload[std_key] = ""
                 continue
-            if key in ("domain", "reality_dest"):
+
+            if std_key in ("domain", "reality_dest"):
                 if not HOSTPORT_RE.match(value):
                     return self._send_error_json(400, "%s 格式非法（应为 host 或 host:port）" % key)
-            elif key == "reality_sni":
+            elif std_key == "reality_sni":
                 if not HOST_RE.match(value):
                     return self._send_error_json(400, "reality_sni 格式非法")
-            elif key == "uuid":
+            elif std_key == "uuid":
                 if not UUID_RE.match(value):
                     return self._send_error_json(400, "uuid 格式非法")
-            elif key == "subtoken":
+            elif std_key == "subtoken":
                 if not TOKEN_RE.match(value):
                     return self._send_error_json(400, "subtoken 含非法字符")
-            elif key == "prefix":
+            elif std_key == "prefix":
                 if not PREFIX_RE.match(value):
                     return self._send_error_json(400, "prefix 含非法字符或过长")
-            elif key in ("port", "reality_port"):
+            elif std_key in ("port", "reality_port", "subpt"):
                 if not re.fullmatch(r"[0-9]{1,5}", value) or not (1 <= int(value) <= 65535):
                     return self._send_error_json(400, "%s 必须是 1-65535" % key)
-            elif key == "upip":
-                if not UPIP_RE.match(value):
-                    return self._send_error_json(400, "upip 只能包含字母、数字、点、冒号、连字符")
-            payload[key] = value
+            elif std_key == "upip":
+                if not re.match(r"^[A-Za-z0-9.:\ -]+$", value):
+                    return self._send_error_json(400, "upip 格式非法")
+            elif std_key == "hyjpt":
+                if not re.match(r"^[0-9: ]*$", value):
+                    return self._send_error_json(400, "hyjpt 格式非法，仅支持数字、冒号与空格")
+            elif std_key == "cdnym":
+                if not HOST_RE.match(value):
+                    return self._send_error_json(400, "cdnym 格式非法")
+
+            payload[std_key] = value
+
         if not payload:
             return self._send_error_json(400, "没有可更新的字段")
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        # 走 stdin 传 JSON（server 端以 "-" 识别），避免命令行参数被环境改写
         return self._finish_cli(run_cli(["cfg", "-"], stdin_data=encoded))
 
     def _handle_simple(self, args):
