@@ -50,7 +50,18 @@ pick_bindir() {
   return 1
 }
 
-is_openwrt() { [[ -f /etc/openwrt_release ]] || command -v opkg >/dev/null 2>&1; }
+# 发行版判定。可用 DEGWD_FORCE_OS=debian|openwrt 强制指定分支:
+#   - 少数系统两类特征同时存在(Kwrt 上跑 Debian chroot、OpenWrt 里装了 apt 的
+#     旁路环境), 自动判定会走错分支, 此时手动指定即可;
+#   - 端到端测试也依赖它 —— 否则测试机自身的特征会决定走哪条分支, 在 OpenWrt
+#     上就永远测不到 Debian 分支。
+is_openwrt() {
+  case "${DEGWD_FORCE_OS:-}" in
+    openwrt)      return 0 ;;
+    debian|ubuntu) return 1 ;;
+  esac
+  [[ -f /etc/openwrt_release ]] || command -v opkg >/dev/null 2>&1
+}
 
 # OpenWrt 架构 → 统一标签(供 xray / sing-box 下载使用)
 owrt_arch() {

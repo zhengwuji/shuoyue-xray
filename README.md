@@ -125,6 +125,12 @@ install.sh 会自动识别 OpenWrt,下载 OpenWrt 原生客户端(`client-openwr
 | 其他 apt 系(Mint 等) | ❓ 未测 | 理论同 Ubuntu 流程 |
 | RHEL / Arch / Alpine | ❌ 不支持 | 脚本基于 apt/dpkg |
 
+**发行版判定可强制指定:** 极少数系统会同时具备两类特征(例如 Kwrt/OpenWrt 里跑 Debian chroot,或 OpenWrt 旁路机上又装了 apt),自动判定可能走错分支。此时用 `DEGWD_FORCE_OS=debian` 或 `DEGWD_FORCE_OS=openwrt` 显式指定即可:
+
+```bash
+DEGWD_FORCE_OS=debian bash install.sh
+```
+
 **版本策略:**
 
 - **安装即最新**:Xray、sing-box、dnsproxy(DoH)、AdGuard Home、wgcf、acme.sh 均从各自官方 GitHub release 拉 latest(带 sha256 校验);nginx 优先 nginx.org 官方源(支持 HTTP3),不可用时回退发行版包;系统包在安装时执行 `apt full-upgrade`
