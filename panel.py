@@ -2487,7 +2487,7 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             if item not in ids:
                 ids.append(item)
         if not ids:
-            return self._send_error_json(400, "至少需要勾选一个协议")
+            return self._finish_cli(run_cli(["protos", "none"]))
         return self._finish_cli(run_cli(["protos", " ".join(ids)]))
 
     def _handle_cfg(self, body):

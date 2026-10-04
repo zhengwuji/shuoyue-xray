@@ -131,10 +131,20 @@ proto_field() {   # $1=id $2=字段序号(1..6)
 }
 proto_name()         { proto_field "$1" 2; }
 proto_kernel()       { proto_field "$1" 3; }
-proto_port()         { local def; def=$(proto_field "$1" 4); effective_proto_port "$1" "$def"; }
-proto_needs_domain() { proto_field "$1" 5; }
+proto_port()         {
+  case "$1" in
+    wsenc_argo|vmess_argo|vless_argo) echo 443; return ;;
+  esac
+  local def; def=$(proto_field "$1" 4); effective_proto_port "$1" "$def";
+}
+proto_needs_domain() {
+  case "$1" in
+    wsenc_argo|vmess_argo|vless_argo) echo 0; return ;;
+  esac
+  proto_field "$1" 5;
+}
 proto_desc()         { proto_field "$1" 6; }
-proto_valid()        { [[ -n $(proto_name "$1") ]]; }
+proto_valid()        { [[ -n $(proto_name "$1") ]] || [[ "$1" =~ ^(wsenc_argo|vmess_argo|vless_argo)$ ]]; }
 
 # ------------------------------------------------- Xray 密钥解析 (兼容多版本) ---
 # Xray 二进制定位: 官方安装器落在 /usr/local/bin/xray, 但容器/自定义安装可能在
@@ -2280,14 +2290,18 @@ singbox_gen_config() {
 # 节点名统一加 conf .prefix 前缀(面板可改), 便于客户端里区分
 emit_link() {
   local id="$1" link="$2" pfx tag; pfx=$(conf_get '.prefix'); tag=$(proto_name "$id")
+  if [[ -z $tag ]]; then
+    case "$id" in
+      wsenc_argo) tag="Vless-ws-enc (Argo CDN)" ;;
+      vmess_argo) tag="Vmess-ws (Argo CDN)" ;;
+      vless_argo) tag="Vless-ws (Argo CDN)" ;;
+      *) tag="$id" ;;
+    esac
+  fi
   if [[ -n $pfx ]]; then
     if [[ $link == *'#'* ]]; then
       link="${link%%#*}#${pfx}${link#*#}"
     else
-      # 没有 '#' 片段时直接追加。原写法 `${link%%#*}#${pfx}${link#*#}` 在无 '#'
-      # 时 %%#* 与 #*# 都返回整串 → 整条链接被复制一遍:
-      #   vmess://eyJ...  →  vmess://eyJ...#朔月vmess://eyJ...
-      # vmess 的节点名在 base64 内的 ps 字段, 链接本身不带 '#', 必然命中。
       link="${link}#${pfx}${tag}"
     fi
   fi
@@ -2405,6 +2419,33 @@ gen_links() {
     ap=$(proto_port anyreality); pbk3=$(conf_get '.reality.public')
     sni3=$(conf_get '.reality.sni'); sid3=$(conf_get '.reality.shortid')
     emit_link anyreality "vless://$uuid0@$host:$ap?security=reality&encryption=none&pbk=$pbk3&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=$sni3&sid=$sid3#any-reality"
+  fi
+  # ---- Argo 临时/固定隧道 CDN 节点 -----------------------------------------
+  local argo_on; argo_on=$(conf_get '.argo.mode // "off"')
+  if [[ "$argo_on" == "on" || "$argo_on" == "1" || "$argo_on" == "y" ]]; then
+    local argo_host; argo_host=$(argo_domain)
+    if [[ -n $argo_host ]]; then
+      local argo_conn="$argo_host"
+      if [[ -n $upip && "$upip" != "$host" ]]; then
+        local first_upip; first_upip=$(echo "$upip" | awk '{print$1}')
+        [[ -n $first_upip ]] && argo_conn="$first_upip"
+      fi
+
+      # 1. Vless-ws-enc (Argo CDN)
+      local wenc; wenc=$(vless_enc_pair 2>/dev/null); wenc=${wenc#* }
+      emit_link wsenc_argo "vless://$uuid0@$argo_conn:443?encryption=$(urlenc "$wenc")&security=tls&sni=$argo_host&fp=chrome&type=ws&host=$argo_host&path=/ve-$u6#Vless-ws-enc-Argo"
+
+      # 2. Vmess-ws (Argo CDN)
+      local vj_argo
+      vj_argo=$(jq -cn --arg add "$argo_conn" --arg port "443" --arg id "$uuid0" \
+        --arg path "$(conf_get '.path')" --arg host "$argo_host" \
+        '{v:"2",ps:"Vmess-ws-Argo",add:$add,port:$port,id:$id,aid:"0",scy:"auto",
+          net:"ws",type:"none",host:$host,path:$path,tls:"tls",sni:$host}')
+      emit_link vmess_argo "vmess://$(printf %s "$vj_argo" | base64 -w0)"
+
+      # 3. Vless-ws (Argo CDN)
+      emit_link vless_argo "vless://$uuid0@$argo_conn:443?encryption=none&security=tls&sni=$argo_host&fp=chrome&type=ws&host=$argo_host&path=/v-$u6#Vless-ws-Argo"
+    fi
   fi
   return 0
 }
@@ -3136,6 +3177,84 @@ cloudflared_quick_tunnel() {
   fi
 }
 
+argo_start() {
+  local mode agn agk
+  mode=$(conf_get '.argo.mode // "off"')
+  [[ "$mode" != "on" && "$mode" != "1" && "$mode" != "y" ]] && return 0
+  agn=$(conf_get '.argo.domain // ""')
+  agk=$(conf_get '.argo.token // ""')
+
+  if [[ ! -x /usr/local/bin/cloudflared ]]; then
+    install_cloudflared >&2 || return 1
+  fi
+
+  local target_port="80"
+  if proto_on wsenc; then
+    target_port=$(proto_port wsenc)
+  elif proto_on vmess; then
+    target_port=$(proto_port vmess)
+  elif proto_on vless; then
+    target_port=$(proto_port vless)
+  elif [[ -f /etc/nginx/conf.d/default.conf ]]; then
+    target_port="80"
+  fi
+
+  if [[ -n $agk ]]; then
+    cat <<EOF >/etc/systemd/system/cloudflared.service
+[Unit]
+Description=Cloudflare Tunnel (cloudflared)
+After=network.target
+
+[Service]
+TimeoutStartSec=0
+Type=notify
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run --token $agk
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable cloudflared >/dev/null 2>&1
+    systemctl restart cloudflared >/dev/null 2>&1
+  else
+    pkill -f 'cloudflared.*tunnel.*--url' >/dev/null 2>&1 || true
+    nohup /usr/local/bin/cloudflared tunnel --url "http://127.0.0.1:$target_port" > /tmp/cf-argo-quick.log 2>&1 &
+    local qdomain=""
+    for _ in {1..8}; do
+      sleep 1
+      qdomain=$(grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf-argo-quick.log 2>/dev/null | head -n1 || true)
+      [[ -n $qdomain ]] && break
+    done
+    if [[ -n $qdomain ]]; then
+      conf_set '.argo.quick_domain' "$qdomain"
+    fi
+  fi
+}
+
+argo_stop() {
+  systemctl stop cloudflared >/dev/null 2>&1 || true
+  pkill -f 'cloudflared.*tunnel.*--url' >/dev/null 2>&1 || true
+  conf_set '.argo.mode' "off"
+}
+
+argo_domain() {
+  local agn; agn=$(conf_get '.argo.domain // ""')
+  if [[ -n $agn ]]; then
+    echo "$agn"
+    return 0
+  fi
+  local qd; qd=$(conf_get '.argo.quick_domain // ""')
+  if [[ -n $qd ]]; then
+    echo "$qd"
+    return 0
+  fi
+  if [[ -f /tmp/cf-argo-quick.log ]]; then
+    grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf-argo-quick.log | head -n1 || true
+  fi
+}
+
 cloudflared_menu() {
   while :; do
     local st_run st_inst
@@ -3720,6 +3839,9 @@ apply_protos() {
     systemctl restart nginx >/dev/null 2>&1
   fi
   svc_restart xray
+  if [[ $(conf_get '.argo.mode // "off"') =~ ^(on|1|y)$ ]]; then
+    argo_start >&2 || true
+  fi
   return 0
 }
 
@@ -4634,7 +4756,14 @@ cli_reset() {
 
 cli_protos() {
   conf_init
-  local want="$1" id out='{}'
+  local want="${1:-}" id out='{}'
+  if [[ "$want" == "none" || "$want" == "clear" || -z "$want" ]]; then
+    conf_raw '.protos' '{}'
+    ( apply_protos ) 1>&2 || true
+    gen_sub_all
+    cli_json '{"ok":true,"message":"已卸载并停用所有协议"}'
+    return 0
+  fi
   for id in $want; do
     proto_valid "$id" || { cli_json "{\"ok\":false,\"error\":\"unknown proto: $id\"}"; return 1; }
     out=$(printf '%s' "$out" | jq -c --arg k "$id" '. + {($k):true}')
@@ -4773,12 +4902,20 @@ cli_cfg() {
         ;;
       argo)
         conf_set '.argo.mode' "$v"
+        if [[ $v == "on" || $v == "1" || $v == "y" ]]; then
+          argo_start >&2 || true
+        else
+          argo_stop >&2 || true
+        fi
         ;;
       agn)
         conf_set '.argo.domain' "$v"
         ;;
       agk)
         conf_set '.argo.token' "$v"
+        if [[ $(conf_get '.argo.mode // "off"') =~ ^(on|1|y)$ ]]; then
+          argo_start >&2 || true
+        fi
         ;;
     esac
   done
