@@ -9,7 +9,12 @@
 RED='\E[1;31m'; GREEN='\E[1;32m'; YELLOW='\E[1;33m'; CYAN='\E[1;36m'; WHITE='\E[1;37m'; cRES='\E[0m'
 REPO="zhengwuji/shuoyue-xray"
 BRANCH="main"
-RAW="https://raw.githubusercontent.com/$REPO/$BRANCH"
+# 下载基址。可用 DEGWD_RAW 覆盖(自建镜像 / 内网分发 / 离线测试):
+#   DEGWD_RAW=http://192.168.1.10/shuoyue bash install.sh
+# 覆盖后不再走 ghproxy / jsdelivr 镜像(那些是给 GitHub raw 用的加速通道)。
+RAW="${DEGWD_RAW:-https://raw.githubusercontent.com/$REPO/$BRANCH}"
+RAW_OVERRIDDEN=0
+[[ -n ${DEGWD_RAW:-} ]] && RAW_OVERRIDDEN=1
 # BASE / 命令落点都可用环境变量覆盖: 与 server / client / client-openwrt / panel.py
 # 的 DEGWD_BASE 保持一致(便于把整套装到自定义路径, 也便于端到端测试时隔离)。
 BASE="${DEGWD_BASE:-/opt/de_GWD}"
@@ -90,14 +95,17 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
 fi
 
 # 多源下载: 官方 raw → ghproxy → jsdelivr (任一成功即可)
+# DEGWD_RAW 被显式指定时只走该基址 —— 否则会绕过自建镜像去打 GitHub。
 dl() {
   local url="$1" out="$2"
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --max-time 60 -o "$out" "$url" 2>/dev/null && [[ -s $out ]] && return 0
+    [[ $RAW_OVERRIDDEN -eq 1 ]] && return 1
     curl -fsSL --max-time 60 -o "$out" "https://ghproxy.net/$url" 2>/dev/null && [[ -s $out ]] && return 0
     curl -fsSL --max-time 60 -o "$out" "https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/${url##*/}" 2>/dev/null && [[ -s $out ]] && return 0
   else
     wget -qO "$out" "$url" 2>/dev/null && [[ -s $out ]] && return 0
+    [[ $RAW_OVERRIDDEN -eq 1 ]] && return 1
     wget -qO "$out" "https://ghproxy.net/$url" 2>/dev/null && [[ -s $out ]] && return 0
     wget -qO "$out" "https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/${url##*/}" 2>/dev/null && [[ -s $out ]] && return 0
   fi

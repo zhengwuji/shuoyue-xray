@@ -131,6 +131,14 @@ install.sh 会自动识别 OpenWrt,下载 OpenWrt 原生客户端(`client-openwr
 DEGWD_FORCE_OS=debian bash install.sh
 ```
 
+**下载基址可自建镜像:** 默认从 GitHub raw 拉取脚本,并自动走 ghproxy / jsdelivr 加速。若你的网络访问 GitHub 不稳、或想在内网分发,可用 `DEGWD_RAW` 指向自建镜像(该目录需按仓库根目录布局放置 `install.sh` / `server` / `client` / `client-openwrt` / `panel.py` / `version` / `SHA256SUMS`):
+
+```bash
+DEGWD_RAW=http://192.168.1.10/shuoyue bash <(curl -fsSL http://192.168.1.10/shuoyue/install.sh)
+```
+
+指定 `DEGWD_RAW` 后只走该基址,不再回退 ghproxy / jsdelivr —— 避免"自建镜像挂了却静默装成上游版本"。sha256 强校验照常生效。
+
 **版本策略:**
 
 - **安装即最新**:Xray、sing-box、dnsproxy(DoH)、AdGuard Home、wgcf、acme.sh 均从各自官方 GitHub release 拉 latest(带 sha256 校验);nginx 优先 nginx.org 官方源(支持 HTTP3),不可用时回退发行版包;系统包在安装时执行 `apt full-upgrade`
