@@ -297,6 +297,19 @@ echo "          + DoH + 订阅 + WARP + CAKE 流量整形, 分享链接兼容 v2
 echo
 
 mkdir -p "$BASE"
+
+# 「安装前」状态取样: 必须在下面把 server/panel.py 下载进 $BASE **之前**做。
+# 否则 `-f "$BASE/server"` 因为刚下载过而恒为真 -> has_installed 永远 =1 ->
+# 全新机器也被当成"已安装环境", 菜单默认跳到 [4] 升级, 实际执行 updateGWD(),
+# 于是基线(limits/sysctl)、unbound、nftables+CAKE、流量整形全部被跳过,
+# 只装出一个 Web 面板。以 conf.json 为唯一判据, 它才是真正安装完成的标志。
+has_installed=0
+cur_ver=""
+if [[ -f "$BASE/conf.json" ]]; then
+  has_installed=1
+  [[ -f "$BASE/version" ]] && cur_ver=$(head -n1 "$BASE/version" 2>/dev/null)
+fi
+
 echo -n "下载主脚本... "
 dl_checked server "$BASE/server" 30
 chmod +x "$BASE/server"
@@ -311,13 +324,6 @@ echo -e "${GREEN}OK${cRES} ($(du -sk "$BASE/panel.py" | awk '{print$1}') KB)"
 pick_bindir || die "/usr/bin 不可写,无法创建命令"
 ln -sf "$BASE/server" "$BINDIR/shuoyue"
 ok "已安装命令: shuoyue (以后随时输入即可打开管理菜单)"
-
-has_installed=0
-cur_ver=""
-if [[ -f "$BASE/conf.json" || -f "$BASE/server" ]]; then
-  has_installed=1
-  [[ -f "$BASE/version" ]] && cur_ver=$(head -n1 "$BASE/version" 2>/dev/null)
-fi
 
 if [[ "${1:-}" == "--update" || "${1:-}" == "-u" ]]; then
   c=4

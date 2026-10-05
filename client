@@ -8,7 +8,7 @@
 #  基于原版 jacyl4/de_GWD (EPL-2.0) 的功能规格重写,全部组件改用官方上游。
 #  LAN 设备将网关与 DNS 指向本机即可生效。仅供学习与研究。
 # =============================================================================
-VERSION="v1.4.2"
+VERSION="v1.4.3"
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
 # 交互式脚本: 不启用 -e(需保留人工交互分支), 但未定义变量与管道错误必须暴露
@@ -1137,6 +1137,11 @@ Nice=-9
 [Install]
 WantedBy=multi-user.target
 EOF
+  # 开机自启。上游安装器只在「本次真的发生了版本升级」的分支里 enable xray
+  # (install-release.sh 963-973 行; "No new version" 时第 888 行直接 exit 0,
+  #  连单元都不重建)。客户端同样是旁路网关的核心, 必须无条件 enable ——
+  # 否则重启后 TPROXY 分流整体失效, 表现为「装了但没网」。
+  systemctl enable xray >/dev/null 2>&1 || true
   systemctl daemon-reload
 }
 

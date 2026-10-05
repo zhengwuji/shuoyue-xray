@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.4.2"
+VERSION="v1.4.3"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -1027,9 +1027,13 @@ table inet degwd_filter {
     }
     chain OUTPUT { type filter hook output priority 0; policy accept; }
     chain degwd_docker { }
-    chain degwd_docker_user { counter accept }
-    chain degwd_docker_isolation_1 { iifname "docker0" oifname != "docker0" counter jump degwd_docker_isolation_2; counter return }
-    chain degwd_docker_isolation_2 { oifname "docker0" counter drop; counter return }
+    # 注意: 单行链体的最后一条规则后**必须**有分号, 否则 nft 1.1.x
+    # (Debian 13 trixie / Ubuntu 24.04+) 报
+    #   Error: syntax error, unexpected '}', expecting newline or semicolon
+    # 整份 ruleset 加载失败 -> degwd-nftables 起不来(旧版 nft 容忍, 故长期未被发现)。
+    chain degwd_docker_user { counter accept; }
+    chain degwd_docker_isolation_1 { iifname "docker0" oifname != "docker0" counter jump degwd_docker_isolation_2; counter return; }
+    chain degwd_docker_isolation_2 { oifname "docker0" counter drop; counter return; }
 }
 
 table inet degwd_router {
@@ -1159,6 +1163,14 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
+  # 开机自启。上游安装器只在「本次真的发生了版本升级」的分支里 enable
+  # (install-release.sh 第 963-973 行: 若 XRAY_IS_INSTALLED_BEFORE_RUNNING_SCRIPT=1
+  #  且未加 --force/--reinstall, 走 start_xray 而**不 enable**; 第 888 行
+  #  "No new version" 更是直接 exit 0 连单元都不重建)。
+  # 我们每次都用 write_atomic 覆写自己的单元, 所以必须自己无条件 enable ——
+  # 否则 apt 升级 xray 后重启机器, xray 不会自启(真机实测 enabled=disabled)。
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable xray >/dev/null 2>&1 || true
   touch /var/log/xray-error.log 2>/dev/null
   if [[ $XTLSUSER != "root" ]]; then
     chown -R $XTLSUSER:$XTLSUSER "$XRAYDIR" 2>/dev/null
@@ -2858,6 +2870,11 @@ updateGWD() {
     fi
     panel_unit_conf
     systemctl daemon-reload
+    # 升级路径也必须 enable。面板的 enable 原先只写在 install_panel() 里, 而
+    # 一键脚本(`curl|bash`)在检测到已安装时默认走 `server --update`, 即本条
+    # updateGWD —— 从不调用 install_panel, 于是真机出现
+    # 「degwd-panel active 但 disabled」, 重启后面板不再自启。
+    systemctl enable degwd-panel >/dev/null 2>&1 || true
     svc_restart degwd-panel && ok "Web 控制面板服务已重新加载" || warn "Web 控制面板重启异常"
     local pport; pport=$(panel_port)
     if ufw_active; then

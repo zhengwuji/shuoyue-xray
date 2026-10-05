@@ -172,6 +172,45 @@ error message is: Verifying signature: Not live until 2026-10-05T08:42:53Z
 - `TERM environment variable not set.`:脚本里的裸 `clear` 在无 TTY 环境(TERM 为空)同样会往 stderr 喷字。已统一改为 `cls()` 辅助函数:仅在 `[[ -t 1 && -n $TERM ]]` 时清屏,管道/日志场景下不清屏(日志反而更好读)。
 - `Xray 版本变更(回滚参考): vX -> vX`:原条件只判"升级前版本非空",重装时版本并未变化却照样报警。已改为仅在前后版本**确实不同**时输出。
 
+**一键安装曾把全新机器当成"已安装"(已修):** `install.sh` 原先在**下载完 `server` 之后**才判断 `has_installed`(`if [[ -f "$BASE/conf.json" || -f "$BASE/server" ]]`)。由于 `server` 刚被自己下载进 `$BASE`,`-f "$BASE/server"` 恒为真 → `has_installed` 永远是 1 → 全新机器也走"已安装"分支,菜单默认值变成 `[4] 升级`,而 `curl|bash` 非交互环境下 `read` 直接 EOF,于是**每一次全新一键安装实际执行的都是 `server --update`(`updateGWD`)而不是 `--install`(`installGWD`)**。
+
+后果是基线系统环境与安全组件被整段跳过:`limits_conf` / `sysctl_conf` / `unbound_conf` / `nftables_conf`(自建防火墙 + CAKE 流量整形)/ `shaping_conf` 都不会执行,面板也只能靠 `panel.py` 首次运行时自补最小配置(`conf.json` 里只有 `panel` 一个键,`uuids`/`path`/`subtoken`/`port` 全缺)。
+
+现已把状态取样挪到下载之前,并以 `conf.json` 为**唯一判据**(它才是"安装真正完成"的标志):
+
+```bash
+has_installed=0
+if [[ -f "$BASE/conf.json" ]]; then
+  has_installed=1
+  [[ -f "$BASE/version" ]] && cur_ver=$(head -n1 "$BASE/version" 2>/dev/null)
+fi
+```
+
+这样全新机器默认 `[1] 服务端全新安装`,而只残留 `server` 而没 `conf.json` 的中断安装也会正确走完整安装(修复)而非"升级"。
+
+**服务开机自启(`systemctl enable`)曾大面积缺失(已修):** 上游 Xray 安装器只在"本次真的发生了版本升级"的分支里 `enable xray`(`install-release.sh` 963-973 行);若 `XRAY_IS_INSTALLED_BEFORE_RUNNING_SCRIPT=1` 且未加 `--force`,它只 `start_xray` 而**不 enable**;遇到 "No new version" 更是第 888 行直接 `exit 0`,连单元文件都不重建。本方案每次都用 `write_atomic` 覆写自己的单元,因此现在**无条件** `enable xray`(服务端与客户端都补上)—— 否则重启后服务端代理不自启、客户端旁路网关整体失效(表现为"装了但没网")。
+
+同类问题还有 `updateGWD()`:面板的 `enable` 原先只写在 `install_panel()` 里,而升级路径只 `svc_restart` 不 `enable`,真机因此出现「`degwd-panel` active 但 disabled」,重启后面板不再自启。现已在升级路径补上 `systemctl enable degwd-panel`。
+
+**nftables 规则在 nft ≥ 1.1 上加载失败(已修):** 自建防火墙里有三条单行写的链:
+
+```
+chain degwd_docker_user { counter accept }
+chain degwd_docker_isolation_1 { iifname "docker0" oifname != "docker0" counter jump degwd_docker_isolation_2; counter return }
+chain degwd_docker_isolation_2 { oifname "docker0" counter drop; counter return }
+```
+
+`nft` 1.1.x(Debian 13 trixie、Ubuntu 24.04+)对**单行链体的最后一条规则强制要求分号** —— 旧版(1.0.x)容忍这种写法,所以这个缺陷长期潜伏。在新版上会报:
+
+```
+Error: syntax error, unexpected '}', expecting newline or semicolon
+    chain degwd_docker_isolation_2 { oifname "docker0" counter drop; counter return }
+                                                                                  ^
+```
+
+一条链报错 → **整份 ruleset 拒绝加载** → `degwd-nftables.service` 变 `failed`,于是流表加速、Docker 隔离、MSS 夹紧、NAT 伪装等规则**一条都没生效**(但看起来"装好了",因为服务单元存在且 `enabled`)。现已给这三条链补上结尾分号。
+
+排查要点:别只看 `systemctl is-enabled`,要 `systemctl is-active` + `nft -c -f <ruleset>` 真校验。注意 `flowtable.eth` 是由单元里前一条 `ExecStart`(即 `flowtable_eth.sh`)动态生成的,单独 `nft -c -f default.nft` 会因 `include` 文件缺失而假失败。
 
 ## v2rayN 导入示例
 
