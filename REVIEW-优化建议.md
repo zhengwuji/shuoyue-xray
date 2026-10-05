@@ -11,7 +11,7 @@
 |---|------|------|----------|
 | 1 | [client:367](client#L367) | `ExecStart=/usr/bin/smartdns`，而 Debian 包把守护进程装在 `/usr/sbin/smartdns` → smartdns 起不来，DNS 全挂 | 用 `command -v smartdns` 动态取路径；enable 前补 `daemon-reload` |
 | 2 | [server:1690](server#L1690) | Zabbly 源写成 `URIs: https://zabbly.com/kernel/stable`，官方仓库实际在 `pkgs.zabbly.com`（实测前者 404/502，后者 200） | 改为 `https://pkgs.zabbly.com/kernel/stable` |
-| 3 | [server:181](server#L181) | 依赖硬编码 `libmimalloc2.0`，Debian trixie 已改为 `libmimalloc3` | 按 codename 分支或直接删除该依赖 |
+| 3 | [server:181](server#L181) | ~~依赖硬编码 `libmimalloc2.0`，Debian trixie 已改为 `libmimalloc3`~~ **已彻底移除**：该库全文无 `LD_PRELOAD` / `ld.so.preload` 引用，装了也不会被加载，`pkg_dep` 里已删除（见 [server:650](server#L650) 注释） | 无需处理 |
 | 4 | [client:319-322](client#L319-L322) + [client:423](client#L423) | `smartdns_conf` 整文件重写把 bind 改回 `[::]:53`，AGH 让出的 53 被抢回，且 AGH 上游 `127.0.0.1:5330` 无人监听 | 端口决策移入生成器，删掉事后 sed |
 | 5 | [server:503](server#L503)、[client:672](client#L672)、[client:1514](client#L1514)、[server:1758](server#L1758) | `nft flush ruleset` 清空**整机**所有 nft 表（Docker / firewalld / 用户规则全丢） | 只 `nft delete table` 自建表；表名加前缀避免撞名 |
 | 6 | [server:1128-1146](server#L1128-L1146) | `xray_gen_config` 用 `>` 直写 `config.json`，jq 失败即留空文件，Xray 起不来且无提示 | 原子写 + `jq -e` 校验后再 `mv` |
