@@ -132,7 +132,23 @@ svc_restart() {
   svc_ok "$s"
 }
 
+# jq 是 conf.json 唯一的读写后端, 而最小化安装的 Debian/Ubuntu 底包并不含 jq。
+# conf_init 在 pkg_dep 之前被调用(先收用户输入再装依赖), 缺 jq 时 conf_set 静默失败 ——
+# 用户答完一堆提示后配置却是空的。这里做一次性自愈安装。
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 && return 0
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq jq >/dev/null 2>&1
+  fi
+  command -v jq >/dev/null 2>&1 && return 0
+  err "jq 未安装且自动安装失败: conf.json 无法读写(请先手动 apt-get install -y jq)"
+  return 1
+}
+
 conf_init() {
+  # 装不上 jq 也继续(后面 pkg_dep 还会再试一次, 且 die 由调用方决定)
+  ensure_jq || true
   mkdir -p "$BASE" "$BASE/.repo" "$XRAYDIR" "$SDNSDIR" "$BASE/nftables"
   [[ -f $CONF ]] && return
   write_atomic "$CONF" 600 <<EOF

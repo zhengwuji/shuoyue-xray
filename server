@@ -289,7 +289,24 @@ svc_restart() {
 }
 
 # ------------------------------------------------------- conf.json storage ---
+# jq 是 conf.json 唯一的读写后端, 而最小化安装的 Debian/Ubuntu 底包并不含 jq。
+# 缺 jq 时 conf_write/conf_raw 会**静默失败**(配置永远停在 {}, 由 conf_init 写入的
+# 那个空对象), 凭据/协议选择全部丢失且没有任何报错 —— 只能靠后面 install_panel
+# 用 python3 补的 panel 段看出来。这里做一次性自愈安装, 装不上就明确报错。
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 && return 0
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq jq >/dev/null 2>&1
+  fi
+  command -v jq >/dev/null 2>&1 && return 0
+  err "jq 未安装且自动安装失败: conf.json 无法读写(请先手动 apt-get install -y jq)"
+  return 1
+}
+
 conf_init() {
+  # 装不上 jq 也继续(后续面板路径用 python3, 仍能给出可见的 err 提示)
+  ensure_jq || true
   mkdir -p "$BASE" "$BASE/.repo" "$XRAYDIR"
   [[ -f $CONF ]] && return
   echo '{}' > "$CONF"; chmod 600 "$CONF"
