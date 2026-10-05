@@ -288,7 +288,9 @@ naive://<urlencode(用户名:密码)>@example.com:8447?sni=example.com&insecure=
 
 ## 依赖
 
-Debian 12 (bookworm) / 13 (trixie) 或 Ubuntu 22.04 / 24.04,amd64 或 arm64;root 权限。服务端需要域名才能使用 nginx 类协议;Reality / XHTTP-Reality / SS / SOCKS5 / Hysteria2 / TUIC / AnyTLS / SS2022(sing-box) 无需域名。客户端建议物理设备或 KVM 虚机(容器内无 TPROXY/CAKE);OpenWrt 客户端由 install.sh 自动识别并安装。
+Debian 12 (bookworm) / 13 (trixie) 或 Ubuntu 22.04 / 24.04 / 26.04,amd64 或 arm64;root 权限。服务端需要域名才能使用 nginx 类协议;Reality / XHTTP-Reality / SS / SOCKS5 / Hysteria2 / TUIC / AnyTLS / SS2022(sing-box) 无需域名。客户端建议物理设备或 KVM 虚机(容器内无 TPROXY/CAKE);OpenWrt 客户端由 install.sh 自动识别并安装。
+
+`install.sh` 会自己补下载工具(`curl` + `ca-certificates`)与 `jq`;其余依赖(`wget nftables chrony unbound` 等)由 `server` / `client` 在安装流程里按需 apt 安装,底包里没有也不影响。
 
 Web 控制面板需要 `python3`(标准库即可,无需 pip);面板由 nginx 反代到随机路径,也可 SSH 隧道直连 `127.0.0.1:3000`。
 

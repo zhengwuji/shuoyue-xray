@@ -94,6 +94,17 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   fi
 fi
 
+# jq 是 conf.json 唯一的读写后端(server/client 的 conf_get/conf_write/conf_raw 全走它)。
+# server/client 内部虽有 ensure_jq 自愈, 但那个自愈发生在收完用户输入之后, 且要在
+# 下载主脚本之后才可能跑到; 在这里先装好可以省掉安装中途的一次 apt 往返, 也避免
+# 自愈那一步失败时用户已经答完一长串提示。装不上不算致命(内部自愈还会再试)。
+if ! is_openwrt && ! command -v jq >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  echo -e "${CYAN}安装 jq (配置读写依赖)...${cRES}"
+  apt-get update -qq >/dev/null 2>&1
+  apt-get install -y -qq jq >/dev/null 2>&1 \
+    || warn "jq 安装失败, 稍后由主脚本自动重试(否则 conf.json 无法读写)"
+fi
+
 # 多源下载: 官方 raw → ghproxy → jsdelivr (任一成功即可)
 # DEGWD_RAW 被显式指定时只走该基址 —— 否则会绕过自建镜像去打 GitHub。
 dl() {
