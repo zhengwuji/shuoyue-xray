@@ -212,6 +212,28 @@ Error: syntax error, unexpected '}', expecting newline or semicolon
 
 排查要点:别只看 `systemctl is-enabled`,要 `systemctl is-active` + `nft -c -f <ruleset>` 真校验。注意 `flowtable.eth` 是由单元里前一条 `ExecStart`(即 `flowtable_eth.sh`)动态生成的,单独 `nft -c -f default.nft` 会因 `include` 文件缺失而假失败。
 
+**刚装完还没勾选协议时 `xray` 显示 failed(已修):** 全新安装后 `/opt/de_GWD/xray/` 还是空目录(协议配置由面板勾选后才生成 `config.json`),而 `xray run -confdir` 在空目录下会以 23 退出:
+
+```
+Failed to start: main: failed to load config files: [stdin:] > infra/conf/serial:
+failed to decode config: &{Name:stdin: Format:json} > failed to read config file > EOF
+```
+
+单元里又有 `RestartPreventExitStatus=23`,于是 `xray.service` 直接变成 `loaded failed failed` —— 功能其实没坏,只是没东西可跑,但用户看到一片红字。现在两端(`server` 与 `client`)的 xray 单元都加了:
+
+```ini
+[Unit]
+After=network.target nss-lookup.target
+ConditionPathExists=$XRAYDIR/config.json
+```
+
+没有配置时 systemd 在**启动前**就跳过整个 job:`systemctl restart` 返回 0,状态是干净的 `inactive`(`Result=success` / `ConditionResult=no`),不是 `failed`;面板勾选协议生成 `config.json` 后再 restart 即正常拉起(systemd 会重新求值 `Condition*`,不需要 `daemon-reload`)。
+
+配套地把 `svc_skipped()` / `svc_cond_pending()` 加进两端的服务管理函数,让"有意跳过"不再被当成"启动失败"(否则装完就会刷一堆 `[ ✕ ] Xray 未启动`)。判据有讲究:
+
+- **不能用** `systemctl show -p ConditionResult`:单元**从未启动过**时它一律返回 `no`,即使单元里一条 `Condition*` 都没写(真机实测),拿它当判据会把所有 `inactive` 服务误判成"有意跳过",**真实失败会被静默吞掉**。`-p Conditions` 的值是字面量 `[unprintable]`,也不可用。可靠判据只有 `systemctl cat <unit> | grep -c '^Condition'`,再用 `ConditionResult` 确认这次确实是被条件拦下的。
+- `systemctl restart` 在条件不满足时**跳过 job 但原样保留单元状态**,所以它**不会**清掉上一次的 `failed` 残留(真机实测:先处于 `failed`,再让 `config.json` 消失并 restart,`is-failed` 仍是 `failed`)。故 `svc_restart()` 在确认"确实被 Condition 拦下"后先 `reset-failed` 再 restart;若条件其实已满足,restart 会立刻重新求值并写回真实结果,**不会掩盖真故障**(回归里有反向断言验证这一点)。
+
 ## v2rayN 导入示例
 
 服务端全部 19 种协议的分享链接都按 v2rayN 7.x 的解析格式生成,安装完或菜单「节点信息」会直接打印,Web 面板里也能逐条复制。链接形态如下(`example.com` 换成你的域名或 IP,UUID 为服务端生成的那个,所有协议共用同一套 UUID/密码):

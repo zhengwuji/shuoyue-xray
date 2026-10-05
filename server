@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.4.3"
+VERSION="v1.4.4"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -274,23 +274,68 @@ ufw_active() {
   s=$(ufw status 2>/dev/null || true)
   grep -q "Status: active" <<<"$s"
 }
+# 单元是否因 Condition* 当前不满足而"不该启动"。
+# 判据必须是**单元文件里真的写了 Condition\***: `systemctl show -p ConditionResult`
+# 对从未启动过的单元一律返回 no(真机实测, 即便一条 Condition* 都没写), 拿它当判据
+# 会把所有 inactive 服务误判成"有意跳过", 真实失败被静默吞掉。`-p Conditions` 的值
+# 是 [unprintable] 也不可用。所以先用 systemctl cat 确认存在 Condition*, 再用
+# ConditionResult 确认这次判定确实是被条件拦下的。
+svc_cond_pending() {
+  local s="$1" n=""
+  n=$(systemctl cat "$s" 2>/dev/null | grep -c '^Condition' || true)
+  [[ ${n:-0} -gt 0 ]] || return 1
+  [[ $(systemctl show "$s" -p ConditionResult --value 2>/dev/null || true) == "no" ]]
+}
+# 服务是否被 systemd 因 Condition* 不满足而有意跳过(不算失败)。
+# 典型: xray 单元的 ConditionPathExists=$XRAYDIR/config.json —— 还没在面板勾选
+# 任何协议时 xray 不该启动, 也**不算失败**(ActiveState=inactive / Result=success)。
+# 用它把"有意跳过"和"真的挂了"区分开, 否则 svc_restart 会把跳过的服务当成启动
+# 失败, 到处打印 "[ ✕ ] Xray 未启动"。
+# failed 也算"跳过": 见 svc_restart 里对 Condition 残留的清理说明。
+svc_skipped() {
+  local s="$1" a=""
+  svc_cond_pending "$s" || return 1
+  a=$(systemctl is-active "$s" 2>/dev/null || true)
+  [[ $a == "inactive" || $a == "failed" ]]
+}
 # 重启服务;容器/受限环境不支持 Nice= 时自动去除后重试(继承原版兜底模式)
 svc_restart() {
   local s="$1"
   systemctl daemon-reload >/dev/null 2>&1
   systemctl restart "$s" >/dev/null 2>&1
-  if ! svc_ok "$s"; then
-    local u="/etc/systemd/system/$s.service" d
-    grep -q '^Nice=' "$u" 2>/dev/null || return 1
-    # 不再 sed -i 改磁盘 unit(会永久删掉 Nice= 且不可恢复)
-    # 改用 /run 下的临时 drop-in 覆盖,重启后自动消失
-    d="/run/systemd/system/$s.service.d"
-    mkdir -p "$d" || return 1
-    printf '[Service]\nNice=0\n' >"$d/10-degwd-nice.conf"
-    systemctl daemon-reload
+  # Condition 不满足时 systemd 在"启动前"就跳过整个 job, 单元状态原样保留 ——
+  # 也就是说它**不会**清掉上一次的 failed 残留。真机实测: 先处于 failed, 再让
+  # config.json 消失并 restart -> is-failed 仍然是 failed, 用户继续看到红字失败态。
+  # 这正好是我们想消除的现象(未配置协议却被显示成 failed), 所以确认"这次确实被
+  # Condition 拦下"后先 reset-failed 再重启一次, 让它落到干净的 inactive。
+  #
+  # 判定必须放在 restart **之后**: ConditionResult 记录的是**最近一次 job** 的求值
+  # 结果, 重启前读到的是上一次的 yes(条件曾经满足过)—— 真机实测: 单元处于 failed
+  # 且上次条件满足时, 重启前 ConditionResult=yes, 据此判断会漏掉这次的不满足,
+  # reset-failed 不执行, failed 残留原样留下。重启后它才刷新成本次的 no。
+  # 安全性: 若这次条件其实满足, restart 已把真实结果(active/failed)写回, 且此时
+  # ConditionResult=yes 使本分支不成立 —— 真故障不会被 reset-failed 掩盖。
+  if ! svc_ok "$s" && svc_cond_pending "$s"; then
+    systemctl reset-failed "$s" >/dev/null 2>&1
     systemctl restart "$s" >/dev/null 2>&1
   fi
-  svc_ok "$s"
+  if ! svc_ok "$s"; then
+    local u="/etc/systemd/system/$s.service" d
+    # 不能写 `... || return svc_skipped "$s"`: return 只接受**数字**, 传函数名会报
+    #   bash: return: svc_skipped: numeric argument required
+    # 使函数退码 2 —— 于是"有意跳过"反而被判成启动失败, 而且重试路径被跳过。
+    # 改成嵌套 if, 让最后一行统一收口。
+    if [[ -f $u ]] && grep -q '^Nice=' "$u" 2>/dev/null; then
+      # 不再 sed -i 改磁盘 unit(会永久删掉 Nice= 且不可恢复)
+      # 改用 /run 下的临时 drop-in 覆盖,重启后自动消失
+      d="/run/systemd/system/$s.service.d"
+      if mkdir -p "$d" && printf '[Service]\nNice=0\n' >"$d/10-degwd-nice.conf"; then
+        systemctl daemon-reload
+        systemctl restart "$s" >/dev/null 2>&1
+      fi
+    fi
+  fi
+  svc_ok "$s" || svc_skipped "$s"
 }
 
 # ------------------------------------------------------- conf.json storage ---
@@ -1145,6 +1190,16 @@ install_xray() {
 [Unit]
 Description=de_GWD Xray Service
 After=network.target nss-lookup.target
+# 没有协议配置时不要启动。xray run -confdir 在空目录下会以 23 退出
+# ("failed to read config file > EOF"), 配合 RestartPreventExitStatus=23
+# 直接变成 failed —— 用户刚装完还没在面板勾选任何协议时, 就会看到
+#   xray.service  loaded failed failed
+# 一个红字失败态(实际功能没坏, 只是没东西可跑)。
+# 加了本条件后: 配置缺失时 systemd 直接跳过激活, restart 返回 0,
+# ActiveState=inactive / Result=success / ConditionResult=no, 不是 failed;
+# 面板勾选协议生成 config.json 后 restart 即正常拉起
+# (systemctl 会重新求值 Condition*, 无需 daemon-reload)。
+ConditionPathExists=$XRAYDIR/config.json
 
 [Service]
 User=$XTLSUSER

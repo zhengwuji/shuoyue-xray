@@ -8,7 +8,7 @@
 #  基于原版 jacyl4/de_GWD (EPL-2.0) 的功能规格重写,全部组件改用官方上游。
 #  LAN 设备将网关与 DNS 指向本机即可生效。仅供学习与研究。
 # =============================================================================
-VERSION="v1.4.3"
+VERSION="v1.4.4"
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
 # 交互式脚本: 不启用 -e(需保留人工交互分支), 但未定义变量与管道错误必须暴露
@@ -117,23 +117,65 @@ detect_nic() {
     | grep 'device' | grep -v 'virtual' | grep -v 'ifb' | awk -F'/' '{print$NF}' | head -n1
 }
 svc_ok() { systemctl is-active "$1" >/dev/null 2>&1; }
+# 单元是否因 Condition* 当前不满足而"不该启动"。
+# 判据必须是**单元文件里真的写了 Condition\***: `systemctl show -p ConditionResult`
+# 对从未启动过的单元一律返回 no(真机实测, 即便一条 Condition* 都没写), 拿它当判据
+# 会把所有 inactive 服务误判成"有意跳过", 真实失败被静默吞掉。`-p Conditions` 的值
+# 是 [unprintable] 也不可用。所以先用 systemctl cat 确认存在 Condition*, 再用
+# ConditionResult 确认这次判定确实是被条件拦下的。
+svc_cond_pending() {
+  local s="$1" n=""
+  n=$(systemctl cat "$s" 2>/dev/null | grep -c '^Condition' || true)
+  [[ ${n:-0} -gt 0 ]] || return 1
+  [[ $(systemctl show "$s" -p ConditionResult --value 2>/dev/null || true) == "no" ]]
+}
+# 服务是否被 systemd 因 Condition* 不满足而有意跳过(不算失败)。
+# 典型: xray 单元的 ConditionPathExists=$XRAYDIR/config.json —— 还没添加任何节点
+# 时 xray 不该启动, 也**不算失败**(ActiveState=inactive / Result=success)。
+# 用它把"有意跳过"和"真的挂了"区分开, 否则 svc_restart 会把跳过的服务当成启动
+# 失败, 到处打印 "[ ✕ ] Xray 重启失败"。
+# failed 也算"跳过": 见 svc_restart 里对 Condition 残留的清理说明。
+svc_skipped() {
+  local s="$1" a=""
+  svc_cond_pending "$s" || return 1
+  a=$(systemctl is-active "$s" 2>/dev/null || true)
+  [[ $a == "inactive" || $a == "failed" ]]
+}
 svc_restart() {
   local s="$1"
   systemctl daemon-reload >/dev/null 2>&1
   systemctl restart "$s" >/dev/null 2>&1
+  # Condition 不满足时 systemd 在"启动前"就跳过整个 job, 单元状态原样保留 ——
+  # 也就是说它**不会**清掉上一次的 failed 残留。真机实测: 先处于 failed, 再让
+  # config.json 消失并 restart -> is-failed 仍然是 failed, 用户继续看到红字失败态。
+  # 所以确认"这次确实被 Condition 拦下"后先 reset-failed 再重启一次, 让它落到
+  # 干净的 inactive。
+  #
+  # 判定必须放在 restart **之后**: ConditionResult 记录的是**最近一次 job** 的求值
+  # 结果, 重启前读到的是上一次的 yes(条件曾经满足过), 据此判断会漏掉这次的不满足,
+  # reset-failed 不执行, failed 残留原样留下。重启后它才刷新成本次的 no。
+  # 安全性: 若这次条件其实满足, restart 已把真实结果(active/failed)写回, 且此时
+  # ConditionResult=yes 使本分支不成立 —— 真故障不会被 reset-failed 掩盖。
+  if ! svc_ok "$s" && svc_cond_pending "$s"; then
+    systemctl reset-failed "$s" >/dev/null 2>&1
+    systemctl restart "$s" >/dev/null 2>&1
+  fi
   if ! svc_ok "$s"; then
-    local u="/etc/systemd/system/$s.service"
-    [[ -f $u && $(grep -c '^Nice=' "$u" 2>/dev/null || echo 0) -gt 0 ]] || return 1
-    # 不修改磁盘上的 unit: 用 /run 下的临时 drop-in 覆盖 Nice=-9(重启后自动失效)
-    local d="/run/systemd/system/$s.service.d"
-    if mkdir -p "$d" && printf '[Service]\nNice=0\n' >"$d/10-nice.conf"; then
-      systemctl daemon-reload >/dev/null 2>&1
-      systemctl restart "$s" >/dev/null 2>&1
-    else
-      return 1
+    local u="/etc/systemd/system/$s.service" d
+    # 不能写 `... || return svc_skipped "$s"`: return 只接受**数字**, 传函数名会报
+    #   bash: return: svc_skipped: numeric argument required
+    # 使函数退码 2 —— 于是"有意跳过"反而被判成启动失败, 而且重试路径被跳过。
+    # 改成嵌套 if, 让最后一行统一收口。
+    if [[ -f $u ]] && grep -q '^Nice=' "$u" 2>/dev/null; then
+      # 不修改磁盘上的 unit: 用 /run 下的临时 drop-in 覆盖 Nice=-9(重启后自动失效)
+      d="/run/systemd/system/$s.service.d"
+      if mkdir -p "$d" && printf '[Service]\nNice=0\n' >"$d/10-degwd-nice.conf"; then
+        systemctl daemon-reload >/dev/null 2>&1
+        systemctl restart "$s" >/dev/null 2>&1
+      fi
     fi
   fi
-  svc_ok "$s"
+  svc_ok "$s" || svc_skipped "$s"
 }
 
 # jq 是 conf.json 唯一的读写后端, 而最小化安装的 Debian/Ubuntu 底包并不含 jq。
@@ -1121,6 +1163,13 @@ install_xray() {
 [Unit]
 Description=de_GWD Xray TPROXY Service
 After=network.target nss-lookup.target
+# 没有节点配置时不要启动。xray run -confdir 在空目录下以 23 退出
+# ("failed to read config file > EOF"), 配合 RestartPreventExitStatus=23
+# 会直接显示为 failed。未添加任何节点前(例如只跑了一次 --update 或
+# 节点被清空)不希望看到红字失败态; 条件不满足时 systemd 跳过激活,
+# restart 返回 0 / ActiveState=inactive / Result=success, 不是 failed。
+# 节点写入 $XRAYDIR/config.json 后再 restart 即可正常拉起。
+ConditionPathExists=$XRAYDIR/config.json
 
 [Service]
 ExecStart=/usr/local/bin/xray run -confdir $XRAYDIR
@@ -1616,7 +1665,13 @@ download_lists() {
     warn "Apple 中国域名列表下载失败"
   fi
   rm -f "$tmpd.raw"
-  cnt=$(grep -c . "$tmpd" 2>/dev/null || echo 0)
+  # 不能写 `$(grep -c . "$tmpd" || echo 0)`: grep -c 无匹配时**已经**打印 "0" 且退码 1,
+  # 再 echo 一个 0 -> 变量变成两行 "0\n0" -> 下一行 [[ -ge 1000 ]] 报
+  # "syntax error in expression (error token is \"0\")" 并把错误打到用户眼前。
+  # grep -c 本身总会输出一个数字, 直接取即可(grep -c 的退码不是数字 0 时才需要兜底),
+  # 这里用 `|| true` 只吞退码、不再追加输出。
+  cnt=$(grep -c . "$tmpd" 2>/dev/null) || true
+  cnt=${cnt:-0}
   if [[ ${cnt:-0} -ge 1000 ]]; then
     sort -u -o "$tmpd" "$tmpd"
     mv -f "$tmpd" "$SDNSDIR/chn_domains.txt"
@@ -2546,7 +2601,10 @@ health_check() {   # $1="full" 才跑外网探测(主菜单每轮调用会拖慢
   echo -e "  xray: $(svc_ok xray && echo ✓ || echo ✕)  smartdns: $(svc_ok smartdns && echo ✓ || echo ✕)  nftables: $(svc_ok degwd-nftables && echo ✓ || echo ✕)  wg0: $(svc_ok wg-quick@wg0 && echo ✓ || echo -)"
   [[ $(conf_get '.adblock') == "true" ]] && echo -e "  AdGuardHome: $(svc_ok adguardhome && echo ✓ || echo ✕) (管理页 :3000)"
   echo -e "  DNS 出口测试: $(dig +short +time=3 @127.0.0.1 google.com 2>/dev/null | head -n1)"
-  echo -e "  chnroute 条目: $(nft list set ip de_GWD CHNROUTE 2>/dev/null | grep -c '/' || echo 0)"
+  # grep -c 无匹配时输出 "0" 且退码 1, 再 `|| echo 0` 会打印成两行("0\n0")。
+  # 这里只取 grep -c 自身的输出, 退码用 `|| true` 吞掉。
+  local chn; chn=$(nft list set ip de_GWD CHNROUTE 2>/dev/null | grep -c '/' || true)
+  echo -e "  chnroute 条目: ${chn:-0}"
 }
 
 # ================================================================ 内核 =========
