@@ -161,6 +161,17 @@ error message is: Verifying signature: Not live until 2026-10-05T08:42:53Z
 
 校时同时写 RTC,但 **`hwclock` 自 Debian 13 / Ubuntu 26.04 起已被拆到独立包 `util-linux-extra`**(主包 `util-linux` 只留文档);Debian 12 与 Ubuntu 22.04/24.04 索引里没有这个包名(二进制仍在 `util-linux` 内)。因此脚本用 `apt-cache show util-linux-extra` 先探再装,装不上也不报错 —— 缺失时 `hwclock -w` 只是被跳过,`chrony` 的 `rtcsync` 会补上 RTC 同步。
 
+**Xray 上游安装器的两类噪声(已屏蔽):** 安装 Xray-core 时调用的是官方 `install-release.sh`,它在两个细节上会往 stderr 喷无关报错,干扰排障:
+
+- `tput: No value for $TERM and no -T specified`(连刷 4 行)——上游 `main()` 里是裸 `red=$(tput setaf 1)`;通过 `curl|bash` 或无 TTY 的 SSH 会话运行时 `TERM` 常为空。脚本改为 `TERM="${TERM:-dumb}"`,空值退到 `dumb`(静默),交互终端保持原样不受影响。
+- `grep: /etc/systemd/system/xray.service: No such file or directory` ——上游 `check_install_user()` 在未指定运行用户且 `/usr/local/bin/xray` 已存在时,会去 grep 单元文件猜用户名;升级场景下该文件可能不存在。脚本改为显式传命令行参数 `--install-user <www-data|root>` 跳过这段探测,顺带让上游创建的 `/var/log/xray/*.log` 归属与自有单元保持一致(此前是上游默认的 `nobody:nogroup` 孤儿日志)。注意必须走命令行参数:`INSTALL_USER=x bash …` 会被上游开头的 `INSTALL_USER=''` 初始化清掉。
+
+另外三处同类噪声也一并消除:
+
+- **客户端装 Xray 必然失败**:`client` 里调用上游安装器写成了 `bash "$ish" @ install` —— `@` 不是有效子命令,上游会打印 `unknown option -- -` 并返回 1,客户端随后 `die "Xray 安装脚本返回非 0 (1)"`,**每一次客户端安装都倒在这一步**。已改为子命令 `install`。
+- `TERM environment variable not set.`:脚本里的裸 `clear` 在无 TTY 环境(TERM 为空)同样会往 stderr 喷字。已统一改为 `cls()` 辅助函数:仅在 `[[ -t 1 && -n $TERM ]]` 时清屏,管道/日志场景下不清屏(日志反而更好读)。
+- `Xray 版本变更(回滚参考): vX -> vX`:原条件只判"升级前版本非空",重装时版本并未变化却照样报警。已改为仅在前后版本**确实不同**时输出。
+
 
 ## v2rayN 导入示例
 

@@ -8,7 +8,7 @@
 #  基于原版 jacyl4/de_GWD (EPL-2.0) 的功能规格重写,全部组件改用官方上游。
 #  LAN 设备将网关与 DNS 指向本机即可生效。仅供学习与研究。
 # =============================================================================
-VERSION="v1.4.1"
+VERSION="v1.4.2"
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
 # 交互式脚本: 不启用 -e(需保留人工交互分支), 但未定义变量与管道错误必须暴露
@@ -89,6 +89,10 @@ render_tpl() {   # $1=file, 其后 KEY VALUE ...
   done
   printf '%s\n' "$c" | write_atomic "$f" "$mode"
 }
+
+# 清屏: 只在真正的交互终端上清。`curl|bash` / 无 TTY 的 SSH 会话里 TERM 常为空,
+# ncurses 的 clear 会往 stderr 打 "TERM environment variable not set."。
+cls() { [[ -t 1 && -n ${TERM:-} ]] && clear 2>/dev/null; return 0; }
 
 # 拆分 host:port, 支持 [ipv6]:port 与裸 IPv6; 结果写入全局 SP_HOST/SP_PORT
 # 原写法 `host=${x%%:*}; port=${x##*:}` 有两个坑:
@@ -1097,7 +1101,18 @@ install_xray() {
     rm -f "$ish"; die "Xray 安装脚本下载失败"
   fi
   if ! bash -n "$ish"; then rm -f "$ish"; die "Xray 安装脚本语法校验失败(可能被篡改)"; fi
-  bash "$ish" @ install; local irc=$?
+  # 修复: 原先写作 `bash "$ish" @ install` —— '@' 不是上游有效参数, 上游参数解析
+  # 落到 `*)` 分支(install-release.sh 第 309-312 行)打印
+  #   "/tmp/xray-install.XXXXXX.sh: unknown option -- -"
+  # 并 return 1, 使安装流程在 "Xray 安装脚本返回非 0 (1)" 处直接 die —— 即客户端
+  # 每次都会在装 Xray 这一步失败。正确写法是子命令 install 本身。
+  #
+  # 顺手压掉上游两类噪声(与本文件同源, 详见 server 的 install_xray 注释):
+  #   1) TERM 为空时裸 tput 连刷 4 行 "tput: No value for $TERM and no -T specified";
+  #   2) check_install_user() 对可能不存在的 /etc/systemd/system/xray.service 做 grep。
+  # 本机 Xray 单元(下方 write_atomic)不带 User=, 即以 root 运行, 故传 --install-user root。
+  # 注意必须走命令行参数: 上游第 71 行 `INSTALL_USER=''` 会清空同名环境变量(实测验证)。
+  TERM="${TERM:-dumb}" bash "$ish" install --install-user root; local irc=$?
   rm -f "$ish"
   [[ $irc -ne 0 ]] && die "Xray 安装脚本返回非 0 ($irc)"
   [[ ! -x /usr/local/bin/xray ]] && die "Xray 安装失败"
@@ -2872,9 +2887,9 @@ EOF
 
 # ==================================================================== 菜单 ====
 start_menu() {
-  clear
+  cls
   while :; do
-    clear
+    cls
     echo -e "${CYAN}=====================================================${cRES}"
     echo -e "${WHITE}   朔月 Shuoyue ${VERSION}  -  旁路网关客户端${cRES}"
     echo -e "${CYAN}=====================================================${cRES}"

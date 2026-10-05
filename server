@@ -9,7 +9,7 @@
 #  一键: bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main/install.sh)
 #  仅供学习与研究。
 # =============================================================================
-VERSION="v1.4.1"
+VERSION="v1.4.2"
 # 自动更新源(指向本仓库;push 新版本后每日 04:30 自动跟进)
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
@@ -42,6 +42,11 @@ ok()   { echo -e "${WHITE}[ ${GREEN}✓${WHITE} ]${cRES} $*"; log "OK   $*"; }
 warn() { echo -e "${WHITE}[ ${YELLOW}!${WHITE} ]${cRES} $*"; log "WARN $*"; }
 err()  { echo -e "${WHITE}[ ${RED}✕${WHITE} ]${cRES} $*"; log "ERR  $*"; }
 die()  { err "$*"; exit 1; }
+
+# 清屏: 只在真正的交互终端上清。`curl|bash` / 无 TTY 的 SSH 会话里 TERM 常为空,
+# ncurses 的 clear 会往 stderr 打 "TERM environment variable not set." —— 这类
+# 噪声与本次要修的 tput 噪声同源, 一并消除(非 TTY 时不清屏, 日志更可读)。
+cls() { [[ -t 1 && -n ${TERM:-} ]] && clear 2>/dev/null; return 0; }
 
 # 统一日志(追加写,失败静默: 日志不可写不应中断安装)
 log() {
@@ -1087,10 +1092,37 @@ install_xray() {
     rm -f "$_xtmp"; die "Xray 官方安装器语法校验失败(上游文件可能损坏/被篡改), 已中止"
   fi
   warn "Xray 安装器为上游 main 分支最新版(无版本锁定), 语法校验已通过但内容未经哈希校验"
-  bash "$_xtmp" install || { rm -f "$_xtmp"; die "Xray 安装失败"; }
+  # ---------------------------------------------------------------------------
+  # 上游 main() 里是裸 `red=$(tput setaf 1)` 取色(install-release.sh 第 833-837 行)。
+  # TERM 为空时 tput 会往 stderr 连刷 4 行
+  #   "tput: No value for $TERM and no -T specified"
+  # 而 `curl | bash` / 无 TTY 的 SSH 会话里 TERM 常常为空 —— 这正是安装日志里
+  # 那 4 行红字噪声的来源。这里把空 TERM 退到 dumb(dumb 下 tput setaf 静默返回 1,
+  # 不打印), 交互终端则原样保留 TERM, 彩色输出不受影响。
+  #
+  # 同时传 --install-user: 上游 check_install_user()(第 331-340 行)在
+  # INSTALL_USER 为空且 /usr/local/bin/xray 已存在时, 会 grep
+  # /etc/systemd/system/xray.service 去猜运行用户 —— 升级场景下该单元文件
+  # 可能并不存在(或已被清理), 于是必然多出一行
+  #   "grep: /etc/systemd/system/xray.service: No such file or directory"
+  # 显式给出用户名即可整段跳过。附带好处: 上游据此创建/修正
+  # /var/log/xray/{access,error}.log 的属主, 与本产品自有的
+  # /var/log/xray-error.log + 单元 User=$XTLSUSER 归属保持一致
+  # (此前上游默认 nobody, 会留下 nobody:nogroup 的孤儿日志)。
+  # 注意: 必须用命令行 `--install-user` 传递, **不能**用 `INSTALL_USER=x bash ...` 环境变量 ——
+  # 上游第 71 行有 `INSTALL_USER=''` 的全局初始化, 会把传入的环境变量直接清空, 于是
+  # check_install_user() 照旧走 grep 分支继续报错(实测验证)。
+  # 若 www-data 意外不存在则退回 root, 避免上游 "the user ... is not effective" 直接退出。
+  local _xuser="root"
+  id "$XTLSUSER" >/dev/null 2>&1 && _xuser="$XTLSUSER"
+  TERM="${TERM:-dumb}" bash "$_xtmp" install --install-user "$_xuser" || { rm -f "$_xtmp"; die "Xray 安装失败"; }
   rm -f "$_xtmp"
   _xver_after=$(/usr/local/bin/xray version 2>/dev/null | head -n1)
-  [[ -n $_xver_before ]] && warn "Xray 版本变更(回滚参考): ${_xver_before} -> ${_xver_after:-未知}"
+  # 只在版本真的变了才提示。原实现只判 `_xver_before` 非空, 于是每次重装/升级
+  # 都会打印一行 "Xray 版本变更(回滚参考): vX -> vX", 与本次要消除的噪声同性质。
+  if [[ -n $_xver_before && -n $_xver_after && $_xver_before != "$_xver_after" ]]; then
+    warn "Xray 版本变更(回滚参考): ${_xver_before} -> ${_xver_after}"
+  fi
   [[ ! -x /usr/local/bin/xray ]] && die "Xray 安装失败"
   mkdir -p "$XRAYDIR"
   # dat 资产放官方位置,服务里用环境变量指向
@@ -3988,7 +4020,7 @@ status_panel() {
 }
 
 start_menu() {
-  clear
+  cls
   while :; do
     echo -e "${CYAN}=====================================================${cRES}"
     echo -e "${WHITE}   朔月 Shuoyue ${VERSION}  -  Debian 多协议旁路网关${cRES}"

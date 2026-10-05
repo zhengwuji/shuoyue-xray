@@ -24,6 +24,10 @@ ok()   { echo -e "${WHITE}[ ${GREEN}✓${WHITE} ]${cRES} $*"; }
 warn() { echo -e "${WHITE}[ ${YELLOW}!${WHITE} ]${cRES} $*"; }
 die()  { echo -e "${WHITE}[ ${RED}✕${WHITE} ]${cRES} $*"; exit 1; }
 
+# 清屏: 只在真正的交互终端上清。`curl|bash` / 无 TTY 的 SSH 会话里 TERM 常为空,
+# ncurses 的 clear 会往 stderr 打 "TERM environment variable not set."。
+cls() { [[ -t 1 && -n ${TERM:-} ]] && clear 2>/dev/null; return 0; }
+
 # 本脚本与 server/client 都依赖 bash 语法([[ ]]、数组、read -rp)。
 # 精简版 OpenWrt 默认只有 ash, 直接用 sh 执行会在一堆语法错误里迷路,
 # 故这里先确认 shell, 能换就换, 换不了给一句可操作的提示。
@@ -344,7 +348,7 @@ case $c in
     chmod +x "$BASE/client"
     ln -sf "$BASE/client" "$BINDIR/shuoyue-gw"
     ok "已安装命令: shuoyue-gw"
-    clear
+    cls
     exec bash "$BASE/client" --install
     ;;
   3)
@@ -352,15 +356,15 @@ case $c in
     exit 0
     ;;
   4|[Uu]|[Uu][Pp][Dd][Aa][Tt][Ee])
-    clear
+    cls
     exec bash "$BASE/server" --update
     ;;
   5|[Uu][Nn][Ii][Nn][Ss][Tt][Aa][Ll][Ll]|[Dd][Ee][Ll])
-    clear
+    cls
     exec bash "$BASE/server" --uninstall
     ;;
   *)
-    clear
+    cls
     exec bash "$BASE/server" --install
     ;;
 esac
