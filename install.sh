@@ -81,6 +81,52 @@ owrt_arch() {
   esac
 }
 
+# ---- 时钟校正 ---------------------------------------------------------------
+# 必须排在**所有** apt 操作之前。
+# Debian 13(trixie) 起 apt 改用 sqv 做 OpenPGP 验签, 且检查"签名时间不得晚于当前
+# 时间"(Not live until)。全新 VPS 的时钟常常差几小时, 于是**每一个** InRelease
+# 都验签失败:
+#   Sub-process /usr/bin/sqv returned an error code (1),
+#   error message is: Verifying signature: Not live until 2026-10-05T08:42:53Z
+# 满屏红字、索引一个都拉不到, 后面所有 apt-get install 连锁失败。用户会以为源
+# 或密钥坏了, 实际只需要先把时钟掰正。
+# server/client 内部有 tcpTime 做同样的事, 但那要在下载完主脚本之后才跑得到;
+# 引导阶段这里先掰一次, 后面的 apt-get update 才是有效的。
+# 只做"当前时钟校正", 持续的 NTP 跟随由主脚本的 chrony 负责。
+# 三个必须注意的点: ①必须保住 "GMT" 时区(sed 去前缀, 不要按空格切字段 —— 响应头
+# 空白数量不保证) ②用 date -u -s 显式按 UTC 设置 ③逐源回退。
+sync_clock() {
+  local t="" u
+  if command -v wget >/dev/null 2>&1; then
+    for u in http://www.baidu.com http://www.qq.com http://whatismyip.akamai.com; do
+      t=$(wget -qSO- --max-redirect=0 --timeout=8 "$u" 2>&1 | grep -i '^ *Date:' | head -n1 | sed 's/^[^:]*: *//' | tr -d '\r')
+      [ -n "$t" ] && break
+    done
+  fi
+  if [ -z "$t" ] && command -v curl >/dev/null 2>&1; then
+    for u in http://cloudflare.com http://www.baidu.com; do
+      t=$(curl -sI --max-time 8 "$u" 2>/dev/null | grep -i '^date:' | head -n1 | sed 's/^[^:]*: *//' | tr -d '\r')
+      [ -n "$t" ] && break
+    done
+  fi
+  # 必须用 date -u -s 显式按 UTC 设置: HTTP Date 头带 GMT, 交给本地时区解释会
+  # 在 CST(+0800) 机器上把时钟改慢 8 小时 —— 正是要修的那个 bug。
+  if [ -n "$t" ]; then
+    if date -u -s "$t" >/dev/null 2>&1 || TZ=UTC date -s "$t" >/dev/null 2>&1; then
+      echo -e "${CYAN}已按 HTTP Date 校准时钟: ${cRES}$t"
+      return 0
+    fi
+    warn "时钟校准失败(date 无法解析 [$t]), 若 apt 报 Not live until 请先手动校时"
+  fi
+  return 1
+}
+
+# 先试一次: 机器上已有 wget/curl 时这里就成了(绝大多数情况)。
+# 没有下载工具时静默跳过(返回 1), 装完 curl 后再试一次。
+# 记下结果, 免得第二次重复打印同一行"已校准"。
+CLOCK_OK=0
+sync_clock && CLOCK_OK=1
+
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   if is_openwrt; then
     echo -e "${CYAN}安装下载工具...${cRES}"
@@ -89,15 +135,26 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   else
     command -v apt-get >/dev/null 2>&1 || die "未检测到 apt,本脚本仅支持 Debian / Ubuntu"
     echo -e "${CYAN}安装下载工具...${cRES}"
+    # 这次 apt-get update 用的还是发行版自带源, 有 Not live until 风险, 所以先
+    # 尽力校时; 校不上照样继续, 不能因为校时失败就挡死安装。
+    [[ ${CLOCK_OK:-0} -eq 1 ]] || sync_clock || true
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || die "curl 安装失败,请检查软件源"
   fi
 fi
 
+# curl 刚装上时再确保一次(前一次可能因为没有下载工具而跳过)。
+if [[ ${CLOCK_OK:-0} -ne 1 ]] && ! is_openwrt; then
+  sync_clock || warn "未取到 HTTP Date 头, 跳过校时(若 apt 报 Not live until 请先手动校时)"
+fi
+unset CLOCK_OK
+
 # jq 是 conf.json 唯一的读写后端(server/client 的 conf_get/conf_write/conf_raw 全走它)。
 # server/client 内部虽有 ensure_jq 自愈, 但那个自愈发生在收完用户输入之后, 且要在
 # 下载主脚本之后才可能跑到; 在这里先装好可以省掉安装中途的一次 apt 往返, 也避免
 # 自愈那一步失败时用户已经答完一长串提示。装不上不算致命(内部自愈还会再试)。
+# 注意: 这个 apt-get update 必须在 sync_clock 之后, 否则 Debian 13 上必然满屏
+# `Not live until` 签名错误。
 if ! is_openwrt && ! command -v jq >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
   echo -e "${CYAN}安装 jq (配置读写依赖)...${cRES}"
   apt-get update -qq >/dev/null 2>&1

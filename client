@@ -8,7 +8,7 @@
 #  基于原版 jacyl4/de_GWD (EPL-2.0) 的功能规格重写,全部组件改用官方上游。
 #  LAN 设备将网关与 DNS 指向本机即可生效。仅供学习与研究。
 # =============================================================================
-VERSION="v1.4.0"
+VERSION="v1.4.1"
 REMOTE_BASE="https://raw.githubusercontent.com/zhengwuji/shuoyue-xray/main"
 
 # 交互式脚本: 不启用 -e(需保留人工交互分支), 但未定义变量与管道错误必须暴露
@@ -235,6 +235,38 @@ fetch_release() {
 }
 
 # ============================================================ 系统基线 =========
+# HTTP Date 头校时。全新安装的机器时钟可能差很多(VPS 常见), 而 Debian 13 起
+# apt 用 sqv 验签并检查"签名时间不得晚于当前时间" —— 时钟偏差会让**全部**
+# InRelease 报 `Not live until ...` 而整批更新失败, 表现成满屏红色签名错误、
+# 一个依赖都装不上。所以 apt-get update 之前必须先校时。
+# 三个必须注意的点: ①必须保住 "GMT" 时区(sed 去前缀, 不要按空格切字段 ——
+# 响应头空白数量不保证) ②用 date -u -s 显式按 UTC 设置 ③逐源回退。
+tcpTime() {
+  local d="" u
+  if command -v wget >/dev/null 2>&1; then
+    for u in http://www.baidu.com http://www.qq.com http://whatismyip.akamai.com; do
+      d=$(wget -qSO- --max-redirect=0 --timeout=8 "$u" 2>&1 | grep -i '^ *Date:' | head -n1 | sed 's/^[^:]*: *//' | tr -d '\r')
+      [[ -n $d ]] && break
+    done
+  fi
+  if [[ -z $d ]] && command -v curl >/dev/null 2>&1; then
+    for u in http://cloudflare.com http://www.baidu.com; do
+      d=$(curl -sI --max-time 8 "$u" 2>/dev/null | grep -i '^date:' | head -n1 | sed 's/^[^:]*: *//' | tr -d '\r')
+      [[ -n $d ]] && break
+    done
+  fi
+  if [[ -n $d ]]; then
+    if date -u -s "$d" >/dev/null 2>&1 || TZ=UTC date -s "$d" >/dev/null 2>&1; then
+      command -v hwclock >/dev/null 2>&1 && hwclock -w >/dev/null 2>&1
+      return 0
+    fi
+    warn "时间校准失败: date 无法解析 [$d]"
+  else
+    warn "时间校准跳过: 未取到任何 HTTP Date 头"
+  fi
+  return 1
+}
+
 apt_baseline() {
   # 原实现写持久化 /etc/apt/apt.conf.d/01deGWD 的 APT::Get::Assume-Yes "true":
   # 该文件对全系统生效, 会让管理员此后所有 apt 操作(含 autoremove)被静默确认。
@@ -242,6 +274,8 @@ apt_baseline() {
   cat <<'EOF' >/etc/apt/apt.conf.d/71debconf
 Dpkg::Options { "--force-confdef"; "--force-confold"; };
 EOF
+  # 必须在 apt-get update 之前: 时钟偏差会让 sqv 把全部 InRelease 判成"未来签名"
+  tcpTime
   echo "debconf debconf/frontend select Noninteractive" | debconf-set-selections
   apt-get update -qq
   # full-upgrade 可能替换内核/删除软件包, 必须询问
@@ -266,6 +300,13 @@ pkg_dep() {
            ca-certificates gnupg wireguard-tools util-linux; do
     dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
   done
+  # hwclock 自 Debian 13(trixie) / Ubuntu 26.04 起拆到独立包 util-linux-extra,
+  # 主包 util-linux 只留文档。而 Debian 12 / Ubuntu 22.04 / 24.04 **没有**这个
+  # 包名(hwclock 仍在 util-linux 里) —— 不能无脑写进上面的固定列表, 那会让整批
+  # 安装因"无此包"整体失败。先看索引里有没有这个名字再决定。
+  if ! command -v hwclock >/dev/null 2>&1 && apt-cache show util-linux-extra >/dev/null 2>&1; then
+    need="$need util-linux-extra"
+  fi
   # dig 由 bind9-dnsutils 提供。Debian 13(trixie)+ / Ubuntu 25.10+ 起 dnsutils
   # 只剩过渡包(新发行版索引里已无该名字), 新版本一律给 bind9-dnsutils;
   # bionic/focal/buster 等老版本尚无 bind9-dnsutils, 只能用 dnsutils。
@@ -298,14 +339,23 @@ pkg_dep() {
 }
 
 chrony_conf() {
+  # 包没装上时 /etc/chrony 不存在, 直接重定向会报 "No such file or directory"。
+  # 校时是辅助功能, 缺包不该阻断安装。
+  command -v chronyd >/dev/null 2>&1 || { warn "chrony 未安装, 跳过 NTP 持续校时"; return 0; }
+  mkdir -p /etc/chrony /var/lib/chrony
   cat <<'EOF' >/etc/chrony/chrony.conf
 server time.cloudflare.com iburst
 server ntp.aliyun.com iburst
 driftfile /var/lib/chrony/chrony.drift
-rtcsync
 makestep 1 3
+maxupdateskew 100.0
+rtcsync
 EOF
-  systemctl enable chrony >/dev/null 2>&1; systemctl restart chrony >/dev/null 2>&1
+  systemctl enable chrony >/dev/null 2>&1
+  systemctl restart chrony >/dev/null 2>&1
+  # Debian 13 起 hwclock 在 util-linux-extra 里; 有就同步一次 RTC, 没有不算错误
+  command -v hwclock >/dev/null 2>&1 && hwclock -w >/dev/null 2>&1
+  return 0
 }
 
 limits_conf() {

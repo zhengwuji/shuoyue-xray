@@ -146,6 +146,21 @@ DEGWD_RAW=http://192.168.1.10/shuoyue bash <(curl -fsSL http://192.168.1.10/shuo
 - **自动更新(cron)**:仅更新脚本自身(版本号比对),不触碰组件——组件升级统一走菜单 0,避免半夜自动大动干戈
 - 内核升级是可选菜单(Zabbly 源,覆盖 Debian 12/13 与 Ubuntu 22.04/24.04/26.04)。脚本会先探测上游 `dists/<codename>/Release`,套件不存在时自动跳过并提示,不会写出一条必然 404 的源
 
+**时钟与 apt 验签(重要):** Debian 13(trixie) 起 apt 改用 `sqv` 做 OpenPGP 验签,并检查"签名时间不得晚于当前时间"。全新 VPS 的系统时钟常常偏差数小时,于是**每一个** `InRelease` 都会验签失败:
+
+```
+Sub-process /usr/bin/sqv returned an error code (1),
+error message is: Verifying signature: Not live until 2026-10-05T08:42:53Z
+```
+
+满屏红字、索引一个都拉不到,后面所有 `apt-get install` 连锁失败 —— 看起来像源或密钥坏了,实际只需要先把时钟掰正。脚本已在三个位置自动处理,无需人工干预:
+
+- `install.sh` 引导段: 在**任何** apt 操作之前用 HTTP `Date` 头校时(此时还没装 jq)
+- `server` / `client` 的 `apt_baseline()`: 同样在 `apt-get update` 之前校时
+- `chrony_conf()`: 写入 NTP 配置并 `enable` + `restart`,让时钟持续跟随(必须在校时之后,否则重启即漂回)
+
+校时同时写 RTC,但 **`hwclock` 自 Debian 13 / Ubuntu 26.04 起已被拆到独立包 `util-linux-extra`**(主包 `util-linux` 只留文档);Debian 12 与 Ubuntu 22.04/24.04 索引里没有这个包名(二进制仍在 `util-linux` 内)。因此脚本用 `apt-cache show util-linux-extra` 先探再装,装不上也不报错 —— 缺失时 `hwclock -w` 只是被跳过,`chrony` 的 `rtcsync` 会补上 RTC 同步。
+
 
 ## v2rayN 导入示例
 
